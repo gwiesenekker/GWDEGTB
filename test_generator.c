@@ -184,6 +184,40 @@ done:
     return ok;
 }
 
+static bool test_external_promotion_backtrack(void)
+{
+    char path[] = "/tmp/ipd-external-backtrack-XXXXXX";
+    EgtbCreateOptions options = {16, 20, 3};
+    EgtbLossBacktrackStatistics statistics;
+    ExternalProbeCheck probe = {0};
+    EgIndexer indexer;
+    Egtb *database = NULL;
+    int descriptor = mkstemp(path);
+    bool ok = false;
+    if (descriptor < 0)
+        return false;
+    close(descriptor);
+    unlink(path);
+    if (!eg_indexer_init(&indexer, 1, 0, 1, 1))
+        goto done;
+    if (!egtb_create(&database, path, eg_max_index(&indexer), 1024,
+                     &options) ||
+        !egtb_set(database, 59310, EGTB_BLACK_TO_MOVE, 1) ||
+        !egtb_backtrack_wins_to_losses_with_probe(
+            database, &indexer, 1, probe_lost_in_four, &probe,
+            &statistics) ||
+        probe.probes == 0)
+        goto destroy_indexer;
+    ok = true;
+destroy_indexer:
+    eg_indexer_destroy(&indexer);
+done:
+    if (database != NULL && !egtb_close(database))
+        ok = false;
+    unlink(path);
+    return ok;
+}
+
 static bool test_complete_wk_bk_generation(void)
 {
     char path[] = "/tmp/ipd-complete-generator-XXXXXX";
@@ -400,6 +434,11 @@ int main(void)
     }
     if (!test_external_promotion_initialization()) {
         fprintf(stderr, "external promotion initialization test failed\n");
+        return EXIT_FAILURE;
+    }
+    if (!test_external_promotion_backtrack()) {
+        fprintf(stderr, "external promotion backtrack test failed: %s\n",
+                egtb_generator_last_error());
         return EXIT_FAILURE;
     }
     if (!test_complete_wk_bk_generation()) {

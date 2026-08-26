@@ -28,6 +28,8 @@ typedef struct {
     EgtbLossBacktrackStatistics *statistics;
     int16_t won_distance;
     int16_t loss_value;
+    EgtbExternalProbe external_probe;
+    void *external_context;
     bool failed;
 } BacktrackContext;
 
@@ -38,6 +40,8 @@ typedef struct {
     EgtbSide successor_side;
     DraughtsPosition predecessor;
     int16_t maximum_win;
+    EgtbExternalProbe external_probe;
+    void *external_context;
     bool all_winning;
     bool failed;
 } ForwardCheckContext;
@@ -50,6 +54,8 @@ typedef struct {
     EgtbGenericWinBacktrackStatistics *statistics;
     int16_t loss_value;
     int16_t win_value;
+    EgtbExternalProbe external_probe;
+    void *external_context;
     bool failed;
 } WinBacktrackContext;
 
@@ -60,6 +66,8 @@ typedef struct {
     EgtbSide successor_side;
     DraughtsPosition predecessor;
     int16_t loss_value;
+    EgtbExternalProbe external_probe;
+    void *external_context;
     bool reaches_target_loss;
     bool failed;
 } WinningForwardContext;
@@ -228,10 +236,28 @@ static bool check_forward_successor(const DraughtsMove *move, void *opaque)
     ForwardCheckContext *context = opaque;
     DraughtsPosition successor = context->predecessor;
     uint64_t index;
+    uint64_t friendly;
     int16_t value;
-    if (!draughts_do_move(&successor, context->mover, move, NULL) ||
-        !position_index(context->indexer, &successor, &index) ||
-        !egtb_get(context->database, index, context->successor_side, &value)) {
+    if (!draughts_do_move(&successor, context->mover, move, NULL)) {
+        context->failed = true;
+        return false;
+    }
+    friendly = context->successor_side == EGTB_WHITE_TO_MOVE
+                   ? successor.white_men | successor.white_kings
+                   : successor.black_men | successor.black_kings;
+    if (friendly == 0) {
+        value = 0;
+    } else if (has_indexer_material(context->indexer, &successor)) {
+        if (!position_index(context->indexer, &successor, &index) ||
+            !egtb_get(context->database, index, context->successor_side,
+                      &value)) {
+            context->failed = true;
+            return false;
+        }
+    } else if (context->external_probe == NULL ||
+               !context->external_probe(&successor, context->successor_side,
+                                        context->external_context, &value) ||
+               !valid_dtm(value)) {
         context->failed = true;
         return false;
     }
@@ -259,6 +285,8 @@ static bool check_predecessor(const DraughtsPosition *predecessor,
     forward.mover = context->mover;
     forward.successor_side = context->successor_side;
     forward.predecessor = *predecessor;
+    forward.external_probe = context->external_probe;
+    forward.external_context = context->external_context;
     forward.all_winning = true;
     if (!draughts_generate_moves(predecessor, context->mover,
                                  check_forward_successor, &forward,
@@ -294,8 +322,9 @@ static bool check_predecessor(const DraughtsPosition *predecessor,
     return true;
 }
 
-bool egtb_backtrack_wins_to_losses(
+bool egtb_backtrack_wins_to_losses_with_probe(
     Egtb *database, const EgIndexer *indexer, int16_t won_distance,
+    EgtbExternalProbe external_probe, void *external_context,
     EgtbLossBacktrackStatistics *statistics)
 {
     EgtbLossBacktrackStatistics local = {0};
@@ -339,6 +368,8 @@ bool egtb_backtrack_wins_to_losses(
             context.statistics = &local;
             context.won_distance = won_distance;
             context.loss_value = (int16_t)-(won_distance + 1);
+            context.external_probe = external_probe;
+            context.external_context = external_context;
             if (!draughts_generate_quiet_predecessors(
                     &position, (EgtbSide)successor_side, check_predecessor,
                     &context, &predecessor_count) || context.failed)
@@ -349,6 +380,14 @@ bool egtb_backtrack_wins_to_losses(
     if (statistics != NULL)
         *statistics = local;
     return true;
+}
+
+bool egtb_backtrack_wins_to_losses(
+    Egtb *database, const EgIndexer *indexer, int16_t won_distance,
+    EgtbLossBacktrackStatistics *statistics)
+{
+    return egtb_backtrack_wins_to_losses_with_probe(
+        database, indexer, won_distance, NULL, NULL, statistics);
 }
 
 bool egtb_backtrack_won_in_one(Egtb *database, const EgIndexer *indexer,
@@ -376,10 +415,28 @@ static bool check_winning_successor(const DraughtsMove *move, void *opaque)
     WinningForwardContext *context = opaque;
     DraughtsPosition successor = context->predecessor;
     uint64_t index;
+    uint64_t friendly;
     int16_t value;
-    if (!draughts_do_move(&successor, context->mover, move, NULL) ||
-        !position_index(context->indexer, &successor, &index) ||
-        !egtb_get(context->database, index, context->successor_side, &value)) {
+    if (!draughts_do_move(&successor, context->mover, move, NULL)) {
+        context->failed = true;
+        return false;
+    }
+    friendly = context->successor_side == EGTB_WHITE_TO_MOVE
+                   ? successor.white_men | successor.white_kings
+                   : successor.black_men | successor.black_kings;
+    if (friendly == 0) {
+        value = 0;
+    } else if (has_indexer_material(context->indexer, &successor)) {
+        if (!position_index(context->indexer, &successor, &index) ||
+            !egtb_get(context->database, index, context->successor_side,
+                      &value)) {
+            context->failed = true;
+            return false;
+        }
+    } else if (context->external_probe == NULL ||
+               !context->external_probe(&successor, context->successor_side,
+                                        context->external_context, &value) ||
+               !valid_dtm(value)) {
         context->failed = true;
         return false;
     }
@@ -406,6 +463,8 @@ static bool check_winning_predecessor(
     forward.successor_side = context->successor_side;
     forward.predecessor = *predecessor;
     forward.loss_value = context->loss_value;
+    forward.external_probe = context->external_probe;
+    forward.external_context = context->external_context;
     if (!draughts_generate_moves(predecessor, context->mover,
                                  check_winning_successor, &forward,
                                  &move_count) || forward.failed) {
@@ -437,8 +496,9 @@ static bool check_winning_predecessor(
     return true;
 }
 
-bool egtb_backtrack_losses_to_wins(
+bool egtb_backtrack_losses_to_wins_with_probe(
     Egtb *database, const EgIndexer *indexer, int16_t loss_distance,
+    EgtbExternalProbe external_probe, void *external_context,
     EgtbGenericWinBacktrackStatistics *statistics)
 {
     EgtbGenericWinBacktrackStatistics local = {0};
@@ -482,6 +542,8 @@ bool egtb_backtrack_losses_to_wins(
             context.statistics = &local;
             context.loss_value = (int16_t)-loss_distance;
             context.win_value = (int16_t)(loss_distance + 1);
+            context.external_probe = external_probe;
+            context.external_context = external_context;
             if (!draughts_generate_quiet_predecessors(
                     &position, (EgtbSide)successor_side,
                     check_winning_predecessor, &context,
@@ -493,6 +555,14 @@ bool egtb_backtrack_losses_to_wins(
     if (statistics != NULL)
         *statistics = local;
     return true;
+}
+
+bool egtb_backtrack_losses_to_wins(
+    Egtb *database, const EgIndexer *indexer, int16_t loss_distance,
+    EgtbGenericWinBacktrackStatistics *statistics)
+{
+    return egtb_backtrack_losses_to_wins_with_probe(
+        database, indexer, loss_distance, NULL, NULL, statistics);
 }
 
 bool egtb_backtrack_lost_in_two(Egtb *database, const EgIndexer *indexer,
@@ -738,8 +808,9 @@ bool egtb_generate(Egtb *database, const EgIndexer *indexer,
         if (won_distance == INT16_MAX)
             return fail("DTM exceeds the signed 16-bit representation");
         loss_distance = (int16_t)(won_distance + 1);
-        if (!egtb_backtrack_wins_to_losses(database, indexer, won_distance,
-                                            &losses))
+        if (!egtb_backtrack_wins_to_losses_with_probe(
+                database, indexer, won_distance, external_probe,
+                external_context, &losses))
             return false;
         ++local.retrograde_passes;
         for (side = 0; side < 2; ++side) {
@@ -751,8 +822,9 @@ bool egtb_generate(Egtb *database, const EgIndexer *indexer,
         if (loss_updates == 0)
             break;
         local.maximum_dtm = (uint16_t)loss_distance;
-        if (!egtb_backtrack_losses_to_wins(database, indexer, loss_distance,
-                                            &wins))
+        if (!egtb_backtrack_losses_to_wins_with_probe(
+                database, indexer, loss_distance, external_probe,
+                external_context, &wins))
             return false;
         ++local.retrograde_passes;
         for (side = 0; side < 2; ++side) {

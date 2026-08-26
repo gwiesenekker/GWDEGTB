@@ -114,6 +114,11 @@ bool egtb_backtrack_wins_to_losses(
     Egtb *database, const EgIndexer *indexer, int16_t won_distance,
     EgtbLossBacktrackStatistics *statistics);
 
+bool egtb_backtrack_wins_to_losses_with_probe(
+    Egtb *database, const EgIndexer *indexer, int16_t won_distance,
+    EgtbExternalProbe external_probe, void *external_context,
+    EgtbLossBacktrackStatistics *statistics);
+
 /*
  * Backtrack lost-in-two entries through legal inverse quiet moves. A
  * predecessor is won in three when at least one legal forward move reaches an
@@ -126,6 +131,11 @@ bool egtb_backtrack_lost_in_two(Egtb *database, const EgIndexer *indexer,
 /* General lost-to-win pass. loss_distance must be nonzero and even. */
 bool egtb_backtrack_losses_to_wins(
     Egtb *database, const EgIndexer *indexer, int16_t loss_distance,
+    EgtbGenericWinBacktrackStatistics *statistics);
+
+bool egtb_backtrack_losses_to_wins_with_probe(
+    Egtb *database, const EgIndexer *indexer, int16_t loss_distance,
+    EgtbExternalProbe external_probe, void *external_context,
     EgtbGenericWinBacktrackStatistics *statistics);
 
 /*
