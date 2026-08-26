@@ -1,5 +1,6 @@
 #include "generator.h"
 
+#include "bitmap.h"
 #include "movegen.h"
 
 #include <stdarg.h>
@@ -30,19 +31,23 @@ typedef struct {
     int16_t loss_value;
     EgtbExternalProbe external_probe;
     void *external_context;
+    const Bitmap *won_exact;
+    const Bitmap *won_at_most;
     bool failed;
 } BacktrackContext;
 
 typedef struct {
-    Egtb *database;
     const EgIndexer *indexer;
     EgtbSide mover;
     EgtbSide successor_side;
     DraughtsPosition predecessor;
-    int16_t maximum_win;
+    int16_t won_distance;
     EgtbExternalProbe external_probe;
     void *external_context;
+    const Bitmap *won_exact;
+    const Bitmap *won_at_most;
     bool all_winning;
+    bool reaches_exact_win;
     bool failed;
 } ForwardCheckContext;
 
@@ -50,27 +55,10 @@ typedef struct {
     Egtb *database;
     const EgIndexer *indexer;
     EgtbSide mover;
-    EgtbSide successor_side;
     EgtbGenericWinBacktrackStatistics *statistics;
-    int16_t loss_value;
     int16_t win_value;
-    EgtbExternalProbe external_probe;
-    void *external_context;
     bool failed;
 } WinBacktrackContext;
-
-typedef struct {
-    Egtb *database;
-    const EgIndexer *indexer;
-    EgtbSide mover;
-    EgtbSide successor_side;
-    DraughtsPosition predecessor;
-    int16_t loss_value;
-    EgtbExternalProbe external_probe;
-    void *external_context;
-    bool reaches_target_loss;
-    bool failed;
-} WinningForwardContext;
 
 static char last_error[256];
 
@@ -248,12 +236,15 @@ static bool check_forward_successor(const DraughtsMove *move, void *opaque)
     if (friendly == 0) {
         value = 0;
     } else if (has_indexer_material(context->indexer, &successor)) {
-        if (!position_index(context->indexer, &successor, &index) ||
-            !egtb_get(context->database, index, context->successor_side,
-                      &value)) {
+        if (!position_index(context->indexer, &successor, &index)) {
             context->failed = true;
             return false;
         }
+        if (!bitmap_test(context->won_at_most, index))
+            context->all_winning = false;
+        if (bitmap_test(context->won_exact, index))
+            context->reaches_exact_win = true;
+        return true;
     } else if (context->external_probe == NULL ||
                !context->external_probe(&successor, context->successor_side,
                                         context->external_context, &value) ||
@@ -261,11 +252,10 @@ static bool check_forward_successor(const DraughtsMove *move, void *opaque)
         context->failed = true;
         return false;
     }
-    if (value <= 0) {
+    if (value <= 0 || value > context->won_distance) {
         context->all_winning = false;
-    } else if (value > context->maximum_win) {
-        context->maximum_win = value;
-    }
+    } else if (value == context->won_distance)
+        context->reaches_exact_win = true;
     return true;
 }
 
@@ -280,13 +270,15 @@ static bool check_predecessor(const DraughtsPosition *predecessor,
     (void)forward_move;
     ++context->statistics->predecessor_candidates[context->mover];
     memset(&forward, 0, sizeof(forward));
-    forward.database = context->database;
     forward.indexer = context->indexer;
     forward.mover = context->mover;
     forward.successor_side = context->successor_side;
     forward.predecessor = *predecessor;
+    forward.won_distance = context->won_distance;
     forward.external_probe = context->external_probe;
     forward.external_context = context->external_context;
+    forward.won_exact = context->won_exact;
+    forward.won_at_most = context->won_at_most;
     forward.all_winning = true;
     if (!draughts_generate_moves(predecessor, context->mover,
                                  check_forward_successor, &forward,
@@ -295,7 +287,7 @@ static bool check_predecessor(const DraughtsPosition *predecessor,
         return false;
     }
     if (move_count == 0 || !forward.all_winning ||
-        forward.maximum_win != context->won_distance)
+        !forward.reaches_exact_win)
         return true;
     if (!position_index(context->indexer, predecessor, &predecessor_index) ||
         !egtb_get(context->database, predecessor_index, context->mover,
@@ -328,8 +320,11 @@ bool egtb_backtrack_wins_to_losses_with_probe(
     EgtbLossBacktrackStatistics *statistics)
 {
     EgtbLossBacktrackStatistics local = {0};
+    Bitmap won_exact = {0};
+    Bitmap won_at_most = {0};
     uint64_t position_count;
-    uint64_t index;
+    unsigned successor_side;
+    bool success = false;
     if (database == NULL || indexer == NULL || won_distance <= 0 ||
         won_distance % 2 == 0 || won_distance == INT16_MAX)
         return fail("invalid win-to-loss backtrack argument");
@@ -337,28 +332,46 @@ bool egtb_backtrack_wins_to_losses_with_probe(
     if (position_count == 0 ||
         egtb_maximum_index(database) != position_count - 1)
         return fail("database and indexer sizes do not match");
-    for (index = 0; index < position_count; ++index) {
-        EgPosition indexed;
-        DraughtsPosition position;
-        unsigned successor_side;
-        if (!eg_index_to_position(indexer, index, &indexed))
-            return fail("cannot invert index %llu",
-                        (unsigned long long)index);
-        position.white_men = indexed.white_men;
-        position.black_men = indexed.black_men;
-        position.white_kings = indexed.white_kings;
-        position.black_kings = indexed.black_kings;
-        for (successor_side = 0; successor_side < 2; ++successor_side) {
+    if (!bitmap_create(&won_exact, position_count) ||
+        !bitmap_create(&won_at_most, position_count)) {
+        fail("cannot allocate win-frontier bitmaps");
+        goto done;
+    }
+    for (successor_side = 0; successor_side < 2; ++successor_side) {
+        uint64_t index;
+        uint64_t first;
+        bitmap_clear(&won_exact);
+        bitmap_clear(&won_at_most);
+        for (index = 0; index < position_count; ++index) {
+            int16_t value;
+            if (!egtb_get(database, index, (EgtbSide)successor_side,
+                          &value)) {
+                fail("cannot read index %llu, side %u: %s",
+                     (unsigned long long)index, successor_side,
+                     egtb_last_error());
+                goto done;
+            }
+            if (value > 0 && value <= won_distance)
+                bitmap_set(&won_at_most, index);
+            if (value == won_distance)
+                bitmap_set(&won_exact, index);
+        }
+        first = 0;
+        while (bitmap_find_next(&won_exact, first, &index)) {
+            EgPosition indexed;
+            DraughtsPosition position;
             BacktrackContext context;
             EgtbSide mover = opposite_side((EgtbSide)successor_side);
-            int16_t value;
             size_t predecessor_count;
-            if (!egtb_get(database, index, (EgtbSide)successor_side, &value))
-                return fail("cannot read index %llu, side %u: %s",
-                            (unsigned long long)index, successor_side,
-                            egtb_last_error());
-            if (value != won_distance)
-                continue;
+            first = index + 1;
+            if (!eg_index_to_position(indexer, index, &indexed)) {
+                fail("cannot invert index %llu", (unsigned long long)index);
+                goto done;
+            }
+            position.white_men = indexed.white_men;
+            position.black_men = indexed.black_men;
+            position.white_kings = indexed.white_kings;
+            position.black_kings = indexed.black_kings;
             ++local.won_sources[mover];
             memset(&context, 0, sizeof(context));
             context.database = database;
@@ -370,16 +383,24 @@ bool egtb_backtrack_wins_to_losses_with_probe(
             context.loss_value = (int16_t)-(won_distance + 1);
             context.external_probe = external_probe;
             context.external_context = external_context;
+            context.won_exact = &won_exact;
+            context.won_at_most = &won_at_most;
             if (!draughts_generate_quiet_predecessors(
                     &position, (EgtbSide)successor_side, check_predecessor,
-                    &context, &predecessor_count) || context.failed)
-                return fail("predecessor backtrack failed at index %llu, side %u",
-                            (unsigned long long)index, successor_side);
+                    &context, &predecessor_count) || context.failed) {
+                fail("predecessor backtrack failed at index %llu, side %u",
+                     (unsigned long long)index, successor_side);
+                goto done;
+            }
         }
     }
+    success = true;
     if (statistics != NULL)
         *statistics = local;
-    return true;
+done:
+    bitmap_destroy(&won_at_most);
+    bitmap_destroy(&won_exact);
+    return success;
 }
 
 bool egtb_backtrack_wins_to_losses(
@@ -410,69 +431,15 @@ bool egtb_backtrack_won_in_one(Egtb *database, const EgIndexer *indexer,
     return true;
 }
 
-static bool check_winning_successor(const DraughtsMove *move, void *opaque)
-{
-    WinningForwardContext *context = opaque;
-    DraughtsPosition successor = context->predecessor;
-    uint64_t index;
-    uint64_t friendly;
-    int16_t value;
-    if (!draughts_do_move(&successor, context->mover, move, NULL)) {
-        context->failed = true;
-        return false;
-    }
-    friendly = context->successor_side == EGTB_WHITE_TO_MOVE
-                   ? successor.white_men | successor.white_kings
-                   : successor.black_men | successor.black_kings;
-    if (friendly == 0) {
-        value = 0;
-    } else if (has_indexer_material(context->indexer, &successor)) {
-        if (!position_index(context->indexer, &successor, &index) ||
-            !egtb_get(context->database, index, context->successor_side,
-                      &value)) {
-            context->failed = true;
-            return false;
-        }
-    } else if (context->external_probe == NULL ||
-               !context->external_probe(&successor, context->successor_side,
-                                        context->external_context, &value) ||
-               !valid_dtm(value)) {
-        context->failed = true;
-        return false;
-    }
-    if (value == context->loss_value)
-        context->reaches_target_loss = true;
-    return true;
-}
-
 static bool check_winning_predecessor(
     const DraughtsPosition *predecessor,
     const DraughtsMove *forward_move, void *opaque)
 {
     WinBacktrackContext *context = opaque;
-    WinningForwardContext forward;
     uint64_t predecessor_index;
-    size_t move_count;
     int16_t old_value;
     (void)forward_move;
     ++context->statistics->predecessor_candidates[context->mover];
-    memset(&forward, 0, sizeof(forward));
-    forward.database = context->database;
-    forward.indexer = context->indexer;
-    forward.mover = context->mover;
-    forward.successor_side = context->successor_side;
-    forward.predecessor = *predecessor;
-    forward.loss_value = context->loss_value;
-    forward.external_probe = context->external_probe;
-    forward.external_context = context->external_context;
-    if (!draughts_generate_moves(predecessor, context->mover,
-                                 check_winning_successor, &forward,
-                                 &move_count) || forward.failed) {
-        context->failed = true;
-        return false;
-    }
-    if (move_count == 0 || !forward.reaches_target_loss)
-        return true;
     if (!position_index(context->indexer, predecessor, &predecessor_index) ||
         !egtb_get(context->database, predecessor_index, context->mover,
                   &old_value)) {
@@ -502,8 +469,12 @@ bool egtb_backtrack_losses_to_wins_with_probe(
     EgtbGenericWinBacktrackStatistics *statistics)
 {
     EgtbGenericWinBacktrackStatistics local = {0};
+    Bitmap lost_exact = {0};
     uint64_t position_count;
-    uint64_t index;
+    unsigned successor_side;
+    bool success = false;
+    (void)external_probe;
+    (void)external_context;
     if (database == NULL || indexer == NULL || loss_distance <= 0 ||
         loss_distance % 2 != 0 || loss_distance == INT16_MAX)
         return fail("invalid loss-to-win backtrack argument");
@@ -511,50 +482,63 @@ bool egtb_backtrack_losses_to_wins_with_probe(
     if (position_count == 0 ||
         egtb_maximum_index(database) != position_count - 1)
         return fail("database and indexer sizes do not match");
-    for (index = 0; index < position_count; ++index) {
-        EgPosition indexed;
-        DraughtsPosition position;
-        unsigned successor_side;
-        if (!eg_index_to_position(indexer, index, &indexed))
-            return fail("cannot invert index %llu",
-                        (unsigned long long)index);
-        position.white_men = indexed.white_men;
-        position.black_men = indexed.black_men;
-        position.white_kings = indexed.white_kings;
-        position.black_kings = indexed.black_kings;
-        for (successor_side = 0; successor_side < 2; ++successor_side) {
+    if (!bitmap_create(&lost_exact, position_count))
+        return fail("cannot allocate loss-frontier bitmap");
+    for (successor_side = 0; successor_side < 2; ++successor_side) {
+        uint64_t index;
+        uint64_t first;
+        bitmap_clear(&lost_exact);
+        for (index = 0; index < position_count; ++index) {
+            int16_t value;
+            if (!egtb_get(database, index, (EgtbSide)successor_side,
+                          &value)) {
+                fail("cannot read index %llu, side %u: %s",
+                     (unsigned long long)index, successor_side,
+                     egtb_last_error());
+                goto done;
+            }
+            if (value == -loss_distance)
+                bitmap_set(&lost_exact, index);
+        }
+        first = 0;
+        while (bitmap_find_next(&lost_exact, first, &index)) {
+            EgPosition indexed;
+            DraughtsPosition position;
             WinBacktrackContext context;
             EgtbSide mover = opposite_side((EgtbSide)successor_side);
-            int16_t value;
             size_t predecessor_count;
-            if (!egtb_get(database, index, (EgtbSide)successor_side, &value))
-                return fail("cannot read index %llu, side %u: %s",
-                            (unsigned long long)index, successor_side,
-                            egtb_last_error());
-            if (value != -loss_distance)
-                continue;
+            first = index + 1;
+            if (!eg_index_to_position(indexer, index, &indexed)) {
+                fail("cannot invert index %llu", (unsigned long long)index);
+                goto done;
+            }
+            position.white_men = indexed.white_men;
+            position.black_men = indexed.black_men;
+            position.white_kings = indexed.white_kings;
+            position.black_kings = indexed.black_kings;
             ++local.loss_sources[mover];
             memset(&context, 0, sizeof(context));
             context.database = database;
             context.indexer = indexer;
             context.mover = mover;
-            context.successor_side = (EgtbSide)successor_side;
             context.statistics = &local;
-            context.loss_value = (int16_t)-loss_distance;
             context.win_value = (int16_t)(loss_distance + 1);
-            context.external_probe = external_probe;
-            context.external_context = external_context;
             if (!draughts_generate_quiet_predecessors(
                     &position, (EgtbSide)successor_side,
                     check_winning_predecessor, &context,
-                    &predecessor_count) || context.failed)
-                return fail("winning predecessor backtrack failed at index %llu, side %u",
-                            (unsigned long long)index, successor_side);
+                    &predecessor_count) || context.failed) {
+                fail("winning predecessor backtrack failed at index %llu, side %u",
+                     (unsigned long long)index, successor_side);
+                goto done;
+            }
         }
     }
+    success = true;
     if (statistics != NULL)
         *statistics = local;
-    return true;
+done:
+    bitmap_destroy(&lost_exact);
+    return success;
 }
 
 bool egtb_backtrack_losses_to_wins(

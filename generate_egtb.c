@@ -10,10 +10,19 @@
 #include <string.h>
 #include <unistd.h>
 
+enum {
+    GENERATION_PAGE_SIZE = 1024,
+    GENERATION_CACHE_BYTES = 256 * 1024 * 1024,
+    READONLY_CACHE_BYTES = 16 * 1024 * 1024,
+    GENERATION_CACHE_PAGES = GENERATION_CACHE_BYTES / GENERATION_PAGE_SIZE,
+    READONLY_CACHE_PAGES = READONLY_CACHE_BYTES / GENERATION_PAGE_SIZE
+};
+
 typedef struct {
     EgtbMaterialKind kind;
     EgtbMaterial canonical;
     Egtb *database;
+    EgtbView *view;
     EgIndexer indexer;
     bool indexer_initialized;
 } CatalogEntry;
@@ -55,6 +64,10 @@ static void close_catalog(DatabaseCatalog *catalog)
             for (bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
                 for (bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
                     CatalogEntry *entry = &catalog->entry[wk][wm][bk][bm];
+                    if (entry->view != NULL) {
+                        egtb_view_close(entry->view);
+                        entry->view = NULL;
+                    }
                     if (entry->database != NULL) {
                         egtb_close(entry->database);
                         entry->database = NULL;
@@ -85,9 +98,16 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
         return false;
     }
     entry->indexer_initialized = true;
-    if (!egtb_open_readonly(&entry->database, path, catalog->cache_pages)) {
+    if (!egtb_open_readonly(&entry->database, path, 1)) {
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot open dependency %.100s: %.100s", path,
+                 egtb_last_error());
+        return false;
+    }
+    if (!egtb_view_create(&entry->view, entry->database,
+                          catalog->cache_pages, false)) {
+        snprintf(catalog->error, sizeof(catalog->error),
+                 "cannot create dependency view for %.100s: %.100s", path,
                  egtb_last_error());
         return false;
     }
@@ -141,7 +161,7 @@ static bool catalog_probe(const DraughtsPosition *position, EgtbSide side,
     indexed.white_kings = transformed.white_kings;
     indexed.black_kings = transformed.black_kings;
     if (!eg_position_to_index(&entry->indexer, &indexed, &index) ||
-        !egtb_get(entry->database, index, side, value)) {
+        !egtb_view_get(entry->view, index, side, value)) {
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot query dependency: %.200s", egtb_last_error());
         return false;
@@ -186,7 +206,7 @@ int main(int argc, char **argv)
     EgtbMaterial requested, material;
     EgtbMaterialKind kind;
     char path[128];
-    EgtbCreateOptions options = {1024, 20, 9};
+    EgtbCreateOptions options = {GENERATION_CACHE_PAGES, 20, 9};
     EgtbGenerationStatistics generation;
     EgtbStorageStatistics storage;
     DatabaseCatalog *catalog = NULL;
@@ -231,8 +251,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "cannot allocate EGTB catalog\n");
         goto done;
     }
-    initialize_catalog(catalog, 16);
-    if (!egtb_create(&database, path, positions - 1, 1024, &options)) {
+    initialize_catalog(catalog, READONLY_CACHE_PAGES);
+    if (!egtb_create(&database, path, positions - 1,
+                     GENERATION_PAGE_SIZE, &options)) {
         fprintf(stderr, "cannot create %s: %s\n", path, egtb_last_error());
         goto done;
     }
@@ -255,8 +276,8 @@ int main(int argc, char **argv)
     }
     database = NULL;
     close_catalog(catalog);
-    if (!egtb_compact(path, 9, 16) ||
-        !egtb_open_readonly(&database, path, 16) ||
+    if (!egtb_compact(path, 9, READONLY_CACHE_PAGES) ||
+        !egtb_open_readonly(&database, path, READONLY_CACHE_PAGES) ||
         !egtb_storage_statistics(database, &storage)) {
         fprintf(stderr, "cannot compact/reopen %s: %s\n", path,
                 egtb_last_error());

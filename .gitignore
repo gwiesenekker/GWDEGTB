@@ -8,6 +8,8 @@
 /test_movegen
 /test_generator
 /test_material
+/test_bitmap
 /generate_egtb
 /*.dtm
 /*.wdl
+/logs/

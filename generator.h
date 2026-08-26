@@ -121,9 +121,9 @@ bool egtb_backtrack_wins_to_losses_with_probe(
 
 /*
  * Backtrack lost-in-two entries through legal inverse quiet moves. A
- * predecessor is won in three when at least one legal forward move reaches an
- * opponent lost-in-two entry. Unknown entries and wins longer than three are
- * updated; shorter wins are preserved. The database is not flushed.
+ * predecessor is won in three because its corresponding legal forward move
+ * reaches the source lost-in-two entry. Unknown entries and wins longer than
+ * three are updated; shorter wins are preserved. The database is not flushed.
  */
 bool egtb_backtrack_lost_in_two(Egtb *database, const EgIndexer *indexer,
                                 EgtbWinBacktrackStatistics *statistics);

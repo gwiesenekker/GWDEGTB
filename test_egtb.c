@@ -64,6 +64,108 @@ static bool same_statistics(const Statistics *a, const Statistics *b)
     return memcmp(a, b, sizeof(*a)) == 0;
 }
 
+static bool test_direct_cache_views(void)
+{
+    char handle_path[] = "/tmp/ipd-egtb-handle-XXXXXX";
+    char direct_path[] = "/tmp/ipd-egtb-direct-XXXXXX";
+    EgtbCreateOptions options = {4, 20, 3};
+    Egtb *handle = NULL, *direct = NULL;
+    EgtbView *write_view = NULL, *read_view = NULL;
+    EgtbCacheStatistics cache_statistics;
+    uint64_t state = UINT64_C(0x4d595df4d0f33173);
+    const uint64_t positions = 16384;
+    unsigned write_number;
+    int handle_descriptor = mkstemp(handle_path);
+    int direct_descriptor = mkstemp(direct_path);
+    bool ok = false;
+    if (handle_descriptor < 0 || direct_descriptor < 0)
+        goto done;
+    close(handle_descriptor);
+    close(direct_descriptor);
+    handle_descriptor = direct_descriptor = -1;
+    unlink(handle_path);
+    unlink(direct_path);
+    if (!egtb_create(&handle, handle_path, positions - 1, 1024, &options) ||
+        !egtb_create(&direct, direct_path, positions - 1, 1024, &options) ||
+        !egtb_view_create(&write_view, direct, 4, true))
+        goto done;
+    for (write_number = 0; write_number < 32768; ++write_number) {
+        uint64_t index;
+        EgtbSide side;
+        int16_t value, read_back;
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        index = (state * UINT64_C(2685821657736338717)) % positions;
+        side = (EgtbSide)(state & 1);
+        value = (state & 2) != 0
+                    ? (int16_t)(1 + 2 * (state % 256))
+                    : (int16_t)(-2 * (int)(state % 257));
+        if (!egtb_set(handle, index, side, value) ||
+            !egtb_view_set(write_view, index, side, value) ||
+            !egtb_view_get(write_view, index, side, &read_back) ||
+            read_back != value)
+            goto done;
+    }
+    egtb_view_cache_statistics(write_view, &cache_statistics);
+    if (cache_statistics.lookups == 0 || cache_statistics.hits == 0 ||
+        cache_statistics.misses == 0 ||
+        cache_statistics.dirty_evictions == 0)
+        goto done;
+    if (!egtb_view_close(write_view))
+        goto done;
+    write_view = NULL;
+    if (!egtb_flush(handle))
+        goto done;
+    for (uint64_t index = 0; index < positions; ++index) {
+        for (unsigned side = 0; side < 2; ++side) {
+            int16_t handle_value, direct_value;
+            if (!egtb_get(handle, index, (EgtbSide)side, &handle_value) ||
+                !egtb_get(direct, index, (EgtbSide)side, &direct_value) ||
+                handle_value != direct_value)
+                goto done;
+        }
+    }
+    if (!egtb_close(handle) || !egtb_close(direct))
+        goto done;
+    handle = direct = NULL;
+    if (!egtb_open_readonly(&handle, handle_path, 4) ||
+        !egtb_open_readonly(&direct, direct_path, 1) ||
+        !egtb_view_create(&read_view, direct, 4, false))
+        goto done;
+    for (uint64_t index = 0; index < positions; ++index) {
+        for (unsigned side = 0; side < 2; ++side) {
+            int16_t handle_value, direct_value;
+            if (!egtb_get(handle, index, (EgtbSide)side, &handle_value) ||
+                !egtb_view_get(read_view, index, (EgtbSide)side,
+                               &direct_value) ||
+                handle_value != direct_value)
+                goto done;
+        }
+    }
+    egtb_view_cache_statistics(read_view, &cache_statistics);
+    if (cache_statistics.lookups != positions * 2 ||
+        cache_statistics.hits == 0 || cache_statistics.misses == 0)
+        goto done;
+    ok = true;
+done:
+    if (write_view != NULL)
+        egtb_view_close(write_view);
+    if (read_view != NULL)
+        egtb_view_close(read_view);
+    if (handle != NULL)
+        egtb_close(handle);
+    if (direct != NULL)
+        egtb_close(direct);
+    if (handle_descriptor >= 0)
+        close(handle_descriptor);
+    if (direct_descriptor >= 0)
+        close(direct_descriptor);
+    unlink(handle_path);
+    unlink(direct_path);
+    return ok;
+}
+
 static bool collect_wdl_statistics(Wdl *wdl, WdlStatistics *statistics)
 {
     uint64_t index;
@@ -146,6 +248,12 @@ int main(void)
     uint64_t count, writes, write_number, last_index = 0;
     struct stat before_compaction, after_compaction;
     int descriptor;
+
+    if (!test_direct_cache_views()) {
+        fprintf(stderr, "direct-mapped cache-view regression failed: %s\n",
+                egtb_last_error());
+        return EXIT_FAILURE;
+    }
 
     descriptor = mkstemp(stem);
     if (descriptor < 0) {

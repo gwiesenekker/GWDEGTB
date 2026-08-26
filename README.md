@@ -50,12 +50,13 @@ conversion functions; callers must then satisfy their documented preconditions.
 
 `egtb.c` stores two signed 16-bit DTM values per position in independently
 Zstd-compressed pages. The versioned header records the page size and maximum
-index. Read/write databases keep their 10-byte-per-page directory in RAM and
-use a configurable private LRU cache with dirty write-back and uncompressed
+index. Databases keep their 10-byte-per-page directory in RAM and use a
+configurable direct-mapped page cache with dirty write-back and uncompressed
 page checksums. Every stored block also carries a CRC32C of its uncompressed
-page, which is verified after decompression. Read-only handles are shared by
-path, keep their own small page
-cache, and seek to directory entries on cache misses.
+page, which is verified after decompression. Read-only backings are shared by
+path; additional views share their immutable directory while owning private
+page caches and ZSTD state. View misses use `pread()` and do not share a seek
+position.
 
 An offset and length of zero represents an implicit all-draw page. Growing
 compressed pages are appended; `egtb_compact()` rewrites all live pages without
@@ -176,12 +177,28 @@ and longer existing losses are updated; shorter losses are preserved.
 `egtb_backtrack_won_in_one()` remains as a convenience wrapper using `N=1`.
 Neither function flushes the database.
 
+The win-to-loss pass builds two packed, reusable `uint64_t` bitmaps for one
+successor side at a time: positions won in exactly `N`, and positions won in
+at most `N`. It iterates only the set bits in the exact frontier. Forward
+successors in the current EGTB are proved through the immutable bitmaps rather
+than page-cache lookups. At 256 EGTB entries per 1024-byte page, each page maps
+to exactly four bitmap words, which provides the page/word boundary needed by
+the planned threaded slices.
+
 `egtb_backtrack_losses_to_wins()` performs the existential reverse step for any
 positive even distance `N`. It generates legal predecessors of lost-in-`N`
-positions and replays all their legal forward moves. A predecessor becomes won
-in `N+1` if any successor is lost in `N`. Unknown entries and longer positive
-wins are updated; shorter wins are retained. `egtb_backtrack_lost_in_two()` is
-the convenience wrapper for `N=2`. Neither function flushes the database.
+positions. The inverse generator supplies the corresponding legal forward
+move, which itself proves that the predecessor can reach the lost-in-`N`
+position; forward moves are therefore not regenerated. Unknown entries and
+longer positive wins are updated to won in `N+1`; shorter wins are retained.
+`egtb_backtrack_lost_in_two()` is the convenience wrapper for `N=2`. Neither
+function flushes the database.
+
+The loss-to-win pass needs only one frontier bitmap: positions lost in exactly
+`N`. Iterating that bitmap and generating legal inverse moves provides the
+existential proof directly. The current EGTB value is still read before writing
+to preserve an already known shorter win; that eligibility state does not
+require a second bitmap.
 
 `egtb_generate()` starts with terminal initialization and alternates the two
 parameterized passes for distances 1, 2, 3, 4, and so on. It stops when a pass
@@ -208,6 +225,18 @@ colors and swap WTM/BTM.
 Within each piece count, generation order places the larger material side on
 White and enumerates White kings descending, then Black kings descending. This
 matches the GWD job order and ensures promotions target earlier databases.
+
+With the generator's 1024-byte page size, the writable database uses a 256 MiB
+uncompressed page cache. Every previously generated database opened for
+read-only dependency lookups uses a 16 MiB cache. These capacities exclude the
+page dictionaries and cache metadata.
+
+DTM page caches are direct-mapped by page number. An `Egtb` backing owns the
+file header and one in-memory immutable page dictionary; additional
+`EgtbView` objects share that backing while keeping their decompressed pages,
+ZSTD contexts, compressed buffers, and cache statistics private. Read-only
+view misses use `pread()` and therefore do not share a seek position. Writable
+views use the same direct mapping and flush a dirty slot before replacing it.
 
 Only after the final zero-update pass does the generator flush the working
 pages, close the working file, compact the live blocks into a temporary file,

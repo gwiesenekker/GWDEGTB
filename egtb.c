@@ -19,14 +19,9 @@
 #define EGTB_DIRECTORY_ENTRY_SIZE 10
 #define EGTB_BLOCK_HEADER_SIZE 4
 #define EGTB_FLAG_EXACT_LAYOUT 1
-#define CACHE_NONE SIZE_MAX
-
 typedef struct {
     uint64_t page_index;
     uint32_t checksum;
-    size_t hash_next;
-    size_t lru_previous;
-    size_t lru_next;
     bool valid;
     bool dirty;
 } CacheEntry;
@@ -34,13 +29,15 @@ typedef struct {
 typedef struct {
     CacheEntry *entries;
     unsigned char *data;
-    size_t *buckets;
     size_t capacity;
-    size_t used;
-    size_t bucket_count;
-    size_t lru_head;
-    size_t lru_tail;
 } PageCache;
+
+typedef struct {
+    uint64_t page_index;
+    uint32_t checksum;
+    bool valid;
+    bool dirty;
+} DirectCacheEntry;
 
 struct Egtb {
     FILE *file;
@@ -59,12 +56,27 @@ struct Egtb {
     bool exact_layout;
     bool registered;
     unsigned references;
+    unsigned view_count;
+    bool writable_view;
     PageCache cache;
     ZSTD_CCtx *compressor;
     ZSTD_DCtx *decompressor;
     unsigned char *compressed;
     size_t compressed_capacity;
     struct Egtb *registry_next;
+};
+
+struct EgtbView {
+    Egtb *backing;
+    DirectCacheEntry *entries;
+    unsigned char *data;
+    size_t capacity;
+    bool writable;
+    ZSTD_CCtx *compressor;
+    ZSTD_DCtx *decompressor;
+    unsigned char *compressed;
+    size_t compressed_capacity;
+    EgtbCacheStatistics statistics;
 };
 
 static const unsigned char egtb_magic[8] = {'I','P','D','E','G','T','B','\0'};
@@ -161,6 +173,29 @@ static bool read_at(FILE *file, uint64_t offset, void *data, size_t size)
     return seek_file(file, offset) &&
            (fread(data, 1, size, file) == size ||
             fail("file read failed or was truncated"));
+}
+
+static bool pread_at(int descriptor, uint64_t offset, void *data, size_t size)
+{
+    unsigned char *destination = data;
+    size_t completed = 0;
+    if (offset > (uint64_t)INT64_MAX ||
+        size > (size_t)((uint64_t)INT64_MAX - offset))
+        return fail("file read offset is too large");
+    while (completed < size) {
+        ssize_t result = pread(descriptor, destination + completed,
+                               size - completed,
+                               (off_t)(offset + completed));
+        if (result < 0) {
+            if (errno == EINTR)
+                continue;
+            return fail("file read failed: %s", strerror(errno));
+        }
+        if (result == 0)
+            return fail("file read failed or was truncated");
+        completed += (size_t)result;
+    }
+    return true;
 }
 
 static bool write_at(FILE *file, uint64_t offset, const void *data, size_t size)
@@ -279,30 +314,19 @@ static uint32_t page_checksum(const Egtb *egtb, const EgtbEntry *entries)
 static bool cache_init(Egtb *egtb, size_t capacity)
 {
     PageCache *cache = &egtb->cache;
-    size_t buckets = 1;
     if (capacity == 0)
         return fail("page cache must contain at least one page");
     if (egtb->page_count < capacity)
         capacity = (size_t)egtb->page_count;
     if (capacity == 0)
         capacity = 1;
-    while (buckets < capacity * 2) {
-        if (buckets > SIZE_MAX / 2)
-            return fail("page cache is too large");
-        buckets *= 2;
-    }
     if (capacity > SIZE_MAX / egtb->page_size)
         return fail("page cache byte size overflows size_t");
     cache->entries = calloc(capacity, sizeof(*cache->entries));
     cache->data = malloc(capacity * egtb->page_size);
-    cache->buckets = malloc(buckets * sizeof(*cache->buckets));
-    if (cache->entries == NULL || cache->data == NULL || cache->buckets == NULL)
+    if (cache->entries == NULL || cache->data == NULL)
         return fail("cannot allocate page cache");
     cache->capacity = capacity;
-    cache->bucket_count = buckets;
-    cache->lru_head = CACHE_NONE;
-    cache->lru_tail = CACHE_NONE;
-    memset(cache->buckets, 0xff, buckets * sizeof(*cache->buckets));
     return true;
 }
 
@@ -310,74 +334,12 @@ static void cache_destroy(PageCache *cache)
 {
     free(cache->entries);
     free(cache->data);
-    free(cache->buckets);
     memset(cache, 0, sizeof(*cache));
 }
 
-static size_t hash_bucket(const PageCache *cache, uint64_t page_index)
+static void cache_invalidate(PageCache *cache)
 {
-    uint64_t hash = page_index * UINT64_C(11400714819323198485);
-    return (size_t)(hash & (cache->bucket_count - 1));
-}
-
-static size_t cache_find(const PageCache *cache, uint64_t page_index)
-{
-    size_t entry = cache->buckets[hash_bucket(cache, page_index)];
-    while (entry != CACHE_NONE) {
-        if (cache->entries[entry].page_index == page_index)
-            return entry;
-        entry = cache->entries[entry].hash_next;
-    }
-    return CACHE_NONE;
-}
-
-static void lru_remove(PageCache *cache, size_t index)
-{
-    CacheEntry *entry = &cache->entries[index];
-    if (entry->lru_previous != CACHE_NONE)
-        cache->entries[entry->lru_previous].lru_next = entry->lru_next;
-    else
-        cache->lru_head = entry->lru_next;
-    if (entry->lru_next != CACHE_NONE)
-        cache->entries[entry->lru_next].lru_previous = entry->lru_previous;
-    else
-        cache->lru_tail = entry->lru_previous;
-}
-
-static void lru_push_front(PageCache *cache, size_t index)
-{
-    CacheEntry *entry = &cache->entries[index];
-    entry->lru_previous = CACHE_NONE;
-    entry->lru_next = cache->lru_head;
-    if (cache->lru_head != CACHE_NONE)
-        cache->entries[cache->lru_head].lru_previous = index;
-    else
-        cache->lru_tail = index;
-    cache->lru_head = index;
-}
-
-static void cache_touch(PageCache *cache, size_t index)
-{
-    if (cache->lru_head == index)
-        return;
-    lru_remove(cache, index);
-    lru_push_front(cache, index);
-}
-
-static void hash_remove(PageCache *cache, size_t index)
-{
-    size_t bucket = hash_bucket(cache, cache->entries[index].page_index);
-    size_t *link = &cache->buckets[bucket];
-    while (*link != index)
-        link = &cache->entries[*link].hash_next;
-    *link = cache->entries[index].hash_next;
-}
-
-static void hash_insert(PageCache *cache, size_t index)
-{
-    size_t bucket = hash_bucket(cache, cache->entries[index].page_index);
-    cache->entries[index].hash_next = cache->buckets[bucket];
-    cache->buckets[bucket] = index;
+    memset(cache->entries, 0, cache->capacity * sizeof(*cache->entries));
 }
 
 static EgtbEntry *cache_data(Egtb *egtb, size_t index)
@@ -388,22 +350,9 @@ static EgtbEntry *cache_data(Egtb *egtb, size_t index)
 static bool directory_entry(Egtb *egtb, uint64_t page, uint64_t *offset,
                             uint16_t *length)
 {
-    if (!egtb->readonly) {
-        *offset = egtb->offsets[page];
-        *length = egtb->lengths[page];
-        return true;
-    } else {
-        unsigned char bytes[EGTB_DIRECTORY_ENTRY_SIZE];
-        uint64_t at = egtb->directory_offset +
-                      page * EGTB_DIRECTORY_ENTRY_SIZE;
-        if (!read_at(egtb->file, at, bytes, sizeof(bytes)))
-            return false;
-        *offset = get_u64(bytes);
-        *length = get_u16(bytes + 8);
-        if ((*offset == 0) != (*length == 0))
-            return fail("invalid directory entry for page %" PRIu64, page);
-        return true;
-    }
+    *offset = egtb->offsets[page];
+    *length = egtb->lengths[page];
+    return true;
 }
 
 static bool all_draws(const Egtb *egtb, const EgtbEntry *entries)
@@ -442,8 +391,11 @@ static bool append_block(Egtb *egtb, uint32_t checksum,
     return true;
 }
 
-static bool store_page(Egtb *egtb, uint64_t page, const EgtbEntry *entries,
-                       bool exact)
+static bool store_page_with_runtime(Egtb *egtb, ZSTD_CCtx *compressor,
+                                    unsigned char *compressed,
+                                    size_t compressed_capacity,
+                                    uint64_t page,
+                                    const EgtbEntry *entries, bool exact)
 {
     uint64_t old_offset = egtb->offsets[page];
     uint16_t old_length = egtb->lengths[page];
@@ -457,8 +409,8 @@ static bool store_page(Egtb *egtb, uint64_t page, const EgtbEntry *entries,
         egtb->lengths[page] = 0;
         return true;
     }
-    compressed_size = ZSTD_compressCCtx(egtb->compressor, egtb->compressed,
-                                        egtb->compressed_capacity, entries,
+    compressed_size = ZSTD_compressCCtx(compressor, compressed,
+                                        compressed_capacity, entries,
                                         egtb->page_size,
                                         egtb->compression_level);
     if (ZSTD_isError(compressed_size))
@@ -485,15 +437,23 @@ static bool store_page(Egtb *egtb, uint64_t page, const EgtbEntry *entries,
         if (!write_at(egtb->file, old_offset, checksum_bytes,
                       sizeof(checksum_bytes)) ||
             !write_at(egtb->file, old_offset + EGTB_BLOCK_HEADER_SIZE,
-                      egtb->compressed, length))
+                      compressed, length))
             return false;
         egtb->offsets[page] = old_offset;
-    } else if (!append_block(egtb, checksum, egtb->compressed, length,
+    } else if (!append_block(egtb, checksum, compressed, length,
                              minimum, &egtb->offsets[page])) {
         return false;
     }
     egtb->lengths[page] = length;
     return true;
+}
+
+static bool store_page(Egtb *egtb, uint64_t page, const EgtbEntry *entries,
+                       bool exact)
+{
+    return store_page_with_runtime(
+        egtb, egtb->compressor, egtb->compressed,
+        egtb->compressed_capacity, page, entries, exact);
 }
 
 static bool flush_cache_entry(Egtb *egtb, size_t index)
@@ -560,25 +520,19 @@ static bool load_page(Egtb *egtb, uint64_t page, EgtbEntry *entries)
 static bool cached_page(Egtb *egtb, uint64_t page, size_t *result)
 {
     PageCache *cache = &egtb->cache;
-    size_t index = cache_find(cache, page);
+    size_t index = (size_t)(page % cache->capacity);
     CacheEntry *entry;
     EgtbEntry *data;
 
-    if (index != CACHE_NONE) {
-        cache_touch(cache, index);
+    entry = &cache->entries[index];
+    if (entry->valid && entry->page_index == page) {
         *result = index;
         return true;
     }
-    if (cache->used < cache->capacity) {
-        index = cache->used++;
-    } else {
-        index = cache->lru_tail;
+    if (entry->valid && entry->dirty) {
         if (!flush_cache_entry(egtb, index))
             return false;
-        hash_remove(cache, index);
-        lru_remove(cache, index);
     }
-    entry = &cache->entries[index];
     data = cache_data(egtb, index);
     if (!load_page(egtb, page, data))
         return false;
@@ -586,11 +540,6 @@ static bool cached_page(Egtb *egtb, uint64_t page, size_t *result)
     entry->checksum = page_checksum(egtb, data);
     entry->dirty = false;
     entry->valid = true;
-    entry->hash_next = CACHE_NONE;
-    entry->lru_previous = CACHE_NONE;
-    entry->lru_next = CACHE_NONE;
-    hash_insert(cache, index);
-    lru_push_front(cache, index);
     *result = index;
     return true;
 }
@@ -711,7 +660,7 @@ static bool open_common(Egtb **out, const char *path, bool readonly,
         return fail("cannot allocate EGTB path");
     }
     strcpy(egtb->path, path);
-    if (!read_header(egtb) || (!readonly && !load_directory(egtb)) ||
+    if (!read_header(egtb) || !load_directory(egtb) ||
         !allocate_runtime(egtb, cache_pages)) {
         destroy_egtb(egtb);
         return false;
@@ -834,9 +783,11 @@ bool egtb_flush(Egtb *egtb)
     size_t i;
     if (egtb == NULL)
         return fail("cannot flush a null EGTB");
+    if (egtb->writable_view)
+        return fail("cannot flush an EGTB with an active writable view");
     if (egtb->readonly)
         return true;
-    for (i = 0; i < egtb->cache.used; ++i) {
+    for (i = 0; i < egtb->cache.capacity; ++i) {
         if (!flush_cache_entry(egtb, i))
             return false;
     }
@@ -851,6 +802,8 @@ bool egtb_close(Egtb *egtb)
     bool ok = true;
     if (egtb == NULL)
         return true;
+    if (egtb->view_count != 0)
+        return fail("cannot close an EGTB with active cache views");
     if (egtb->registered && egtb->references > 1) {
         --egtb->references;
         return true;
@@ -882,7 +835,8 @@ bool egtb_get(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value)
     uint32_t slot;
     size_t cache_index;
     EgtbEntry *entries;
-    if (egtb == NULL || value == NULL || index > egtb->maximum_index ||
+    if (egtb == NULL || egtb->writable_view || value == NULL ||
+        index > egtb->maximum_index ||
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid EGTB lookup");
     page = index / egtb->entries_per_page;
@@ -903,7 +857,8 @@ bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value)
     CacheEntry *cache_entry;
     EgtbEntry *entries;
     EgtbEntry old;
-    if (egtb == NULL || egtb->readonly || index > egtb->maximum_index ||
+    if (egtb == NULL || egtb->readonly || egtb->writable_view ||
+        index > egtb->maximum_index ||
         !valid_value(value) ||
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid EGTB update");
@@ -922,6 +877,263 @@ bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value)
                              slot_checksum(slot, &entries[slot]);
     cache_entry->dirty = true;
     return true;
+}
+
+static EgtbEntry *view_cache_data(EgtbView *view, size_t slot)
+{
+    return (EgtbEntry *)(void *)(view->data +
+                                 slot * view->backing->page_size);
+}
+
+static bool view_load_page(EgtbView *view, uint64_t page, EgtbEntry *entries)
+{
+    Egtb *egtb = view->backing;
+    uint64_t offset = egtb->offsets[page];
+    uint16_t length = egtb->lengths[page];
+    size_t decompressed;
+    unsigned char checksum_bytes[EGTB_BLOCK_HEADER_SIZE];
+    uint32_t expected_checksum, actual_checksum;
+    int descriptor = fileno(egtb->file);
+    if (offset == 0) {
+        fill_draw_page(egtb, entries);
+        return true;
+    }
+    if (descriptor < 0 || length > view->compressed_capacity)
+        return fail("cannot read compressed page through cache view");
+    if (!pread_at(descriptor, offset, checksum_bytes,
+                  sizeof(checksum_bytes)) ||
+        !pread_at(descriptor, offset + EGTB_BLOCK_HEADER_SIZE,
+                  view->compressed, length))
+        return false;
+    expected_checksum = get_u32(checksum_bytes);
+    decompressed = ZSTD_decompressDCtx(
+        view->decompressor, entries, egtb->page_size,
+        view->compressed, length);
+    if (ZSTD_isError(decompressed))
+        return fail("Zstd decompression failed for page %" PRIu64 ": %s",
+                    page, ZSTD_getErrorName(decompressed));
+    if (decompressed != egtb->page_size)
+        return fail("decompressed page has an invalid size");
+    actual_checksum = crc32c(entries, egtb->page_size);
+    if (actual_checksum != expected_checksum)
+        return fail("CRC32C mismatch for uncompressed page %" PRIu64, page);
+    ++view->statistics.decompressions;
+    return true;
+}
+
+static bool view_flush_slot(EgtbView *view, size_t slot)
+{
+    DirectCacheEntry *entry = &view->entries[slot];
+    EgtbEntry *data;
+    bool compressed_write;
+    if (!entry->valid || !entry->dirty)
+        return true;
+    if (!view->writable)
+        return fail("attempt to flush a dirty read-only cache view");
+    data = view_cache_data(view, slot);
+    if (page_checksum(view->backing, data) != entry->checksum)
+        return fail("uncompressed page checksum mismatch for page %" PRIu64,
+                    entry->page_index);
+    compressed_write = !all_draws(view->backing, data);
+    if (!store_page_with_runtime(
+            view->backing, view->compressor, view->compressed,
+            view->compressed_capacity, entry->page_index, data, false))
+        return false;
+    if (compressed_write)
+        ++view->statistics.compressed_writes;
+    entry->dirty = false;
+    return true;
+}
+
+static bool view_cached_page(EgtbView *view, uint64_t page, size_t *result)
+{
+    size_t slot = (size_t)(page % view->capacity);
+    DirectCacheEntry *entry = &view->entries[slot];
+    EgtbEntry *data = view_cache_data(view, slot);
+    ++view->statistics.lookups;
+    if (entry->valid && entry->page_index == page) {
+        ++view->statistics.hits;
+        *result = slot;
+        return true;
+    }
+    ++view->statistics.misses;
+    if (entry->valid && entry->dirty) {
+        ++view->statistics.dirty_evictions;
+        if (!view_flush_slot(view, slot))
+            return false;
+    }
+    if (!view_load_page(view, page, data))
+        return false;
+    entry->page_index = page;
+    entry->checksum = page_checksum(view->backing, data);
+    entry->valid = true;
+    entry->dirty = false;
+    *result = slot;
+    return true;
+}
+
+bool egtb_view_create(EgtbView **out, Egtb *backing, size_t cache_pages,
+                      bool writable)
+{
+    EgtbView *view;
+    if (out == NULL)
+        return fail("invalid cache-view output pointer");
+    *out = NULL;
+    if (backing == NULL || cache_pages == 0 ||
+        (writable && backing->readonly) ||
+        (writable && backing->view_count != 0) || backing->writable_view)
+        return fail("invalid or conflicting cache-view request");
+    if (writable && !egtb_flush(backing))
+        return false;
+    if (backing->page_count < cache_pages)
+        cache_pages = (size_t)backing->page_count;
+    if (cache_pages == 0)
+        cache_pages = 1;
+    if (cache_pages > SIZE_MAX / backing->page_size)
+        return fail("cache-view byte size overflows size_t");
+    view = calloc(1, sizeof(*view));
+    if (view == NULL)
+        return fail("cannot allocate cache view");
+    view->backing = backing;
+    view->capacity = cache_pages;
+    view->writable = writable;
+    view->compressed_capacity = ZSTD_compressBound(backing->page_size);
+    view->entries = calloc(cache_pages, sizeof(*view->entries));
+    view->data = malloc(cache_pages * backing->page_size);
+    view->compressed = malloc(view->compressed_capacity);
+    view->decompressor = ZSTD_createDCtx();
+    if (writable)
+        view->compressor = ZSTD_createCCtx();
+    if (view->entries == NULL || view->data == NULL ||
+        view->compressed == NULL || view->decompressor == NULL ||
+        (writable && view->compressor == NULL)) {
+        ZSTD_freeCCtx(view->compressor);
+        ZSTD_freeDCtx(view->decompressor);
+        free(view->compressed);
+        free(view->data);
+        free(view->entries);
+        free(view);
+        return fail("cannot allocate direct-mapped cache view");
+    }
+    ++backing->view_count;
+    if (writable)
+        backing->writable_view = true;
+    *out = view;
+    return true;
+}
+
+bool egtb_view_flush(EgtbView *view)
+{
+    size_t slot;
+    Egtb *egtb;
+    if (view == NULL)
+        return fail("cannot flush a null cache view");
+    if (!view->writable)
+        return true;
+    egtb = view->backing;
+    for (slot = 0; slot < view->capacity; ++slot) {
+        if (!view_flush_slot(view, slot))
+            return false;
+    }
+    if (!write_header(egtb) || !write_directory(egtb) ||
+        fflush(egtb->file) != 0)
+        return fail("cannot flush EGTB cache view");
+    return true;
+}
+
+bool egtb_view_close(EgtbView *view)
+{
+    bool ok = true;
+    Egtb *backing;
+    if (view == NULL)
+        return true;
+    backing = view->backing;
+    if (backing != NULL && view->writable)
+        ok = egtb_view_flush(view);
+    if (backing != NULL && backing->view_count != 0) {
+        --backing->view_count;
+        if (view->writable) {
+            backing->writable_view = false;
+            cache_invalidate(&backing->cache);
+        }
+    }
+    ZSTD_freeCCtx(view->compressor);
+    ZSTD_freeDCtx(view->decompressor);
+    free(view->compressed);
+    free(view->data);
+    free(view->entries);
+    free(view);
+    return ok;
+}
+
+bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
+                   int16_t *value)
+{
+    Egtb *egtb;
+    uint64_t page;
+    uint32_t entry_index;
+    size_t cache_slot;
+    EgtbEntry *entries;
+    if (view == NULL || value == NULL)
+        return fail("invalid cache-view lookup");
+    egtb = view->backing;
+    if (index > egtb->maximum_index ||
+        (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
+        return fail("invalid cache-view lookup");
+    page = index / egtb->entries_per_page;
+    entry_index = (uint32_t)(index % egtb->entries_per_page);
+    if (!view_cached_page(view, page, &cache_slot))
+        return false;
+    entries = view_cache_data(view, cache_slot);
+    *value = side == EGTB_WHITE_TO_MOVE
+                 ? entries[entry_index].white_to_move
+                 : entries[entry_index].black_to_move;
+    return true;
+}
+
+bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
+                   int16_t value)
+{
+    Egtb *egtb;
+    uint64_t page;
+    uint32_t entry_index;
+    size_t cache_slot;
+    DirectCacheEntry *cache_entry;
+    EgtbEntry *entries;
+    EgtbEntry old;
+    if (view == NULL || !view->writable || !valid_value(value))
+        return fail("invalid cache-view update");
+    egtb = view->backing;
+    if (index > egtb->maximum_index ||
+        (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
+        return fail("invalid cache-view update");
+    page = index / egtb->entries_per_page;
+    entry_index = (uint32_t)(index % egtb->entries_per_page);
+    if (!view_cached_page(view, page, &cache_slot))
+        return false;
+    cache_entry = &view->entries[cache_slot];
+    entries = view_cache_data(view, cache_slot);
+    old = entries[entry_index];
+    if (side == EGTB_WHITE_TO_MOVE)
+        entries[entry_index].white_to_move = value;
+    else
+        entries[entry_index].black_to_move = value;
+    cache_entry->checksum ^= slot_checksum(entry_index, &old) ^
+                             slot_checksum(entry_index,
+                                           &entries[entry_index]);
+    cache_entry->dirty = true;
+    return true;
+}
+
+void egtb_view_cache_statistics(const EgtbView *view,
+                                EgtbCacheStatistics *statistics)
+{
+    if (statistics == NULL)
+        return;
+    if (view == NULL)
+        memset(statistics, 0, sizeof(*statistics));
+    else
+        *statistics = view->statistics;
 }
 
 uint64_t egtb_maximum_index(const Egtb *egtb)

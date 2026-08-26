@@ -19,6 +19,7 @@ typedef struct {
 } EgtbEntry;
 
 typedef struct Egtb Egtb;
+typedef struct EgtbView EgtbView;
 
 typedef struct {
     size_t cache_pages;
@@ -33,6 +34,15 @@ typedef struct {
     uint64_t file_bytes;
     uint64_t live_pages;
 } EgtbStorageStatistics;
+
+typedef struct {
+    uint64_t lookups;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t decompressions;
+    uint64_t dirty_evictions;
+    uint64_t compressed_writes;
+} EgtbCacheStatistics;
 
 const char *egtb_last_error(void);
 
@@ -56,6 +66,22 @@ bool egtb_flush(Egtb *egtb);
 
 bool egtb_get(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value);
 bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value);
+
+/*
+ * Create a direct-mapped cache view over an open EGTB backing. Read-only
+ * views may coexist. A writable view requires a writable backing and is
+ * exclusive until page ownership is introduced by the threaded generator.
+ */
+bool egtb_view_create(EgtbView **out, Egtb *backing, size_t cache_pages,
+                      bool writable);
+bool egtb_view_close(EgtbView *view);
+bool egtb_view_flush(EgtbView *view);
+bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
+                   int16_t *value);
+bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
+                   int16_t value);
+void egtb_view_cache_statistics(const EgtbView *view,
+                                EgtbCacheStatistics *statistics);
 
 uint64_t egtb_maximum_index(const Egtb *egtb);
 uint64_t egtb_page_count(const Egtb *egtb);

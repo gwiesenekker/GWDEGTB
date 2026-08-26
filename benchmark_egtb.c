@@ -53,23 +53,36 @@ static bool benchmark_density(unsigned density, uint64_t positions,
                               uint64_t cache_bytes)
 {
     char path[] = "/tmp/ipd-egtb-benchmark-XXXXXX";
+    char direct_path[] = "/tmp/ipd-egtb-direct-benchmark-XXXXXX";
     EgtbCreateOptions options = {1024, 20, 3};
+    EgtbCreateOptions direct_options = {1, 20, 3};
     EgtbStorageStatistics storage;
-    Egtb *egtb = NULL;
+    EgtbCacheStatistics direct_cache;
+    Egtb *egtb = NULL, *direct_egtb = NULL;
+    EgtbView *view = NULL;
     uint64_t index, non_draw_values = 0, checked_non_draw_values = 0;
     uint64_t total_values = positions * 2;
-    uint64_t lookup, lookup_checksum = 0;
+    uint64_t lookup, lookup_checksum = 0, direct_lookup_checksum = 0;
     size_t read_cache_pages = (size_t)(cache_bytes / page_size);
-    double write_start, write_seconds, compact_start, compact_seconds;
-    double read_start, read_seconds, random_read_start, random_read_seconds;
+    double write_start, write_seconds, direct_write_seconds;
+    double compact_start, compact_seconds;
+    double read_start, read_seconds, direct_read_seconds;
+    double random_read_start, random_read_seconds, direct_random_read_seconds;
     int descriptor = mkstemp(path);
+    int direct_descriptor = mkstemp(direct_path);
 
-    if (descriptor < 0) {
+    if (descriptor < 0 || direct_descriptor < 0) {
         perror("mkstemp");
+        if (descriptor >= 0)
+            close(descriptor);
+        if (direct_descriptor >= 0)
+            close(direct_descriptor);
         return false;
     }
     close(descriptor);
+    close(direct_descriptor);
     unlink(path);
+    unlink(direct_path);
 
     random_state = UINT64_C(0xd1b54a32d192ed03);
     if (!egtb_create(&egtb, path, positions - 1, page_size, &options))
@@ -94,6 +107,34 @@ static bool benchmark_density(unsigned density, uint64_t positions,
         goto failure;
     }
     egtb = NULL;
+
+    random_state = UINT64_C(0xd1b54a32d192ed03);
+    if (!egtb_create(&direct_egtb, direct_path, positions - 1, page_size,
+                     &direct_options) ||
+        !egtb_view_create(&view, direct_egtb, options.cache_pages, true))
+        goto failure;
+    write_start = now_seconds();
+    for (index = 0; index < positions; ++index) {
+        for (unsigned side = 0; side < 2; ++side) {
+            if (selected(density) &&
+                !egtb_view_set(view, index, (EgtbSide)side, random_dtm()))
+                goto failure;
+        }
+    }
+    if (!egtb_view_flush(view))
+        goto failure;
+    direct_write_seconds = now_seconds() - write_start;
+    if (!egtb_view_close(view)) {
+        view = NULL;
+        goto failure;
+    }
+    view = NULL;
+    if (!egtb_close(direct_egtb)) {
+        direct_egtb = NULL;
+        goto failure;
+    }
+    direct_egtb = NULL;
+    unlink(direct_path);
 
     compact_start = now_seconds();
     if (!egtb_compact(path, 9, 64))
@@ -139,14 +180,62 @@ static bool benchmark_density(unsigned density, uint64_t positions,
     }
     egtb = NULL;
 
-    printf("%3u%%  actual=%6.2f%%  write=%8.2f Mvalues/s  "
-           "seq-read=%8.2f Mvalues/s  random-read=%8.3f Mlookups/s  "
+    if (!egtb_open_readonly(&direct_egtb, path, 1) ||
+        !egtb_view_create(&view, direct_egtb, read_cache_pages, false))
+        goto failure;
+    checked_non_draw_values = 0;
+    read_start = now_seconds();
+    for (index = 0; index < positions; ++index) {
+        for (unsigned side = 0; side < 2; ++side) {
+            int16_t value;
+            if (!egtb_view_get(view, index, (EgtbSide)side, &value))
+                goto failure;
+            if (value != EGTB_DRAW)
+                ++checked_non_draw_values;
+        }
+    }
+    direct_read_seconds = now_seconds() - read_start;
+    if (checked_non_draw_values != non_draw_values)
+        goto failure;
+    random_state = UINT64_C(0x8f3f73b5cf1c9ade);
+    random_read_start = now_seconds();
+    for (lookup = 0; lookup < random_lookups; ++lookup) {
+        int16_t value;
+        index = next_random() % positions;
+        if (!egtb_view_get(view, index, (EgtbSide)(next_random() & 1),
+                           &value))
+            goto failure;
+        direct_lookup_checksum += (uint16_t)value;
+    }
+    direct_random_read_seconds = now_seconds() - random_read_start;
+    egtb_view_cache_statistics(view, &direct_cache);
+    if (direct_lookup_checksum != lookup_checksum ||
+        !egtb_view_close(view)) {
+        view = NULL;
+        goto failure;
+    }
+    view = NULL;
+    if (!egtb_close(direct_egtb)) {
+        direct_egtb = NULL;
+        goto failure;
+    }
+    direct_egtb = NULL;
+
+    printf("%3u%% actual=%6.2f%%  write handle/view=%7.2f/%7.2f Mvalues/s\n"
+           "     seq-read handle/view=%7.2f/%7.2f Mvalues/s  "
+           "random handle/view=%7.3f/%7.3f Mlookups/s  hit=%5.1f%%  "
            "compact=%6.3f s  "
            "payload=%6.2f%%  overall=%6.2f%%  file=%7.2f MiB\n",
            density, 100.0 * (double)non_draw_values / (double)total_values,
            (double)total_values / write_seconds / 1e6,
+           (double)total_values / direct_write_seconds / 1e6,
            (double)total_values / read_seconds / 1e6,
+           (double)total_values / direct_read_seconds / 1e6,
            (double)random_lookups / random_read_seconds / 1e6,
+           (double)random_lookups / direct_random_read_seconds / 1e6,
+           direct_cache.lookups == 0 ? 0.0 :
+               100.0 * (double)direct_cache.hits /
+                   (double)direct_cache.lookups,
            compact_seconds,
            100.0 * (double)storage.compressed_payload_bytes /
                (double)storage.logical_uncompressed_bytes,
@@ -156,13 +245,19 @@ static bool benchmark_density(unsigned density, uint64_t positions,
     if (lookup_checksum == UINT64_MAX)
         fprintf(stderr, "lookup checksum=%" PRIu64 "\n", lookup_checksum);
     unlink(path);
+    unlink(direct_path);
     return true;
 
 failure:
     fprintf(stderr, "density %u%% failed: %s\n", density, egtb_last_error());
     if (egtb != NULL)
         egtb_close(egtb);
+    if (view != NULL)
+        egtb_view_close(view);
+    if (direct_egtb != NULL)
+        egtb_close(direct_egtb);
     unlink(path);
+    unlink(direct_path);
     return false;
 }
 
