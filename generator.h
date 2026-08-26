@@ -13,6 +13,8 @@ typedef struct {
     uint64_t legal_moves[2];
     uint64_t lost_in_zero[2];
     uint64_t won_in_one[2];
+    uint64_t external_wins[2];
+    uint64_t external_losses[2];
     uint64_t unknown[2];
 } EgtbInitializationStatistics;
 
@@ -89,6 +91,11 @@ bool egtb_initialize_terminal_positions(
     Egtb *database, const EgIndexer *indexer,
     EgtbInitializationStatistics *statistics);
 
+bool egtb_initialize_terminal_positions_with_probe(
+    Egtb *database, const EgIndexer *indexer,
+    EgtbExternalProbe external_probe, void *external_context,
+    EgtbInitializationStatistics *statistics);
+
 /*
  * Backtrack won-in-one entries through legal inverse quiet moves. A
  * predecessor is stored as lost in two only when all of its legal forward
@@ -127,6 +134,8 @@ bool egtb_backtrack_losses_to_wins(
  * open and unflushed on return so finalization remains the caller's decision.
  */
 bool egtb_generate(Egtb *database, const EgIndexer *indexer,
+                   EgtbExternalProbe external_probe,
+                   void *external_context,
                    EgtbConsistencyReporter reporter,
                    void *reporter_context,
                    EgtbGenerationStatistics *statistics);

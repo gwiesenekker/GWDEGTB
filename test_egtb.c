@@ -157,8 +157,8 @@ int main(void)
     snprintf(path, sizeof(path), "%s.dtm", stem);
     snprintf(wdl_path, sizeof(wdl_path), "%s.wdl", stem);
     if (!egtb_material_filename(material_name, sizeof(material_name),
-                                1, 2, 3, 1, "dtm") ||
-        strcmp(material_name, "1wO-2bO-3wX-1bX.dtm") != 0) {
+                                3, 1, 1, 2, "dtm") ||
+        strcmp(material_name, "3wX-1wO-1bX-2bO.dtm") != 0) {
         fprintf(stderr, "material filename generation failed\n");
         return EXIT_FAILURE;
     }

@@ -7,5 +7,7 @@
 /test_egtb
 /test_movegen
 /test_generator
-/generate_wk_bk
-/0wO-0bO-1wX-1bX.dtm
+/test_material
+/generate_egtb
+/*.dtm
+/*.wdl

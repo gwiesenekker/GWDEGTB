@@ -36,10 +36,10 @@ typedef struct {
 
 const char *egtb_last_error(void);
 
-/* Build "<wm>wO-<bm>bO-<wk>wX-<bk>bX.<extension>". */
+/* Build "<wk>wX-<wm>wO-<bk>bX-<bm>bO.<extension>" (GWD order). */
 bool egtb_material_filename(char *buffer, size_t buffer_size,
-                            unsigned white_men, unsigned black_men,
-                            unsigned white_kings, unsigned black_kings,
+                            unsigned white_kings, unsigned white_men,
+                            unsigned black_kings, unsigned black_men,
                             const char *extension);
 
 /* Create a new, all-draw, read/write EGTB. Existing files are not overwritten. */

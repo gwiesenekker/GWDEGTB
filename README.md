@@ -89,9 +89,9 @@ expected in generated databases.
 
 ## Packed WDL databases
 
-Material database filenames use
-`<wm>wO-<bm>bO-<wk>wX-<bk>bX.dtm`; for example,
-`1wO-2bO-3wX-1bX.dtm`. The corresponding packed database uses the `.wdl`
+Material database filenames use GWD order:
+`<wk>wX-<wm>wO-<bk>bX-<bm>bO.dtm`; for example,
+`3wX-1wO-1bX-2bO.dtm`. The corresponding packed database uses the `.wdl`
 extension. `egtb_material_filename()` constructs either name.
 
 Each WDL position is a four-bit nibble: two bits for WTM followed by two bits
@@ -192,9 +192,25 @@ pass makes no corrections. Corrections report the index, side, four bitboards,
 and old/new DTM. Transitions to another material signature can be resolved by
 an external EGTB probe callback.
 
-`make generate-wk-bk` runs the convergence and self-consistency loops. Only
-after the final zero-update pass does it flush the working pages, close the
-working file, compact the live blocks into a temporary file, and atomically
-install the compacted database. It reopens the finished
-`0wO-0bO-1wX-1bX.dtm` read-only and prints WTM and BTM counts for every stored
-DTM value together with final compression statistics.
+The generic generator uses the same argument order as GWD:
+
+```sh
+./generate_egtb NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
+```
+
+Filenames use the same order, for example `1wX-0wO-0bX-1bO.dtm` for WK-BM.
+The computed 4D material catalog generates only the GWD-canonical orientation:
+the side with more pieces is White, or, when piece counts are equal, the side
+with more kings is White. A request for the other orientation is redirected to
+the canonical database. Mirrored lookups rotate squares with `s -> 49-s`, swap
+colors and swap WTM/BTM.
+
+Within each piece count, generation order places the larger material side on
+White and enumerates White kings descending, then Black kings descending. This
+matches the GWD job order and ensures promotions target earlier databases.
+
+Only after the final zero-update pass does the generator flush the working
+pages, close the working file, compact the live blocks into a temporary file,
+and atomically install the compacted database. It reopens the finished file
+read-only and prints WTM and BTM counts for every stored DTM value together
+with final compression statistics.

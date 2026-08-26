@@ -88,16 +88,16 @@ const char *egtb_last_error(void)
 }
 
 bool egtb_material_filename(char *buffer, size_t buffer_size,
-                            unsigned white_men, unsigned black_men,
-                            unsigned white_kings, unsigned black_kings,
+                            unsigned white_kings, unsigned white_men,
+                            unsigned black_kings, unsigned black_men,
                             const char *extension)
 {
     int length;
     if (buffer == NULL || buffer_size == 0 || extension == NULL ||
         *extension == '\0' || strchr(extension, '/') != NULL)
         return fail("invalid EGTB filename argument");
-    length = snprintf(buffer, buffer_size, "%uwO-%ubO-%uwX-%ubX.%s",
-                      white_men, black_men, white_kings, black_kings,
+    length = snprintf(buffer, buffer_size, "%uwX-%uwO-%ubX-%ubO.%s",
+                      white_kings, white_men, black_kings, black_men,
                       extension);
     if (length < 0 || (size_t)length >= buffer_size)
         return fail("material filename buffer is too small");

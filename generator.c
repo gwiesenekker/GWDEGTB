@@ -9,7 +9,14 @@
 typedef struct {
     DraughtsPosition position;
     EgtbSide side;
-    bool reaches_terminal_loss;
+    const EgIndexer *indexer;
+    EgtbExternalProbe external_probe;
+    void *external_context;
+    uint16_t shortest_loss;
+    uint16_t longest_win;
+    bool has_loss;
+    bool has_draw;
+    bool has_internal;
     bool failed;
 } SuccessorContext;
 
@@ -79,25 +86,53 @@ static EgtbSide opposite_side(EgtbSide side)
                                         EGTB_WHITE_TO_MOVE;
 }
 
+static unsigned generator_bit_count(uint64_t value);
+static bool has_indexer_material(const EgIndexer *indexer,
+                                 const DraughtsPosition *position);
+static bool valid_dtm(int16_t value);
+
 static bool examine_successor(const DraughtsMove *move, void *opaque)
 {
     SuccessorContext *context = opaque;
     DraughtsPosition successor = context->position;
-    size_t reply_count;
     EgtbSide successor_side = opposite_side(context->side);
-    if (!draughts_do_move(&successor, context->side, move, NULL) ||
-        !draughts_generate_moves(&successor, successor_side, NULL, NULL,
-                                 &reply_count)) {
+    uint64_t friendly;
+    int16_t value;
+    if (!draughts_do_move(&successor, context->side, move, NULL)) {
         context->failed = true;
         return false;
     }
-    if (reply_count == 0)
-        context->reaches_terminal_loss = true;
+    friendly = successor_side == EGTB_WHITE_TO_MOVE
+                   ? successor.white_men | successor.white_kings
+                   : successor.black_men | successor.black_kings;
+    if (friendly == 0) {
+        value = 0;
+    } else if (has_indexer_material(context->indexer, &successor)) {
+        context->has_internal = true;
+        return true;
+    } else if (context->external_probe == NULL ||
+               !context->external_probe(&successor, successor_side,
+                                        context->external_context, &value) ||
+               !valid_dtm(value)) {
+        context->failed = true;
+        return false;
+    }
+    if (value == EGTB_DRAW) {
+        context->has_draw = true;
+    } else if (value <= 0) {
+        uint16_t distance = (uint16_t)-value;
+        if (!context->has_loss || distance < context->shortest_loss)
+            context->shortest_loss = distance;
+        context->has_loss = true;
+    } else if ((uint16_t)value > context->longest_win) {
+        context->longest_win = (uint16_t)value;
+    }
     return true;
 }
 
-bool egtb_initialize_terminal_positions(
+bool egtb_initialize_terminal_positions_with_probe(
     Egtb *database, const EgIndexer *indexer,
+    EgtbExternalProbe external_probe, void *external_context,
     EgtbInitializationStatistics *statistics)
 {
     EgtbInitializationStatistics local = {0};
@@ -128,6 +163,9 @@ bool egtb_initialize_terminal_positions(
             memset(&context, 0, sizeof(context));
             context.position = position;
             context.side = (EgtbSide)side;
+            context.indexer = indexer;
+            context.external_probe = external_probe;
+            context.external_context = external_context;
             if (!draughts_generate_moves(&position, (EgtbSide)side,
                                          examine_successor, &context,
                                          &move_count) || context.failed)
@@ -138,9 +176,19 @@ bool egtb_initialize_terminal_positions(
             if (move_count == 0) {
                 value = 0;
                 ++local.lost_in_zero[side];
-            } else if (context.reaches_terminal_loss) {
-                value = 1;
-                ++local.won_in_one[side];
+            } else if (context.has_loss) {
+                if (context.shortest_loss >= INT16_MAX)
+                    return fail("initialized winning DTM is too large");
+                value = (int16_t)(context.shortest_loss + 1);
+                if (value == 1)
+                    ++local.won_in_one[side];
+                else
+                    ++local.external_wins[side];
+            } else if (!context.has_internal && !context.has_draw) {
+                if (context.longest_win >= INT16_MAX)
+                    return fail("initialized losing DTM is too large");
+                value = (int16_t)-(context.longest_win + 1);
+                ++local.external_losses[side];
             } else {
                 ++local.unknown[side];
             }
@@ -154,6 +202,14 @@ bool egtb_initialize_terminal_positions(
     if (statistics != NULL)
         *statistics = local;
     return true;
+}
+
+bool egtb_initialize_terminal_positions(
+    Egtb *database, const EgIndexer *indexer,
+    EgtbInitializationStatistics *statistics)
+{
+    return egtb_initialize_terminal_positions_with_probe(
+        database, indexer, NULL, NULL, statistics);
 }
 
 static bool position_index(const EgIndexer *indexer,
@@ -655,6 +711,8 @@ bool egtb_make_consistent(
 }
 
 bool egtb_generate(Egtb *database, const EgIndexer *indexer,
+                   EgtbExternalProbe external_probe,
+                   void *external_context,
                    EgtbConsistencyReporter reporter,
                    void *reporter_context,
                    EgtbGenerationStatistics *statistics)
@@ -664,8 +722,9 @@ bool egtb_generate(Egtb *database, const EgIndexer *indexer,
     int16_t won_distance = 1;
     unsigned side;
     memset(&local, 0, sizeof(local));
-    if (!egtb_initialize_terminal_positions(database, indexer,
-                                             &local.initialization))
+    if (!egtb_initialize_terminal_positions_with_probe(
+            database, indexer, external_probe, external_context,
+            &local.initialization))
         return false;
     if (local.initialization.won_in_one[0] != 0 ||
         local.initialization.won_in_one[1] != 0)
@@ -709,8 +768,9 @@ bool egtb_generate(Egtb *database, const EgIndexer *indexer,
             return fail("DTM exceeds the signed 16-bit representation");
         won_distance = (int16_t)(won_distance + 2);
     }
-    if (!egtb_make_consistent(database, indexer, NULL, NULL, reporter,
-                              reporter_context, &consistency))
+    if (!egtb_make_consistent(database, indexer, external_probe,
+                              external_context, reporter, reporter_context,
+                              &consistency))
         return false;
     local.consistency_passes = consistency.passes;
     for (side = 0; side < 2; ++side)

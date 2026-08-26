@@ -26,6 +26,21 @@ typedef struct {
     bool saw_longer_loss;
 } ConsistencyReportCheck;
 
+typedef struct {
+    uint64_t probes;
+} ExternalProbeCheck;
+
+static bool probe_lost_in_four(const DraughtsPosition *position,
+                               EgtbSide side, void *opaque, int16_t *value)
+{
+    ExternalProbeCheck *check = opaque;
+    (void)position;
+    (void)side;
+    ++check->probes;
+    *value = -4;
+    return true;
+}
+
 static void check_consistency_report(
     uint64_t index, EgtbSide side, const DraughtsPosition *position,
     int16_t old_value, int16_t new_value, void *opaque)
@@ -123,6 +138,52 @@ done:
     return ok;
 }
 
+static bool test_external_promotion_initialization(void)
+{
+    char path[] = "/tmp/ipd-external-init-XXXXXX";
+    EgtbCreateOptions options = {16, 20, 3};
+    EgtbInitializationStatistics statistics;
+    ExternalProbeCheck probe = {0};
+    DraughtsPosition position = {0};
+    EgPosition indexed;
+    EgIndexer indexer;
+    Egtb *database = NULL;
+    uint64_t index;
+    int16_t value;
+    int descriptor = mkstemp(path);
+    bool ok = false;
+    if (descriptor < 0)
+        return false;
+    close(descriptor);
+    unlink(path);
+    if (!eg_indexer_init(&indexer, 1, 1, 0, 0))
+        goto done;
+    if (!egtb_create(&database, path, eg_max_index(&indexer), 1024, &options) ||
+        !egtb_initialize_terminal_positions_with_probe(
+            database, &indexer, probe_lost_in_four, &probe, &statistics))
+        goto destroy_indexer;
+    position.white_men = BIT(5);
+    position.black_men = BIT(44);
+    indexed.white_men = position.white_men;
+    indexed.black_men = position.black_men;
+    indexed.white_kings = 0;
+    indexed.black_kings = 0;
+    if (draughts_has_capture(&position, EGTB_WHITE_TO_MOVE) ||
+        !eg_position_to_index(&indexer, &indexed, &index) ||
+        !egtb_get(database, index, EGTB_WHITE_TO_MOVE, &value) ||
+        value != 5 || probe.probes == 0 ||
+        statistics.external_wins[EGTB_WHITE_TO_MOVE] == 0)
+        goto destroy_indexer;
+    ok = true;
+destroy_indexer:
+    eg_indexer_destroy(&indexer);
+done:
+    if (database != NULL && !egtb_close(database))
+        ok = false;
+    unlink(path);
+    return ok;
+}
+
 static bool test_complete_wk_bk_generation(void)
 {
     char path[] = "/tmp/ipd-complete-generator-XXXXXX";
@@ -145,7 +206,8 @@ static bool test_complete_wk_bk_generation(void)
     if (!eg_indexer_init(&indexer, 0, 0, 1, 1))
         goto done;
     if (!egtb_create(&database, path, eg_max_index(&indexer), 1024, &options) ||
-        !egtb_generate(database, &indexer, NULL, NULL, &statistics))
+        !egtb_generate(database, &indexer, NULL, NULL, NULL, NULL,
+                       &statistics))
         goto destroy_indexer;
     for (index = 0; index < eg_position_count(&indexer); ++index) {
         unsigned side;
@@ -334,6 +396,10 @@ int main(void)
     }
     if (!test_parameterized_win_backtrack()) {
         fprintf(stderr, "parameterized win-to-loss backtrack test failed\n");
+        return EXIT_FAILURE;
+    }
+    if (!test_external_promotion_initialization()) {
+        fprintf(stderr, "external promotion initialization test failed\n");
         return EXIT_FAILURE;
     }
     if (!test_complete_wk_bk_generation()) {
