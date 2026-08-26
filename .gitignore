@@ -1,0 +1,4 @@
+*.o
+/benchmark_index
+/check_stats
+/test_index
