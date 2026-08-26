@@ -1,4 +1,11 @@
 *.o
 /benchmark_index
+/benchmark_egtb
+/benchmark_movegen
 /check_stats
 /test_index
+/test_egtb
+/test_movegen
+/test_generator
+/generate_wk_bk
+/0wO-0bO-1wX-1bX.dtm
