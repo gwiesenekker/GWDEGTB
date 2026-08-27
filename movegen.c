@@ -6,6 +6,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(__BMI2__) && (defined(__x86_64__) || defined(_M_X64))
+#include <immintrin.h>
+#define DRAUGHTS_HAVE_BMI2 1
+#else
+#define DRAUGHTS_HAVE_BMI2 0
+#endif
+
 #define INVALID_SQUARE UINT8_MAX
 #define BIT(square) (UINT64_C(1) << (square))
 
@@ -592,6 +599,524 @@ bool draughts_generate_quiet_predecessors(
         kings &= kings - 1;
         if (!generate_piece_predecessors(position, mover, (uint8_t)to, true,
                                          visitor, context, &count))
+            return false;
+    }
+    if (predecessor_count != NULL)
+        *predecessor_count = count;
+    return true;
+}
+
+/*
+ * GWD-compatible padded move generator.
+ *
+ * Compact squares 0..49 are deposited into fields
+ *
+ *   6..15, 17..26, 28..37, 39..48, 50..59
+ *
+ * leaving a guard bit between each pair of board rows. Diagonal steps are
+ * therefore fixed shifts by 5 or 6. Always shift an existing uint64_t word;
+ * never form 1ULL << (field + offset), because the latter would be undefined
+ * for fields whose sum reaches 64.
+ */
+#define PADDED_BOARD_MASK UINT64_C(0x0ffdffbff7feffc0)
+
+bool draughts_padded_backend_uses_bmi2(void)
+{
+    return DRAUGHTS_HAVE_BMI2 != 0;
+}
+
+typedef struct {
+    uint64_t white_men;
+    uint64_t black_men;
+    uint64_t white_kings;
+    uint64_t black_kings;
+} PaddedPosition;
+
+typedef struct {
+    uint64_t opponents;
+    uint64_t fixed_occupied;
+    uint64_t start;
+    unsigned maximum;
+    DraughtsMoveVisitor visitor;
+    void *visitor_context;
+    size_t emitted;
+    bool emitting;
+    bool ok;
+} PaddedCaptureSearch;
+
+static inline uint64_t padded_step(uint64_t bits, unsigned direction)
+{
+    switch (direction) {
+    case DIR_NW: return (bits >> 6) & PADDED_BOARD_MASK;
+    case DIR_NE: return (bits >> 5) & PADDED_BOARD_MASK;
+    case DIR_SW: return (bits << 5) & PADDED_BOARD_MASK;
+    default:     return (bits << 6) & PADDED_BOARD_MASK;
+    }
+}
+
+static inline unsigned padded_field_from_square(unsigned square)
+{
+    return square + 6 + square / 10;
+}
+
+static inline unsigned padded_square_from_field(unsigned field)
+{
+    unsigned relative = field - 6;
+    return relative - relative / 11;
+}
+
+static inline unsigned padded_square_from_bit(uint64_t bit)
+{
+    return padded_square_from_field(first_square(bit));
+}
+
+static uint64_t compact_to_padded(uint64_t compact)
+{
+#if DRAUGHTS_HAVE_BMI2
+    return _pdep_u64(compact, PADDED_BOARD_MASK);
+#else
+    uint64_t padded = 0;
+    while (compact != 0) {
+        unsigned square = first_square(compact);
+        compact &= compact - 1;
+        padded |= UINT64_C(1) << padded_field_from_square(square);
+    }
+    return padded;
+#endif
+}
+
+static uint64_t padded_to_compact(uint64_t padded)
+{
+#if DRAUGHTS_HAVE_BMI2
+    return _pext_u64(padded, PADDED_BOARD_MASK);
+#else
+    uint64_t compact = 0;
+    while (padded != 0) {
+        uint64_t bit = padded & (UINT64_C(0) - padded);
+        unsigned square = padded_square_from_bit(bit);
+        padded &= padded - 1;
+        compact |= BIT(square);
+    }
+    return compact;
+#endif
+}
+
+static PaddedPosition make_padded_position(
+    const DraughtsPosition *position)
+{
+    PaddedPosition padded;
+    padded.white_men = compact_to_padded(position->white_men);
+    padded.black_men = compact_to_padded(position->black_men);
+    padded.white_kings = compact_to_padded(position->white_kings);
+    padded.black_kings = compact_to_padded(position->black_kings);
+    return padded;
+}
+
+static inline uint64_t padded_occupied(const PaddedPosition *position)
+{
+    return position->white_men | position->black_men |
+           position->white_kings | position->black_kings;
+}
+
+static inline uint64_t padded_side_men(const PaddedPosition *position,
+                                       EgtbSide side)
+{
+    return side == EGTB_WHITE_TO_MOVE ? position->white_men :
+                                        position->black_men;
+}
+
+static inline uint64_t padded_side_kings(const PaddedPosition *position,
+                                         EgtbSide side)
+{
+    return side == EGTB_WHITE_TO_MOVE ? position->white_kings :
+                                        position->black_kings;
+}
+
+static inline uint64_t padded_opponents(const PaddedPosition *position,
+                                        EgtbSide side)
+{
+    return side == EGTB_WHITE_TO_MOVE
+               ? position->black_men | position->black_kings
+               : position->white_men | position->white_kings;
+}
+
+static bool padded_emit_capture(PaddedCaptureSearch *search,
+                                uint64_t current, uint64_t captured,
+                                unsigned count)
+{
+    DraughtsMove move;
+    if (!search->emitting) {
+        if (count > search->maximum)
+            search->maximum = count;
+        return true;
+    }
+    if (count != search->maximum)
+        return true;
+    if (search->visitor != NULL) {
+        move.from = (uint8_t)padded_square_from_bit(search->start);
+        move.to = (uint8_t)padded_square_from_bit(current);
+        move.captured = padded_to_compact(captured);
+        move.capture_count = (uint8_t)count;
+        if (!search->visitor(&move, search->visitor_context)) {
+            search->ok = fail("move visitor rejected a padded capture");
+            return false;
+        }
+    }
+    ++search->emitted;
+    return true;
+}
+
+static void padded_search_man_captures(PaddedCaptureSearch *search,
+                                       uint64_t current,
+                                       uint64_t captured, unsigned count)
+{
+    uint64_t current_occupied = search->fixed_occupied | current;
+    bool found = false;
+    unsigned direction;
+    for (direction = 0; direction < DIRECTION_COUNT && search->ok;
+         ++direction) {
+        uint64_t victim = padded_step(current, direction);
+        uint64_t landing = padded_step(victim, direction);
+        if ((victim & search->opponents & ~captured) != 0 && landing != 0 &&
+            (current_occupied & landing) == 0) {
+            found = true;
+            padded_search_man_captures(search, landing, captured | victim,
+                                       count + 1);
+        }
+    }
+    if (!found && count != 0)
+        padded_emit_capture(search, current, captured, count);
+}
+
+static void padded_search_king_captures(PaddedCaptureSearch *search,
+                                        uint64_t current,
+                                        uint64_t captured, unsigned count)
+{
+    uint64_t current_occupied = search->fixed_occupied | current;
+    bool found = false;
+    unsigned direction;
+    for (direction = 0; direction < DIRECTION_COUNT && search->ok;
+         ++direction) {
+        uint64_t victim = padded_step(current, direction);
+        uint64_t landing;
+        while (victim != 0 && (current_occupied & victim) == 0)
+            victim = padded_step(victim, direction);
+        if ((victim & search->opponents & ~captured) == 0)
+            continue;
+        landing = padded_step(victim, direction);
+        while (landing != 0 && (current_occupied & landing) == 0) {
+            found = true;
+            padded_search_king_captures(search, landing,
+                                        captured | victim, count + 1);
+            landing = padded_step(landing, direction);
+        }
+    }
+    if (!found && count != 0)
+        padded_emit_capture(search, current, captured, count);
+}
+
+static void padded_search_all_captures(const PaddedPosition *position,
+                                       EgtbSide side,
+                                       PaddedCaptureSearch *search)
+{
+    uint64_t men = padded_side_men(position, side);
+    uint64_t kings = padded_side_kings(position, side);
+    uint64_t all = padded_occupied(position);
+    while (men != 0 && search->ok) {
+        uint64_t piece = men & (UINT64_C(0) - men);
+        men &= men - 1;
+        search->start = piece;
+        search->fixed_occupied = all & ~piece;
+        padded_search_man_captures(search, piece, 0, 0);
+    }
+    while (kings != 0 && search->ok) {
+        uint64_t piece = kings & (UINT64_C(0) - kings);
+        kings &= kings - 1;
+        search->start = piece;
+        search->fixed_occupied = all & ~piece;
+        padded_search_king_captures(search, piece, 0, 0);
+    }
+}
+
+static bool padded_king_has_capture(uint64_t king, uint64_t opponents,
+                                    uint64_t all)
+{
+    unsigned direction;
+    for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
+        uint64_t scan = padded_step(king, direction);
+        while (scan != 0 && (all & scan) == 0)
+            scan = padded_step(scan, direction);
+        if ((scan & opponents) != 0) {
+            uint64_t landing = padded_step(scan, direction);
+            if (landing != 0 && (all & landing) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool padded_position_has_capture(const PaddedPosition *position,
+                                        EgtbSide side)
+{
+    uint64_t men = padded_side_men(position, side);
+    uint64_t kings = padded_side_kings(position, side);
+    uint64_t opponents = padded_opponents(position, side);
+    uint64_t all = padded_occupied(position);
+    unsigned direction;
+
+    for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
+        uint64_t victims = padded_step(men, direction) & opponents;
+        if ((padded_step(victims, direction) & ~all) != 0)
+            return true;
+    }
+    while (kings != 0) {
+        uint64_t king = kings & (UINT64_C(0) - kings);
+        kings &= kings - 1;
+        if (padded_king_has_capture(king, opponents, all))
+            return true;
+    }
+    return false;
+}
+
+bool draughts_has_capture_padded(const DraughtsPosition *position,
+                                 EgtbSide side)
+{
+    PaddedPosition padded;
+#ifndef NDEBUG
+    if (!draughts_position_is_valid(position) ||
+        (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
+        return false;
+#endif
+    padded = make_padded_position(position);
+    return padded_position_has_capture(&padded, side);
+}
+
+static bool padded_visit_quiet_move(uint64_t from, uint64_t to,
+                                    DraughtsMoveVisitor visitor,
+                                    void *context, size_t *count)
+{
+    if (visitor != NULL) {
+        DraughtsMove move;
+        move.from = (uint8_t)padded_square_from_bit(from);
+        move.to = (uint8_t)padded_square_from_bit(to);
+        move.captured = 0;
+        move.capture_count = 0;
+        if (!visitor(&move, context))
+            return fail("move visitor rejected a padded quiet move");
+    }
+    ++*count;
+    return true;
+}
+
+static bool padded_generate_quiet_moves(const PaddedPosition *position,
+                                        EgtbSide side,
+                                        DraughtsMoveVisitor visitor,
+                                        void *context, size_t *count)
+{
+    uint64_t men = padded_side_men(position, side);
+    uint64_t kings = padded_side_kings(position, side);
+    uint64_t all = padded_occupied(position);
+    unsigned first_direction =
+        side == EGTB_WHITE_TO_MOVE ? DIR_NW : DIR_SW;
+    unsigned direction;
+
+    for (direction = first_direction; direction < first_direction + 2;
+         ++direction) {
+        uint64_t targets = padded_step(men, direction) & ~all;
+        if (visitor == NULL) {
+            *count += bit_count(targets);
+            continue;
+        }
+        while (targets != 0) {
+            uint64_t target = targets & (UINT64_C(0) - targets);
+            uint64_t from = padded_step(target, 3 - direction);
+            targets &= targets - 1;
+            if (!padded_visit_quiet_move(from, target, visitor, context,
+                                         count))
+                return false;
+        }
+    }
+
+    while (kings != 0) {
+        uint64_t king = kings & (UINT64_C(0) - kings);
+        kings &= kings - 1;
+        for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
+            uint64_t target = padded_step(king, direction);
+            while (target != 0 && (all & target) == 0) {
+                if (!padded_visit_quiet_move(king, target, visitor, context,
+                                             count))
+                    return false;
+                target = padded_step(target, direction);
+            }
+        }
+    }
+    return true;
+}
+
+bool draughts_generate_moves_padded(
+    const DraughtsPosition *position, EgtbSide side,
+    DraughtsMoveVisitor visitor, void *context, size_t *move_count)
+{
+    PaddedPosition padded;
+    PaddedCaptureSearch search;
+    size_t quiet_count = 0;
+    if (move_count != NULL)
+        *move_count = 0;
+#ifndef NDEBUG
+    if (!draughts_position_is_valid(position) ||
+        (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
+        return fail("invalid padded move-generation position or side");
+#endif
+    padded = make_padded_position(position);
+    memset(&search, 0, sizeof(search));
+    search.opponents = padded_opponents(&padded, side);
+    search.ok = true;
+    padded_search_all_captures(&padded, side, &search);
+    if (!search.ok)
+        return false;
+    if (search.maximum != 0) {
+        search.emitting = true;
+        search.visitor = visitor;
+        search.visitor_context = context;
+        padded_search_all_captures(&padded, side, &search);
+        if (!search.ok)
+            return false;
+        if (move_count != NULL)
+            *move_count = search.emitted;
+        return true;
+    }
+    if (!padded_generate_quiet_moves(&padded, side, visitor, context,
+                                     &quiet_count))
+        return false;
+    if (move_count != NULL)
+        *move_count = quiet_count;
+    return true;
+}
+
+static bool padded_emit_predecessor(
+    const DraughtsPosition *current, const PaddedPosition *predecessor_padded,
+    EgtbSide mover, bool king, uint64_t from, uint64_t to,
+    DraughtsPredecessorVisitor visitor, void *context, size_t *count)
+{
+    DraughtsPosition predecessor;
+    DraughtsMove move;
+    uint64_t *pieces;
+    unsigned from_square, to_square;
+    if (padded_position_has_capture(predecessor_padded, mover))
+        return true;
+    if (visitor == NULL) {
+        ++*count;
+        return true;
+    }
+    from_square = padded_square_from_bit(from);
+    to_square = padded_square_from_bit(to);
+    predecessor = *current;
+    if (mover == EGTB_WHITE_TO_MOVE)
+        pieces = king ? &predecessor.white_kings : &predecessor.white_men;
+    else
+        pieces = king ? &predecessor.black_kings : &predecessor.black_men;
+    *pieces &= ~BIT(to_square);
+    *pieces |= BIT(from_square);
+    move.captured = 0;
+    move.from = (uint8_t)from_square;
+    move.to = (uint8_t)to_square;
+    move.capture_count = 0;
+    if (!visitor(&predecessor, &move, context))
+        return fail("predecessor visitor rejected a padded position");
+    ++*count;
+    return true;
+}
+
+static bool padded_generate_piece_predecessors(
+    const DraughtsPosition *position, const PaddedPosition *padded,
+    EgtbSide mover, uint64_t to, bool king,
+    DraughtsPredecessorVisitor visitor, void *context, size_t *count)
+{
+    uint64_t all_without_to = padded_occupied(padded) & ~to;
+    unsigned to_square = padded_square_from_bit(to);
+    unsigned direction;
+
+    if (!king) {
+        unsigned first_direction =
+            mover == EGTB_WHITE_TO_MOVE ? DIR_SW : DIR_NW;
+        if (is_promotion_square(mover, to_square))
+            return true;
+        for (direction = first_direction; direction < first_direction + 2;
+             ++direction) {
+            uint64_t from = padded_step(to, direction);
+            PaddedPosition predecessor;
+            uint64_t *men;
+            if (from == 0 ||
+                is_promotion_square(mover, padded_square_from_bit(from)) ||
+                (all_without_to & from) != 0)
+                continue;
+            predecessor = *padded;
+            men = mover == EGTB_WHITE_TO_MOVE ? &predecessor.white_men :
+                                                &predecessor.black_men;
+            *men &= ~to;
+            *men |= from;
+            if (!padded_emit_predecessor(position, &predecessor, mover,
+                                         false, from, to, visitor, context,
+                                         count))
+                return false;
+        }
+        return true;
+    }
+
+    for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
+        uint64_t from = padded_step(to, direction);
+        while (from != 0 && (all_without_to & from) == 0) {
+            PaddedPosition predecessor = *padded;
+            uint64_t *kings =
+                mover == EGTB_WHITE_TO_MOVE ? &predecessor.white_kings :
+                                              &predecessor.black_kings;
+            *kings &= ~to;
+            *kings |= from;
+            if (!padded_emit_predecessor(position, &predecessor, mover,
+                                         true, from, to, visitor, context,
+                                         count))
+                return false;
+            from = padded_step(from, direction);
+        }
+    }
+    return true;
+}
+
+bool draughts_generate_quiet_predecessors_padded(
+    const DraughtsPosition *position, EgtbSide current_side,
+    DraughtsPredecessorVisitor visitor, void *context,
+    size_t *predecessor_count)
+{
+    PaddedPosition padded;
+    EgtbSide mover;
+    uint64_t men, kings;
+    size_t count = 0;
+    if (predecessor_count != NULL)
+        *predecessor_count = 0;
+#ifndef NDEBUG
+    if (!draughts_position_is_valid(position) ||
+        (current_side != EGTB_WHITE_TO_MOVE &&
+         current_side != EGTB_BLACK_TO_MOVE))
+        return fail("invalid padded predecessor-generation position or side");
+#endif
+    padded = make_padded_position(position);
+    mover = opposite_side(current_side);
+    men = padded_side_men(&padded, mover);
+    kings = padded_side_kings(&padded, mover);
+    while (men != 0) {
+        uint64_t to = men & (UINT64_C(0) - men);
+        men &= men - 1;
+        if (!padded_generate_piece_predecessors(
+                position, &padded, mover, to, false, visitor, context,
+                &count))
+            return false;
+    }
+    while (kings != 0) {
+        uint64_t to = kings & (UINT64_C(0) - kings);
+        kings &= kings - 1;
+        if (!padded_generate_piece_predecessors(
+                position, &padded, mover, to, true, visitor, context,
+                &count))
             return false;
     }
     if (predecessor_count != NULL)

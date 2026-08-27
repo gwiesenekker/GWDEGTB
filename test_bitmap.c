@@ -29,10 +29,13 @@ int main(void)
     assert(!bitmap_test(&bitmap, 255));
     assert(bitmap_test(&bitmap, 256));
     assert(bitmap_test(&bitmap, 299));
+    bitmap_set_atomic(&bitmap, 42);
+    assert(bitmap_test(&bitmap, 42));
     bitmap_clear_range(&bitmap, 63, 257);
     assert(bitmap_test(&bitmap, 0));
     assert(!bitmap_test(&bitmap, 63));
     assert(!bitmap_test(&bitmap, 256));
+    assert(bitmap_test(&bitmap, 42));
     assert(bitmap_test(&bitmap, 299));
     bitmap_clear(&bitmap);
     assert(!bitmap_find_next(&bitmap, 0, &found));

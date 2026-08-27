@@ -10,6 +10,10 @@
 /test_material
 /test_bitmap
 /generate_egtb
+/generate_egtb_padded
+/revision.c
+/revision.o
+/.build-revision-state
 /*.dtm
 /*.wdl
 /logs/

@@ -284,13 +284,16 @@ static bool test_complete_wk_bk_generation(void)
             counts[side][2] != 16 || counts[side][3] != 2024)
             goto destroy_indexer;
     }
-    if (win_three_index == UINT64_MAX || lost_two_index == UINT64_MAX ||
-        !egtb_set(database, win_three_index, EGTB_WHITE_TO_MOVE, 5) ||
-        !egtb_set(database, lost_two_index, EGTB_WHITE_TO_MOVE, 0) ||
-        !egtb_make_consistent(database, &indexer, NULL, NULL,
-                              check_consistency_report, &report,
-                              &consistency))
-        goto destroy_indexer;
+    {
+        EgtbVerificationOptions repair_options = {4, 16, NULL};
+        if (win_three_index == UINT64_MAX || lost_two_index == UINT64_MAX ||
+            !egtb_set(database, win_three_index, EGTB_WHITE_TO_MOVE, 5) ||
+            !egtb_set(database, lost_two_index, EGTB_WHITE_TO_MOVE, 0) ||
+            !egtb_make_consistent_threaded(
+                database, &indexer, NULL, NULL, check_consistency_report,
+                &report, &repair_options, &consistency))
+            goto destroy_indexer;
+    }
     {
         int16_t win_value, loss_value;
         if (!egtb_get(database, win_three_index, EGTB_WHITE_TO_MOVE,
@@ -302,6 +305,44 @@ static bool test_complete_wk_bk_generation(void)
             consistency.passes < 2 ||
             consistency.shorter_wins[EGTB_WHITE_TO_MOVE] == 0 ||
             consistency.longer_losses[EGTB_WHITE_TO_MOVE] == 0)
+            goto destroy_indexer;
+        if (consistency.positions_checked >=
+            consistency.passes * eg_position_count(&indexer) * 2)
+            goto destroy_indexer;
+    }
+    {
+        EgtbVerificationOptions verify_options = {4, 16, NULL};
+        EgtbConsistencyStatistics verification;
+        if (!egtb_flush(database) || !egtb_close(database)) {
+            database = NULL;
+            goto destroy_indexer;
+        }
+        database = NULL;
+        if (!egtb_compact(path, 3, 4) ||
+            !egtb_open_readonly(&database, path, 4) ||
+            !egtb_verify_consistent_threaded(
+                database, &indexer, NULL, NULL, &verify_options,
+                &verification) ||
+            verification.passes != 1 ||
+            verification.positions_checked !=
+                eg_position_count(&indexer) * 2)
+            goto destroy_indexer;
+        if (!egtb_close(database)) {
+            database = NULL;
+            goto destroy_indexer;
+        }
+        database = NULL;
+        if (!egtb_open_readwrite(&database, path, 4) ||
+            !egtb_set(database, win_three_index, EGTB_WHITE_TO_MOVE, 5) ||
+            !egtb_close(database)) {
+            database = NULL;
+            goto destroy_indexer;
+        }
+        database = NULL;
+        if (!egtb_open_readonly(&database, path, 4) ||
+            egtb_verify_consistent_threaded(
+                database, &indexer, NULL, NULL, &verify_options,
+                &verification))
             goto destroy_indexer;
     }
     ok = true;
@@ -344,6 +385,22 @@ static bool test_threaded_wk_bk_generation(void)
         !egtb_generate_threaded(threaded, &indexer, NULL, NULL, NULL, NULL,
                                 &thread_options, &threaded_statistics))
         goto destroy_indexer;
+    serial_statistics.initialization_seconds = 0.0;
+    serial_statistics.backpropagation_seconds = 0.0;
+    serial_statistics.compilation_seconds = 0.0;
+    serial_statistics.consistency_seconds = 0.0;
+    serial_statistics.final_scan_seconds = 0.0;
+    serial_statistics.total_seconds = 0.0;
+    memset(&serial_statistics.consistency_cache, 0,
+           sizeof(serial_statistics.consistency_cache));
+    threaded_statistics.initialization_seconds = 0.0;
+    threaded_statistics.backpropagation_seconds = 0.0;
+    threaded_statistics.compilation_seconds = 0.0;
+    threaded_statistics.consistency_seconds = 0.0;
+    threaded_statistics.final_scan_seconds = 0.0;
+    threaded_statistics.total_seconds = 0.0;
+    memset(&threaded_statistics.consistency_cache, 0,
+           sizeof(threaded_statistics.consistency_cache));
     if (memcmp(&serial_statistics, &threaded_statistics,
                sizeof(serial_statistics)) != 0)
         goto destroy_indexer;

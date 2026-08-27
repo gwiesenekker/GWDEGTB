@@ -16,6 +16,8 @@ typedef struct {
     bool saw_capture;
     bool failed;
     uint64_t destination_mask;
+    uint64_t fingerprint_xor;
+    uint64_t fingerprint_sum;
 } MoveCheck;
 
 typedef struct {
@@ -24,7 +26,15 @@ typedef struct {
     size_t predecessors;
     bool failed;
     uint64_t source_mask;
+    uint64_t fingerprint_xor;
+    uint64_t fingerprint_sum;
 } PredecessorCheck;
+
+typedef bool (*GenerateMovesFunction)(
+    const DraughtsPosition *, EgtbSide, DraughtsMoveVisitor, void *, size_t *);
+typedef bool (*GeneratePredecessorsFunction)(
+    const DraughtsPosition *, EgtbSide, DraughtsPredecessorVisitor, void *,
+    size_t *);
 
 static int square_at(int row, int column)
 {
@@ -41,6 +51,35 @@ static bool same_position(const DraughtsPosition *a,
            a->black_men == b->black_men &&
            a->white_kings == b->white_kings &&
            a->black_kings == b->black_kings;
+}
+
+static uint64_t mix64(uint64_t value)
+{
+    value ^= value >> 30;
+    value *= UINT64_C(0xbf58476d1ce4e5b9);
+    value ^= value >> 27;
+    value *= UINT64_C(0x94d049bb133111eb);
+    value ^= value >> 31;
+    return value;
+}
+
+static uint64_t move_fingerprint(const DraughtsMove *move)
+{
+    uint64_t value = move->captured;
+    value ^= (uint64_t)move->from << 50;
+    value ^= (uint64_t)move->to << 56;
+    value ^= (uint64_t)move->capture_count * UINT64_C(0x9e3779b97f4a7c15);
+    return mix64(value);
+}
+
+static uint64_t predecessor_fingerprint(
+    const DraughtsPosition *position, const DraughtsMove *move)
+{
+    uint64_t value = mix64(position->white_men);
+    value ^= mix64(position->black_men + UINT64_C(0x9e3779b97f4a7c15));
+    value ^= mix64(position->white_kings + UINT64_C(0x3c6ef372fe94f82a));
+    value ^= mix64(position->black_kings + UINT64_C(0xdaa66d2c7ddef743));
+    return mix64(value ^ move_fingerprint(move));
 }
 
 static unsigned test_bit_count(uint64_t bits)
@@ -106,6 +145,8 @@ static bool check_move(const DraughtsMove *move, void *opaque)
     if (!same_position(&changed, &check->original))
         check->failed = true;
     check->destination_mask |= BIT(move->to);
+    check->fingerprint_xor ^= move_fingerprint(move);
+    check->fingerprint_sum += move_fingerprint(move);
     ++check->moves;
     return true;
 }
@@ -117,24 +158,71 @@ static bool check_predecessor(const DraughtsPosition *predecessor,
     DraughtsPosition reconstructed = *predecessor;
     if (!same_material(predecessor, &check->current) ||
         draughts_has_capture(predecessor, check->mover) ||
+        draughts_has_capture_padded(predecessor, check->mover) ||
         !draughts_do_move(&reconstructed, check->mover, forward_move, NULL) ||
         !same_position(&reconstructed, &check->current))
         check->failed = true;
     check->source_mask |= BIT(forward_move->from);
+    check->fingerprint_xor ^=
+        predecessor_fingerprint(predecessor, forward_move);
+    check->fingerprint_sum +=
+        predecessor_fingerprint(predecessor, forward_move);
     ++check->predecessors;
     return true;
 }
 
-static bool generate_and_check(const DraughtsPosition *position, EgtbSide side,
-                               MoveCheck *check)
+static bool generate_and_check_backend(
+    const DraughtsPosition *position, EgtbSide side, MoveCheck *check,
+    GenerateMovesFunction generate)
 {
     size_t generated;
     memset(check, 0, sizeof(*check));
     check->original = *position;
     check->side = side;
-    return draughts_generate_moves(position, side, check_move, check,
-                                   &generated) &&
+    return generate(position, side, check_move, check, &generated) &&
            generated == check->moves && !check->failed;
+}
+
+static bool same_move_result(const MoveCheck *a, const MoveCheck *b)
+{
+    return a->moves == b->moves &&
+           a->capture_count == b->capture_count &&
+           a->saw_capture == b->saw_capture &&
+           a->destination_mask == b->destination_mask &&
+           a->fingerprint_xor == b->fingerprint_xor &&
+           a->fingerprint_sum == b->fingerprint_sum;
+}
+
+static bool generate_and_check(const DraughtsPosition *position, EgtbSide side,
+                               MoveCheck *check)
+{
+    MoveCheck padded;
+    return generate_and_check_backend(position, side, check,
+                                      draughts_generate_moves) &&
+           generate_and_check_backend(position, side, &padded,
+                                      draughts_generate_moves_padded) &&
+           same_move_result(check, &padded);
+}
+
+static bool generate_predecessors_backend(
+    const DraughtsPosition *position, EgtbSide side, PredecessorCheck *check,
+    GeneratePredecessorsFunction generate, size_t *generated)
+{
+    memset(check, 0, sizeof(*check));
+    check->current = *position;
+    check->mover = side == EGTB_WHITE_TO_MOVE ? EGTB_BLACK_TO_MOVE :
+                                                EGTB_WHITE_TO_MOVE;
+    return generate(position, side, check_predecessor, check, generated) &&
+           !check->failed && *generated == check->predecessors;
+}
+
+static bool same_predecessor_result(const PredecessorCheck *a,
+                                    const PredecessorCheck *b)
+{
+    return a->predecessors == b->predecessors &&
+           a->source_mask == b->source_mask &&
+           a->fingerprint_xor == b->fingerprint_xor &&
+           a->fingerprint_sum == b->fingerprint_sum;
 }
 
 static bool test_quiet_man_and_promotion(void)
@@ -210,36 +298,38 @@ static bool test_captured_piece_remains_blocker(void)
 static bool test_inverse_capture_filter(void)
 {
     DraughtsPosition position = {0};
-    PredecessorCheck check;
-    size_t generated;
+    PredecessorCheck table, padded;
+    size_t table_generated, padded_generated;
     position.white_men = BIT(square_at(4, 3));
     position.black_men = BIT(square_at(4, 1));
-    memset(&check, 0, sizeof(check));
-    check.current = position;
-    check.mover = EGTB_WHITE_TO_MOVE;
-    if (!draughts_generate_quiet_predecessors(
-            &position, EGTB_BLACK_TO_MOVE, check_predecessor, &check,
-            &generated) ||
-        check.failed || generated != check.predecessors ||
-        check.predecessors != 1)
+    if (!generate_predecessors_backend(
+            &position, EGTB_BLACK_TO_MOVE, &table,
+            draughts_generate_quiet_predecessors, &table_generated) ||
+        !generate_predecessors_backend(
+            &position, EGTB_BLACK_TO_MOVE, &padded,
+            draughts_generate_quiet_predecessors_padded,
+            &padded_generated) ||
+        !same_predecessor_result(&table, &padded) ||
+        table.predecessors != 1)
         return false;
-    return check.source_mask == BIT(square_at(5, 4));
+    return table.source_mask == BIT(square_at(5, 4));
 }
 
 static bool test_inverse_king_same_material(void)
 {
     DraughtsPosition position = {0};
-    PredecessorCheck check;
-    size_t generated;
+    PredecessorCheck table, padded;
+    size_t table_generated, padded_generated;
     position.white_kings = BIT(0);
-    memset(&check, 0, sizeof(check));
-    check.current = position;
-    check.mover = EGTB_WHITE_TO_MOVE;
-    return draughts_generate_quiet_predecessors(
-               &position, EGTB_BLACK_TO_MOVE, check_predecessor, &check,
-               &generated) &&
-           !check.failed && generated == check.predecessors &&
-           check.predecessors == 9;
+    return generate_predecessors_backend(
+               &position, EGTB_BLACK_TO_MOVE, &table,
+               draughts_generate_quiet_predecessors, &table_generated) &&
+           generate_predecessors_backend(
+               &position, EGTB_BLACK_TO_MOVE, &padded,
+               draughts_generate_quiet_predecessors_padded,
+               &padded_generated) &&
+           same_predecessor_result(&table, &padded) &&
+           table.predecessors == 9;
 }
 
 static bool test_random_positions(void)
@@ -269,9 +359,13 @@ static bool test_random_positions(void)
         position.black_kings = indexed.black_kings;
         for (side = 0; side < 2; ++side) {
             MoveCheck check;
+            bool padded_has_capture;
             bool has_capture =
                 draughts_has_capture(&position, (EgtbSide)side);
+            padded_has_capture =
+                draughts_has_capture_padded(&position, (EgtbSide)side);
             if (!generate_and_check(&position, (EgtbSide)side, &check) ||
+                has_capture != padded_has_capture ||
                 has_capture != check.saw_capture) {
                 fprintf(stderr, "random move test failed at sample %u side %u\n",
                         sample, side);
@@ -279,18 +373,17 @@ static bool test_random_positions(void)
                 return false;
             }
             if (sample < 10000) {
-                PredecessorCheck predecessor_check;
-                size_t generated;
-                memset(&predecessor_check, 0, sizeof(predecessor_check));
-                predecessor_check.current = position;
-                predecessor_check.mover =
-                    side == EGTB_WHITE_TO_MOVE ? EGTB_BLACK_TO_MOVE :
-                                                 EGTB_WHITE_TO_MOVE;
-                if (!draughts_generate_quiet_predecessors(
-                        &position, (EgtbSide)side, check_predecessor,
-                        &predecessor_check, &generated) ||
-                    predecessor_check.failed ||
-                    generated != predecessor_check.predecessors) {
+                PredecessorCheck table, padded;
+                size_t table_generated, padded_generated;
+                if (!generate_predecessors_backend(
+                        &position, (EgtbSide)side, &table,
+                        draughts_generate_quiet_predecessors,
+                        &table_generated) ||
+                    !generate_predecessors_backend(
+                        &position, (EgtbSide)side, &padded,
+                        draughts_generate_quiet_predecessors_padded,
+                        &padded_generated) ||
+                    !same_predecessor_result(&table, &padded)) {
                     fprintf(stderr,
                             "random predecessor test failed at sample %u "
                             "side %u\n", sample, side);
@@ -339,7 +432,7 @@ int main(void)
                 draughts_movegen_last_error());
         return EXIT_FAILURE;
     }
-    printf("move-generation tests: PASS (100000 random seven-piece positions, "
-           "both sides)\n");
+    printf("move-generation tests: PASS (table/padded differential, 100000 "
+           "random seven-piece positions, both sides)\n");
     return EXIT_SUCCESS;
 }

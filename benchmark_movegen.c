@@ -21,6 +21,32 @@ typedef struct {
     bool failed;
 } ApplyContext;
 
+typedef bool (*HasCaptureFunction)(const DraughtsPosition *, EgtbSide);
+typedef bool (*GenerateMovesFunction)(
+    const DraughtsPosition *, EgtbSide, DraughtsMoveVisitor, void *, size_t *);
+typedef bool (*GeneratePredecessorsFunction)(
+    const DraughtsPosition *, EgtbSide, DraughtsPredecessorVisitor, void *,
+    size_t *);
+
+typedef struct {
+    const char *name;
+    HasCaptureFunction has_capture;
+    GenerateMovesFunction generate_moves;
+    GeneratePredecessorsFunction generate_predecessors;
+} MovegenBackend;
+
+typedef struct {
+    uint64_t captures;
+    uint64_t moves;
+    uint64_t predecessors;
+    uint64_t checksum;
+    unsigned maximum_capture;
+    double capture_seconds;
+    double generate_seconds;
+    double apply_seconds;
+    double predecessor_seconds;
+} BenchmarkResult;
+
 static double now_seconds(void)
 {
     struct timespec time;
@@ -80,6 +106,104 @@ static bool parse_samples(const char *text, uint64_t *samples)
     return true;
 }
 
+static bool benchmark_backend(const MovegenBackend *backend,
+                              const DraughtsPosition *positions,
+                              uint64_t samples, BenchmarkResult *result)
+{
+    uint64_t sample;
+    double start;
+    memset(result, 0, sizeof(*result));
+
+    for (sample = 0; sample < samples && sample < 10000; ++sample) {
+        size_t ignored;
+        backend->generate_moves(&positions[sample], EGTB_WHITE_TO_MOVE,
+                                NULL, NULL, &ignored);
+        backend->generate_moves(&positions[sample], EGTB_BLACK_TO_MOVE,
+                                NULL, NULL, &ignored);
+    }
+
+    start = now_seconds();
+    for (sample = 0; sample < samples; ++sample) {
+        unsigned side;
+        for (side = 0; side < 2; ++side) {
+            if (backend->has_capture(&positions[sample], (EgtbSide)side))
+                ++result->captures;
+        }
+    }
+    result->capture_seconds = now_seconds() - start;
+
+    start = now_seconds();
+    for (sample = 0; sample < samples; ++sample) {
+        unsigned side;
+        for (side = 0; side < 2; ++side) {
+            size_t count;
+            if (!backend->generate_moves(&positions[sample], (EgtbSide)side,
+                                         NULL, NULL, &count))
+                return false;
+            result->moves += count;
+        }
+    }
+    result->generate_seconds = now_seconds() - start;
+
+    start = now_seconds();
+    for (sample = 0; sample < samples; ++sample) {
+        unsigned side;
+        for (side = 0; side < 2; ++side) {
+            ApplyContext context = {positions[sample], (EgtbSide)side,
+                                    0, 0, 0, false};
+            size_t count;
+            if (!backend->generate_moves(&positions[sample], (EgtbSide)side,
+                                         apply_move, &context, &count) ||
+                context.failed)
+                return false;
+            result->checksum += context.checksum + count;
+            if (context.maximum_capture > result->maximum_capture)
+                result->maximum_capture = context.maximum_capture;
+        }
+    }
+    result->apply_seconds = now_seconds() - start;
+
+    start = now_seconds();
+    for (sample = 0; sample < samples; ++sample) {
+        unsigned side;
+        for (side = 0; side < 2; ++side) {
+            size_t count;
+            if (!backend->generate_predecessors(
+                    &positions[sample], (EgtbSide)side, NULL, NULL, &count))
+                return false;
+            result->predecessors += count;
+        }
+    }
+    result->predecessor_seconds = now_seconds() - start;
+    return true;
+}
+
+static void print_result(const MovegenBackend *backend,
+                         const BenchmarkResult *result, uint64_t operations)
+{
+    printf("%s backend:\n", backend->name);
+    printf("  capture test:       %10.3f positions/s  "
+           "capture positions=%.2f%%\n",
+           (double)operations / result->capture_seconds,
+           100.0 * (double)result->captures / (double)operations);
+    printf("  legal generation:   %10.3f positions/s  %10.3f moves/s  "
+           "average=%.3f\n",
+           (double)operations / result->generate_seconds,
+           (double)result->moves / result->generate_seconds,
+           (double)result->moves / (double)operations);
+    printf("  generation+do/undo: %10.3f positions/s  %10.3f moves/s  "
+           "max-capture=%u\n",
+           (double)operations / result->apply_seconds,
+           (double)result->moves / result->apply_seconds,
+           result->maximum_capture);
+    printf("  quiet predecessors: %10.3f positions/s  "
+           "%10.3f predecessors/s  average=%.3f\n",
+           (double)operations / result->predecessor_seconds,
+           (double)result->predecessors / result->predecessor_seconds,
+           (double)result->predecessors / (double)operations);
+    printf("  checksum=%" PRIu64 "\n", result->checksum);
+}
+
 int main(int argc, char **argv)
 {
     EgIndexer indexer;
@@ -87,11 +211,15 @@ int main(int argc, char **argv)
     uint64_t samples = DEFAULT_SAMPLES;
     uint64_t state = UINT64_C(0xd1b54a32d192ed03);
     uint64_t database_count;
-    uint64_t sample, operations, captures = 0, moves = 0, predecessors = 0;
-    uint64_t checksum = 0;
-    unsigned maximum_capture = 0;
-    double start, capture_seconds, generate_seconds, apply_seconds;
-    double predecessor_seconds;
+    uint64_t sample, operations;
+    const MovegenBackend table = {
+        "table", draughts_has_capture, draughts_generate_moves,
+        draughts_generate_quiet_predecessors};
+    const MovegenBackend padded = {
+        "padded", draughts_has_capture_padded,
+        draughts_generate_moves_padded,
+        draughts_generate_quiet_predecessors_padded};
+    BenchmarkResult table_result, padded_result;
 
     if (argc == 3 && strcmp(argv[1], "--samples") == 0) {
         if (!parse_samples(argv[2], &samples)) {
@@ -131,101 +259,38 @@ int main(int argc, char **argv)
     eg_indexer_destroy(&indexer);
     operations = samples * 2;
 
-    for (sample = 0; sample < samples && sample < 10000; ++sample) {
-        size_t ignored;
-        draughts_generate_moves(&positions[sample], EGTB_WHITE_TO_MOVE,
-                                NULL, NULL, &ignored);
-        draughts_generate_moves(&positions[sample], EGTB_BLACK_TO_MOVE,
-                                NULL, NULL, &ignored);
+    if (!benchmark_backend(&table, positions, samples, &table_result) ||
+        !benchmark_backend(&padded, positions, samples, &padded_result)) {
+        fprintf(stderr, "move-generation benchmark failed: %s\n",
+                draughts_movegen_last_error());
+        free(positions);
+        return EXIT_FAILURE;
     }
-
-    start = now_seconds();
-    for (sample = 0; sample < samples; ++sample) {
-        unsigned side;
-        for (side = 0; side < 2; ++side) {
-            if (draughts_has_capture(&positions[sample], (EgtbSide)side))
-                ++captures;
-        }
+    if (table_result.captures != padded_result.captures ||
+        table_result.moves != padded_result.moves ||
+        table_result.predecessors != padded_result.predecessors ||
+        table_result.checksum != padded_result.checksum ||
+        table_result.maximum_capture != padded_result.maximum_capture) {
+        fprintf(stderr, "move-generation backends produced different results\n");
+        free(positions);
+        return EXIT_FAILURE;
     }
-    capture_seconds = now_seconds() - start;
-
-    start = now_seconds();
-    for (sample = 0; sample < samples; ++sample) {
-        unsigned side;
-        for (side = 0; side < 2; ++side) {
-            size_t count;
-            if (!draughts_generate_moves(&positions[sample], (EgtbSide)side,
-                                         NULL, NULL, &count)) {
-                fprintf(stderr, "move generation failed: %s\n",
-                        draughts_movegen_last_error());
-                free(positions);
-                return EXIT_FAILURE;
-            }
-            moves += count;
-        }
-    }
-    generate_seconds = now_seconds() - start;
-
-    start = now_seconds();
-    for (sample = 0; sample < samples; ++sample) {
-        unsigned side;
-        for (side = 0; side < 2; ++side) {
-            ApplyContext context = {positions[sample], (EgtbSide)side,
-                                    0, 0, 0, false};
-            size_t count;
-            if (!draughts_generate_moves(&positions[sample], (EgtbSide)side,
-                                         apply_move, &context, &count) ||
-                context.failed) {
-                fprintf(stderr, "move/apply benchmark failed: %s\n",
-                        draughts_movegen_last_error());
-                free(positions);
-                return EXIT_FAILURE;
-            }
-            checksum += context.checksum + count;
-            if (context.maximum_capture > maximum_capture)
-                maximum_capture = context.maximum_capture;
-        }
-    }
-    apply_seconds = now_seconds() - start;
-
-    start = now_seconds();
-    for (sample = 0; sample < samples; ++sample) {
-        unsigned side;
-        for (side = 0; side < 2; ++side) {
-            size_t count;
-            if (!draughts_generate_quiet_predecessors(
-                    &positions[sample], (EgtbSide)side, NULL, NULL, &count)) {
-                fprintf(stderr, "predecessor generation failed: %s\n",
-                        draughts_movegen_last_error());
-                free(positions);
-                return EXIT_FAILURE;
-            }
-            predecessors += count;
-        }
-    }
-    predecessor_seconds = now_seconds() - start;
 
     printf("Move-generation benchmark: WM=1 BM=2 WK=2 BK=2\n");
     printf("positions=%" PRIu64 " side-to-move positions=%" PRIu64 "\n",
            samples, operations);
-    printf("capture test:       %10.3f positions/s  capture positions=%.2f%%\n",
-           (double)operations / capture_seconds,
-           100.0 * (double)captures / (double)operations);
-    printf("legal generation:   %10.3f positions/s  %10.3f moves/s  "
-           "average=%.3f\n",
-           (double)operations / generate_seconds,
-           (double)moves / generate_seconds,
-           (double)moves / (double)operations);
-    printf("generation+do/undo: %10.3f positions/s  %10.3f moves/s  "
-           "max-capture=%u\n",
-           (double)operations / apply_seconds,
-           (double)moves / apply_seconds, maximum_capture);
-    printf("quiet predecessors: %10.3f positions/s  %10.3f predecessors/s  "
-           "average=%.3f\n",
-           (double)operations / predecessor_seconds,
-           (double)predecessors / predecessor_seconds,
-           (double)predecessors / (double)operations);
-    printf("checksum=%" PRIu64 "\n", checksum);
+    printf("padded conversion: %s\n",
+           draughts_padded_backend_uses_bmi2() ? "BMI2 PDEP/PEXT" :
+                                                 "portable fallback");
+    print_result(&table, &table_result, operations);
+    print_result(&padded, &padded_result, operations);
+    printf("padded/table speedup: capture=%.3fx generation=%.3fx "
+           "generation+do/undo=%.3fx predecessors=%.3fx\n",
+           table_result.capture_seconds / padded_result.capture_seconds,
+           table_result.generate_seconds / padded_result.generate_seconds,
+           table_result.apply_seconds / padded_result.apply_seconds,
+           table_result.predecessor_seconds /
+               padded_result.predecessor_seconds);
     free(positions);
     return EXIT_SUCCESS;
 }

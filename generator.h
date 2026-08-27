@@ -60,7 +60,14 @@ typedef struct {
     uint64_t shortened_wins[2];
     uint64_t consistency_passes;
     uint64_t consistency_updates[2];
+    EgtbCacheStatistics consistency_cache;
     uint16_t maximum_dtm;
+    double initialization_seconds;
+    double backpropagation_seconds;
+    double compilation_seconds;
+    double consistency_seconds;
+    double final_scan_seconds;
+    double total_seconds;
 } EgtbGenerationStatistics;
 
 typedef struct {
@@ -69,6 +76,14 @@ typedef struct {
     /* Optional array of thread_count private probe contexts. */
     void *const *external_contexts;
 } EgtbThreadOptions;
+
+typedef struct {
+    unsigned thread_count;
+    /* Total cache pages, divided between private read-only worker views. */
+    size_t cache_pages;
+    /* Optional array of thread_count private probe contexts. */
+    void *const *external_contexts;
+} EgtbVerificationOptions;
 
 typedef bool (*EgtbExternalProbe)(
     const DraughtsPosition *position, EgtbSide side, void *context,
@@ -85,6 +100,7 @@ typedef struct {
     uint64_t shorter_wins[2];
     uint64_t longer_losses[2];
     uint64_t other_updates[2];
+    EgtbCacheStatistics cache;
 } EgtbConsistencyStatistics;
 
 const char *egtb_generator_last_error(void);
@@ -149,7 +165,9 @@ bool egtb_backtrack_losses_to_wins_with_probe(
 
 /*
  * Initialize and alternate win-to-loss and loss-to-win layers until a layer
- * creates no new value. The caller supplies a new all-draw database. It stays
+ * creates no new value. The threaded implementation records compressed exact
+ * DTM frontier streams and persistent outcome bitmaps, then compiles the
+ * caller's all-draw database once before running consistency repair. It stays
  * open and unflushed on return so finalization remains the caller's decision.
  */
 bool egtb_generate(Egtb *database, const EgIndexer *indexer,
@@ -177,6 +195,29 @@ bool egtb_make_consistent(
     Egtb *database, const EgIndexer *indexer,
     EgtbExternalProbe external_probe, void *external_context,
     EgtbConsistencyReporter reporter, void *reporter_context,
+    EgtbConsistencyStatistics *statistics);
+
+/*
+ * Snapshot-based parallel consistency repair. Workers collect corrections
+ * through private read-only views; after their views close, one thread applies
+ * the merged corrections to the writable backing. Later passes inspect only
+ * positions affected by the preceding correction batch.
+ */
+bool egtb_make_consistent_threaded(
+    Egtb *database, const EgIndexer *indexer,
+    EgtbExternalProbe external_probe, void *external_context,
+    EgtbConsistencyReporter reporter, void *reporter_context,
+    const EgtbVerificationOptions *options,
+    EgtbConsistencyStatistics *statistics);
+
+/*
+ * Verify a compacted, read-only database without changing it. Index ranges
+ * and cache views are private per worker. Any mismatch is a fatal failure.
+ */
+bool egtb_verify_consistent_threaded(
+    Egtb *database, const EgIndexer *indexer,
+    EgtbExternalProbe external_probe, void *external_context,
+    const EgtbVerificationOptions *options,
     EgtbConsistencyStatistics *statistics);
 
 #endif

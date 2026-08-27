@@ -48,8 +48,21 @@ bool draughts_generate_moves(const DraughtsPosition *position, EgtbSide side,
                              DraughtsMoveVisitor visitor, void *context,
                              size_t *move_count);
 
+/*
+ * Alternative move generator using GWD's padded 64-bit board layout. The
+ * public position and move representation remains the compact 0..49 layout.
+ * BMI2 builds use PDEP/PEXT for whole-board conversion; other builds use a
+ * portable set-bit fallback.
+ */
+bool draughts_generate_moves_padded(
+    const DraughtsPosition *position, EgtbSide side,
+    DraughtsMoveVisitor visitor, void *context, size_t *move_count);
+bool draughts_padded_backend_uses_bmi2(void);
+
 /* True when at least one capture is available; maximum length is not computed. */
 bool draughts_has_capture(const DraughtsPosition *position, EgtbSide side);
+bool draughts_has_capture_padded(const DraughtsPosition *position,
+                                 EgtbSide side);
 
 /* Apply a generated move and optionally save the four bitboards for undo. */
 bool draughts_do_move(DraughtsPosition *position, EgtbSide side,
@@ -64,6 +77,10 @@ void draughts_undo_move(DraughtsPosition *position, const DraughtsUndo *undo);
  * and inverse captures are not generated.
  */
 bool draughts_generate_quiet_predecessors(
+    const DraughtsPosition *position, EgtbSide current_side,
+    DraughtsPredecessorVisitor visitor, void *context,
+    size_t *predecessor_count);
+bool draughts_generate_quiet_predecessors_padded(
     const DraughtsPosition *position, EgtbSide current_side,
     DraughtsPredecessorVisitor visitor, void *context,
     size_t *predecessor_count);

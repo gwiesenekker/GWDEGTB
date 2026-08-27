@@ -124,6 +124,14 @@ scan across empty diagonal squares and consider every empty landing square
 beyond a victim. Captures are compulsory and only globally maximum-length
 capture paths are emitted.
 
+The alternative padded backend maps compact squares 0..49 to GWD fields
+6..15, 17..26, 28..37, 39..48, and 50..59. Diagonal steps then become fixed
+unsigned shifts by 5 or 6; the unused fields prevent row wrapping. Builds with
+BMI2 use PDEP/PEXT to convert whole bitboards at the API boundary and portable
+builds use a set-bit fallback. The public position and move representations
+remain compact. The padded entry points have a `_padded` suffix, and
+`generate_egtb_padded` builds the generator against them.
+
 Captured pieces remain occupied during recursive generation and are tracked in
 a separate captured mask. This both prevents capturing a piece twice and makes
 an already captured piece continue to block a king ray until the move ends.
@@ -135,7 +143,8 @@ generation reverses regular man and king moves, rejecting every predecessor
 in which the previous mover had a compulsory capture. Neither direction may
 promote, so every predecessor retains the EGTB's exact material signature.
 
-The regression suite includes focused tests for forced maximum capture,
+The regression suite compares the table and padded backends and includes
+focused tests for forced maximum capture,
 backward man captures, flying-king landing choices, delayed captured-piece
 removal, forward promotion, inverse material preservation, inverse capture filtering, and
 do/undo. It also checks 100,000 random seven-piece positions for both sides,
@@ -145,8 +154,8 @@ plus inverse predecessors for the first 10,000:
 make test
 ```
 
-Benchmark capture detection, full legal generation, generation plus do/undo,
-and inverse quiet predecessors with:
+Benchmark both backends for capture detection, full legal generation,
+generation plus do/undo, and inverse quiet predecessors with:
 
 ```sh
 make benchmark-movegen
@@ -207,23 +216,40 @@ require a second bitmap.
 `egtb_generate()` starts with terminal initialization and alternates the two
 parameterized passes for distances 1, 2, 3, 4, and so on. It stops when a pass
 creates no new or shortened entries. No intermediate pass is explicitly
-saved. It then runs `egtb_make_consistent()`, which recomputes both side-to-move
-values of every position from all legal successors and repeats until a complete
-pass makes no corrections. Corrections report the index, side, four bitboards,
-and old/new DTM. Transitions to another material signature can be resolved by
-an external EGTB probe callback.
+saved. It then runs `egtb_make_consistent()`, whose first pass recomputes both
+side-to-move values of every position from all legal successors. Corrections
+seed a deduplicated worklist with their quiet, non-promoting predecessors and
+successors. Later passes check only that affected worklist and continue until
+a pass makes no corrections. Corrections report the index, side, four
+bitboards, and old/new DTM. Transitions to another material signature can be
+resolved by an external EGTB probe callback.
 
 The generic generator uses the same argument order as GWD:
 
 ```sh
 ./generate_egtb NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
 ./generate_egtb -j THREADS NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
+./generate_egtb --revision
 ```
 
+A plain `make generate_egtb` is the native production build and uses
+`-O3 -DNDEBUG -march=native`. Override `CFLAGS` explicitly for a portable or
+debug build. Because `-march=native` specializes the executable for the build
+machine, rebuild after copying the source to a machine with a different CPU.
+
+Every actual generator build receives a local revision in increments of 0.001
+and prints it at startup. An up-to-date `make` does not increment it; `make -B`
+does because it explicitly forces a rebuild. The ignored build state is tied
+to Git `HEAD`, so the first build after a commit resets to `.001`. The base is
+taken from the latest version tag; for example, builds after `v1.7` are
+`1.701`, `1.702`, and so on. This build revision is intentionally independent
+of commit identifiers.
+
 `-j` enables page-partitioned POSIX-thread backtracking. The accepted range is
-1 through 256; one thread retains the original implementation. Initialization
-and the final self-consistency sweep are currently serial, while the repeated
-bitmap/frontier retrograde passes run concurrently.
+1 through 256. Initialization, bitmap/frontier retrograde propagation,
+frontier compilation, snapshot-based consistency repair, and the final
+read-only consistency verification are divided across the requested threads.
+After compaction, any mismatch found by final verification is fatal.
 
 Filenames use the same order, for example `1wX-0wO-0bX-1bO.dtm` for WK-BM.
 The computed 4D material catalog generates only the GWD-canonical orientation:
@@ -239,31 +265,42 @@ matches the GWD job order and ensures promotions target earlier databases.
 With the generator's 1024-byte page size, the writable database uses a 256 MiB
 uncompressed page cache. Every previously generated database opened for
 read-only dependency lookups uses a 16 MiB cache. These capacities exclude the
-page dictionaries and cache metadata.
+page dictionaries and cache metadata. The final read-only consistency check
+uses a separate 256 MiB cache budget divided across its workers, so increasing
+verification locality does not multiply the dependency-cache allocation.
 
-During threaded backtracking the 256 MiB writable-cache budget is divided
-across the workers. The original shared cache is temporarily reduced to one
-page, so the threaded views do not add another 256 MiB to it, and is restored
-before the consistency sweep. Each worker owns a contiguous range of complete
-EGTB pages and the corresponding whole bitmap words. It has a private writable
-view, ZSTD contexts, statistics, error state, and external-DTM catalog/cache.
-Consequently the 16 MiB dependency-cache setting is per worker and per opened
-dependency.
+During threaded backtracking each worker owns a contiguous range of complete
+EGTB pages and the corresponding whole bitmap words. Exact DTM layers are
+stored as temporary, append-only streams of 64-bit indices. The streams use
+checksummed ZSTD blocks and one unlinked temporary backing file per worker, so
+they require neither a global stream lock nor thousands of open files.
 
-Workers compress and update pages that still fit their owned reserved blocks
-with positional `pwrite()` calls, without locking one another. Fixed-offset
-reads likewise use `pread()`, so cache eviction/reload never depends on a
-shared or buffered stream position. A single mutex in the shared writable
-backing protects end-of-file allocation/appending and directory/header writes.
-In particular, choosing the end offset and appending a block that outgrows its
-old reservation is one atomic operation.
-Frontier construction completes before predecessor processing starts, making
-the shared exact/cumulative bitmaps immutable during proof generation.
+Initialization uses the same page-aligned partition. Every worker evaluates
+both side-to-move values in its slice with a private external-DTM catalog and
+appends every non-draw result to the appropriate private stream. This includes
+terminal loss-in-zero, win-in-one, and higher DTMs introduced by captures or
+promotions into previously generated databases.
 
-The `1x1.sh`, `2x1.sh`, `2x2.sh`, `3x1.sh`, and `3x2.sh` jobs accept
-`EGTB_THREADS`; for example, `EGTB_THREADS=16 ./3x2.sh`. They default to one
-thread. Each script removes the target DTM immediately before regenerating it
-and writes separate logs below `logs/<job-name>/`.
+Persistent WTM/BTM won and lost bitmaps replace the writable working EGTB.
+Each exact source position is processed by its owner exactly once. Generated
+predecessors are routed through a shared candidate bitmap using atomic 64-bit
+OR operations. After a barrier, workers inspect only the candidate bits in
+their page-aligned slices and append proven results to their private next-DTM
+streams. Previously generated dependency EGTBs still use a private read-only
+catalog and cache per worker.
+
+After retrograde convergence, workers compile their DTM streams into disjoint
+page ranges of the final all-draw database. Streams are applied from the
+largest distance down to zero, so a later shorter result supersedes a stale
+longer record. Only this compilation phase uses the 256 MiB writable-cache
+budget, divided across the workers. The shared cache is temporarily reduced to
+one page and restored before the sparse consistency repair.
+
+The family job scripts from `1x1.sh` through the seven-piece `4x3.sh`,
+`5x2.sh`, and `6x1.sh` jobs accept `EGTB_THREADS`; for example,
+`EGTB_THREADS=16 ./3x2.sh`. They default to one thread. Each script removes the
+target DTM immediately before regenerating it and writes separate logs below
+`logs/<job-name>/`.
 
 DTM page caches are direct-mapped by page number. An `Egtb` backing owns the
 file header and one in-memory immutable page dictionary; additional
@@ -272,8 +309,20 @@ ZSTD contexts, compressed buffers, and cache statistics private. Read-only
 view misses use `pread()` and therefore do not share a seek position. Writable
 views use the same direct mapping and flush a dirty slot before replacing it.
 
-Only after the final zero-update pass does the generator flush the working
-pages, close the working file, compact the live blocks into a temporary file,
-and atomically install the compacted database. It reopens the finished file
-read-only and prints WTM and BTM counts for every stored DTM value together
-with final compression statistics.
+Consistency repair uses snapshot iterations. Every worker opens a private
+read-only view of the compiled database and writes mismatches from its owned
+range to an in-memory correction stream. After the views close, one thread
+applies the range-ordered streams through the writable backing and constructs
+the affected-position bitmap. Later parallel iterations inspect only affected
+successors and predecessors. The generator then flushes the repaired pages,
+compacts the live blocks into a temporary file, and atomically installs the
+compacted database. It reopens the finished file read-only, runs the parallel
+fatal consistency verification, and prints WTM and BTM counts for every stored
+DTM value together with final compression statistics. The summary also prints
+monotonic wall-clock timings for setup, initialization, backpropagation,
+frontier compilation, consistency repair, the final DTM scan, finalization,
+compaction/reopen, final verification, the statistics scan, and total runtime.
+It also reports aggregate lookups, hits, misses, hit rate, decompressions,
+dirty evictions, and compressed writes for the current-database views and the
+external dependency caches. Dependency statistics cover the complete generator
+phase and, separately, the freshly reopened final-verification catalogs.

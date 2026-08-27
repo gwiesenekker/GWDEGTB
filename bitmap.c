@@ -72,6 +72,20 @@ void bitmap_set(Bitmap *bitmap, uint64_t index)
     bitmap->words[index >> 6] |= UINT64_C(1) << (index & 63u);
 }
 
+void bitmap_set_atomic(Bitmap *bitmap, uint64_t index)
+{
+    uint64_t mask;
+    assert(bitmap != NULL && bitmap->words != NULL);
+    assert(index < bitmap->bit_count);
+    mask = UINT64_C(1) << (index & 63u);
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_fetch_or(&bitmap->words[index >> 6], mask, __ATOMIC_RELAXED);
+#else
+    /* The threaded generator requires a compiler with atomic intrinsics. */
+    bitmap->words[index >> 6] |= mask;
+#endif
+}
+
 bool bitmap_test(const Bitmap *bitmap, uint64_t index)
 {
     assert(bitmap != NULL && bitmap->words != NULL);

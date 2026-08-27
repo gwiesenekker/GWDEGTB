@@ -2,21 +2,34 @@
 #include "endgame_index.h"
 #include "generator.h"
 #include "material.h"
+#include "revision.h"
 
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 enum {
     GENERATION_PAGE_SIZE = 1024,
     GENERATION_CACHE_BYTES = 256 * 1024 * 1024,
     READONLY_CACHE_BYTES = 16 * 1024 * 1024,
+    FINAL_VERIFICATION_CACHE_BYTES = 256 * 1024 * 1024,
     GENERATION_CACHE_PAGES = GENERATION_CACHE_BYTES / GENERATION_PAGE_SIZE,
-    READONLY_CACHE_PAGES = READONLY_CACHE_BYTES / GENERATION_PAGE_SIZE
+    READONLY_CACHE_PAGES = READONLY_CACHE_BYTES / GENERATION_PAGE_SIZE,
+    FINAL_VERIFICATION_CACHE_PAGES =
+        FINAL_VERIFICATION_CACHE_BYTES / GENERATION_PAGE_SIZE
 };
+
+static double wall_seconds(void)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0.0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
 
 typedef struct {
     EgtbMaterialKind kind;
@@ -77,6 +90,59 @@ static void close_catalog(DatabaseCatalog *catalog)
                         entry->indexer_initialized = false;
                     }
                 }
+}
+
+static void add_cache_statistics(EgtbCacheStatistics *total,
+                                 const EgtbCacheStatistics *part)
+{
+    total->lookups += part->lookups;
+    total->hits += part->hits;
+    total->misses += part->misses;
+    total->decompressions += part->decompressions;
+    total->dirty_evictions += part->dirty_evictions;
+    total->compressed_writes += part->compressed_writes;
+}
+
+static void catalog_cache_statistics(const DatabaseCatalog *catalogs,
+                                     unsigned catalog_count,
+                                     EgtbCacheStatistics *statistics)
+{
+    unsigned catalog_index, wk, wm, bk, bm;
+    memset(statistics, 0, sizeof(*statistics));
+    for (catalog_index = 0; catalog_index < catalog_count; ++catalog_index)
+        for (wk = 0; wk <= EGTB_MAX_PIECES; ++wk)
+            for (wm = 0; wm <= EGTB_MAX_PIECES; ++wm)
+                for (bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
+                    for (bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
+                        const CatalogEntry *entry =
+                            &catalogs[catalog_index].entry[wk][wm][bk][bm];
+                        EgtbCacheStatistics part;
+                        if (entry->view == NULL)
+                            continue;
+                        egtb_view_cache_statistics(entry->view, &part);
+                        add_cache_statistics(statistics, &part);
+                    }
+}
+
+static void print_cache_statistics(const char *label,
+                                   const EgtbCacheStatistics *statistics)
+{
+    double hit_rate = statistics->lookups == 0
+                          ? 0.0
+                          : 100.0 * (double)statistics->hits /
+                                (double)statistics->lookups;
+    printf("%s:\n", label);
+    printf("  %-22s %20s\n", "Metric", "Value");
+    printf("  %-22s %20" PRIu64 "\n", "Lookups", statistics->lookups);
+    printf("  %-22s %20" PRIu64 "\n", "Hits", statistics->hits);
+    printf("  %-22s %20" PRIu64 "\n", "Misses", statistics->misses);
+    printf("  %-22s %19.2f%%\n", "Hit rate", hit_rate);
+    printf("  %-22s %20" PRIu64 "\n", "Decompressions",
+           statistics->decompressions);
+    printf("  %-22s %20" PRIu64 "\n", "Dirty evictions",
+           statistics->dirty_evictions);
+    printf("  %-22s %20" PRIu64 "\n", "Compressed writes",
+           statistics->compressed_writes);
 }
 
 static bool open_catalog_database(DatabaseCatalog *catalog,
@@ -221,7 +287,10 @@ int main(int argc, char **argv)
     char path[128];
     EgtbCreateOptions options = {GENERATION_CACHE_PAGES, 20, 9};
     EgtbGenerationStatistics generation;
+    EgtbConsistencyStatistics final_verification = {0};
     EgtbStorageStatistics storage;
+    EgtbCacheStatistics generation_dependencies = {0};
+    EgtbCacheStatistics verification_dependencies = {0};
     DatabaseCatalog *catalogs = NULL;
     void **probe_contexts = NULL;
     EgIndexer indexer;
@@ -233,6 +302,16 @@ int main(int argc, char **argv)
     bool ok = false;
     unsigned thread_count = 1;
     int material_argument = 1;
+    double program_started = wall_seconds();
+    double generation_started, phase_started;
+    double setup_seconds, generation_seconds, finalize_seconds;
+    double compact_seconds, verification_seconds, statistics_seconds;
+    double total_seconds;
+    if (argc == 2 && strcmp(argv[1], "--revision") == 0) {
+        printf("GWDEGTB revision %s\n", gwdegtb_revision);
+        return EXIT_SUCCESS;
+    }
+    printf("GWDEGTB revision %s\n", gwdegtb_revision);
     if (argc == 7 && strcmp(argv[1], "-j") == 0) {
         if (!parse_thread_count(argv[2], &thread_count)) {
             fprintf(stderr, "thread count must be 1..%u\n",
@@ -291,6 +370,8 @@ int main(int argc, char **argv)
            path, thread_count, thread_count == 1 ? "" : "s",
            (size_t)GENERATION_CACHE_PAGES);
     fflush(stdout);
+    generation_started = wall_seconds();
+    setup_seconds = generation_started - program_started;
     {
         EgtbThreadOptions thread_options = {
             thread_count, GENERATION_CACHE_PAGES, probe_contexts
@@ -311,6 +392,10 @@ int main(int argc, char **argv)
             goto done;
         }
     }
+    generation_seconds = wall_seconds() - generation_started;
+    catalog_cache_statistics(catalogs, thread_count,
+                             &generation_dependencies);
+    phase_started = wall_seconds();
     if (!egtb_flush(database)) {
         fprintf(stderr, "cannot finalize %s: %s\n", path, egtb_last_error());
         goto done;
@@ -323,11 +408,48 @@ int main(int argc, char **argv)
     database = NULL;
     for (unsigned worker = 0; worker < thread_count; ++worker)
         close_catalog(&catalogs[worker]);
+    finalize_seconds = wall_seconds() - phase_started;
+    phase_started = wall_seconds();
     if (!egtb_compact(path, 9, READONLY_CACHE_PAGES) ||
-        !egtb_open_readonly(&database, path, READONLY_CACHE_PAGES) ||
-        !egtb_storage_statistics(database, &storage)) {
+        !egtb_open_readonly(&database, path, READONLY_CACHE_PAGES)) {
         fprintf(stderr, "cannot compact/reopen %s: %s\n", path,
                 egtb_last_error());
+        goto done;
+    }
+    compact_seconds = wall_seconds() - phase_started;
+    phase_started = wall_seconds();
+    for (unsigned worker = 0; worker < thread_count; ++worker) {
+        initialize_catalog(&catalogs[worker], READONLY_CACHE_PAGES);
+        probe_contexts[worker] = &catalogs[worker];
+    }
+    {
+        EgtbVerificationOptions verify_options = {
+            thread_count, FINAL_VERIFICATION_CACHE_PAGES, probe_contexts
+        };
+        if (!egtb_verify_consistent_threaded(
+                database, &indexer, catalog_probe, &catalogs[0],
+                &verify_options, &final_verification)) {
+            const char *catalog_error = "";
+            for (unsigned worker = 0; worker < thread_count; ++worker) {
+                if (catalogs[worker].error[0] != '\0') {
+                    catalog_error = catalogs[worker].error;
+                    break;
+                }
+            }
+            fprintf(stderr, "fatal: compacted database %s failed final "
+                            "consistency verification: %s%s%s\n",
+                    path, egtb_generator_last_error(),
+                    *catalog_error ? ": " : "", catalog_error);
+            goto done;
+        }
+    }
+    verification_seconds = wall_seconds() - phase_started;
+    catalog_cache_statistics(catalogs, thread_count,
+                             &verification_dependencies);
+    phase_started = wall_seconds();
+    if (!egtb_storage_statistics(database, &storage)) {
+        fprintf(stderr, "cannot read storage statistics for %s: %s\n",
+                path, egtb_last_error());
         goto done;
     }
     histogram = calloc((size_t)2 * (UINT16_MAX + 1u), sizeof(*histogram));
@@ -340,6 +462,7 @@ int main(int argc, char **argv)
                 goto done;
             ++histogram[(size_t)side * (UINT16_MAX + 1u) + (uint16_t)value];
         }
+    statistics_seconds = wall_seconds() - phase_started;
     printf("generated %s: material=%u %u %u %u positions=%" PRIu64
            " maximum-index=%" PRIu64 " passes=%" PRIu64
            " maximum-dtm=%u threads=%u\n", path, material.white_kings,
@@ -349,6 +472,18 @@ int main(int argc, char **argv)
     printf("self-consistency: passes=%" PRIu64 " updates=%" PRIu64
            "/%" PRIu64 "\n", generation.consistency_passes,
            generation.consistency_updates[0], generation.consistency_updates[1]);
+    printf("final read-only consistency verification: threads=%u "
+           "cache=%u MiB total positions-checked=%" PRIu64 "\n",
+           thread_count, FINAL_VERIFICATION_CACHE_BYTES / (1024 * 1024),
+           final_verification.positions_checked);
+    print_cache_statistics("consistency current-DB cache",
+                           &generation.consistency_cache);
+    print_cache_statistics("generator dependency caches",
+                           &generation_dependencies);
+    print_cache_statistics("final verification current-DB cache",
+                           &final_verification.cache);
+    print_cache_statistics("final verification dependency caches",
+                           &verification_dependencies);
     for (unsigned side = 0; side < 2; ++side) {
         uint64_t wins = 0, losses = 0, draws = 0;
         for (int numeric = INT16_MIN; numeric <= INT16_MAX; ++numeric) {
@@ -384,6 +519,26 @@ int main(int argc, char **argv)
                (double)storage.logical_uncompressed_bytes,
            (double)storage.logical_uncompressed_bytes /
                (double)storage.file_bytes);
+    total_seconds = wall_seconds() - program_started;
+    printf("wall-clock timings:\n");
+    printf("  %-28s %10.3f s\n", "setup/create", setup_seconds);
+    printf("  %-28s %10.3f s\n", "initialization",
+           generation.initialization_seconds);
+    printf("  %-28s %10.3f s\n", "backpropagation",
+           generation.backpropagation_seconds);
+    printf("  %-28s %10.3f s\n", "frontier compilation",
+           generation.compilation_seconds);
+    printf("  %-28s %10.3f s\n", "consistency repair",
+           generation.consistency_seconds);
+    printf("  %-28s %10.3f s\n", "final DTM scan",
+           generation.final_scan_seconds);
+    printf("  %-28s %10.3f s\n", "generator total", generation_seconds);
+    printf("  %-28s %10.3f s\n", "finalize/close", finalize_seconds);
+    printf("  %-28s %10.3f s\n", "compact/reopen", compact_seconds);
+    printf("  %-28s %10.3f s\n", "final verification",
+           verification_seconds);
+    printf("  %-28s %10.3f s\n", "statistics scan", statistics_seconds);
+    printf("  %-28s %10.3f s\n", "total", total_seconds);
     ok = true;
 done:
     if (database != NULL && !egtb_close(database))
