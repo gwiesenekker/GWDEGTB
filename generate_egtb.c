@@ -365,15 +365,16 @@ int main(int argc, char **argv)
         printf("%s: wins=%" PRIu64 " losses=%" PRIu64 " draws=%" PRIu64
                "\n", side == EGTB_WHITE_TO_MOVE ? "WTM" : "BTM",
                wins, losses, draws);
-        printf("%s DTM:", side == EGTB_WHITE_TO_MOVE ? "WTM" : "BTM");
+        printf("%s DTM statistics:\n",
+               side == EGTB_WHITE_TO_MOVE ? "WTM" : "BTM");
+        printf("%8s %20s\n", "DTM", "Frequency");
         for (int numeric = INT16_MIN; numeric <= INT16_MAX; ++numeric) {
             int16_t value = (int16_t)numeric;
             uint64_t count = histogram[(size_t)side * (UINT16_MAX + 1u) +
                                        (uint16_t)value];
             if (count != 0)
-                printf(" %d=%" PRIu64, value, count);
+                printf("%8d %20" PRIu64 "\n", value, count);
         }
-        putchar('\n');
     }
     printf("storage: raw=%" PRIu64 " payload=%" PRIu64 " file=%" PRIu64
            " bytes overall=%.2f%% (%.2f:1)\n",

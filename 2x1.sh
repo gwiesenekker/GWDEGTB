@@ -24,7 +24,7 @@ generate()
     rm -f -- "$database"
     if ./generate_egtb -j "$threads" "$white_kings" "$white_men" \
             "$black_kings" "$black_men" >"$log" 2>&1; then
-        tail -n 7 "$log"
+        sed -n '/^generated /,$p' "$log"
     else
         status=$?
         printf 'Generation failed for %s; final log lines follow:\n' \
