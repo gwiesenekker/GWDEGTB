@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#define EGTB_MAX_THREADS 256u
+
 typedef struct {
     uint64_t positions;
     uint64_t legal_moves[2];
@@ -60,6 +62,13 @@ typedef struct {
     uint64_t consistency_updates[2];
     uint16_t maximum_dtm;
 } EgtbGenerationStatistics;
+
+typedef struct {
+    unsigned thread_count;
+    size_t writable_cache_pages;
+    /* Optional array of thread_count private probe contexts. */
+    void *const *external_contexts;
+} EgtbThreadOptions;
 
 typedef bool (*EgtbExternalProbe)(
     const DraughtsPosition *position, EgtbSide side, void *context,
@@ -149,6 +158,14 @@ bool egtb_generate(Egtb *database, const EgIndexer *indexer,
                    EgtbConsistencyReporter reporter,
                    void *reporter_context,
                    EgtbGenerationStatistics *statistics);
+
+bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
+                            EgtbExternalProbe external_probe,
+                            void *external_context,
+                            EgtbConsistencyReporter reporter,
+                            void *reporter_context,
+                            const EgtbThreadOptions *options,
+                            EgtbGenerationStatistics *statistics);
 
 /*
  * Recompute every value from its legal successors until a fixed point. Moves

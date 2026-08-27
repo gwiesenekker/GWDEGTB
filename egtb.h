@@ -74,6 +74,9 @@ bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value);
  */
 bool egtb_view_create(EgtbView **out, Egtb *backing, size_t cache_pages,
                       bool writable);
+bool egtb_view_create_range(EgtbView **out, Egtb *backing,
+                            size_t cache_pages, bool writable,
+                            uint64_t first_page, uint64_t end_page);
 bool egtb_view_close(EgtbView *view);
 bool egtb_view_flush(EgtbView *view);
 bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
@@ -88,6 +91,8 @@ uint64_t egtb_page_count(const Egtb *egtb);
 uint32_t egtb_page_size(const Egtb *egtb);
 bool egtb_is_readonly(const Egtb *egtb);
 unsigned egtb_reserve_percent(const Egtb *egtb);
+size_t egtb_cache_pages(const Egtb *egtb);
+bool egtb_resize_cache(Egtb *egtb, size_t cache_pages);
 
 /* Flush a writable EGTB before calling this if dirty pages must be included. */
 bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics);

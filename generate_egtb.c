@@ -201,6 +201,19 @@ static bool parse_count(const char *text, unsigned *count)
     return true;
 }
 
+static bool parse_thread_count(const char *text, unsigned *count)
+{
+    char *end;
+    unsigned long value;
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    if (errno != 0 || *text == '\0' || *end != '\0' || value == 0 ||
+        value > EGTB_MAX_THREADS)
+        return false;
+    *count = (unsigned)value;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     EgtbMaterial requested, material;
@@ -209,7 +222,8 @@ int main(int argc, char **argv)
     EgtbCreateOptions options = {GENERATION_CACHE_PAGES, 20, 9};
     EgtbGenerationStatistics generation;
     EgtbStorageStatistics storage;
-    DatabaseCatalog *catalog = NULL;
+    DatabaseCatalog *catalogs = NULL;
+    void **probe_contexts = NULL;
     EgIndexer indexer;
     Egtb *database = NULL;
     uint64_t *histogram = NULL;
@@ -217,11 +231,22 @@ int main(int argc, char **argv)
     bool indexer_initialized = false;
     bool created = false;
     bool ok = false;
-    if (argc != 5 || !parse_count(argv[1], &requested.white_kings) ||
-        !parse_count(argv[2], &requested.white_men) ||
-        !parse_count(argv[3], &requested.black_kings) ||
-        !parse_count(argv[4], &requested.black_men)) {
-        fprintf(stderr, "usage: %s NWHITE_KINGS NWHITE_MEN "
+    unsigned thread_count = 1;
+    int material_argument = 1;
+    if (argc == 7 && strcmp(argv[1], "-j") == 0) {
+        if (!parse_thread_count(argv[2], &thread_count)) {
+            fprintf(stderr, "thread count must be 1..%u\n",
+                    EGTB_MAX_THREADS);
+            return EXIT_FAILURE;
+        }
+        material_argument = 3;
+    }
+    if (argc != material_argument + 4 ||
+        !parse_count(argv[material_argument], &requested.white_kings) ||
+        !parse_count(argv[material_argument + 1], &requested.white_men) ||
+        !parse_count(argv[material_argument + 2], &requested.black_kings) ||
+        !parse_count(argv[material_argument + 3], &requested.black_men)) {
+        fprintf(stderr, "usage: %s [-j THREADS] NWHITE_KINGS NWHITE_MEN "
                         "NBLACK_KINGS NBLACK_MEN\n", argv[0]);
         return EXIT_FAILURE;
     }
@@ -246,24 +271,45 @@ int main(int argc, char **argv)
     }
     indexer_initialized = true;
     positions = eg_position_count(&indexer);
-    catalog = malloc(sizeof(*catalog));
-    if (catalog == NULL) {
+    catalogs = calloc(thread_count, sizeof(*catalogs));
+    probe_contexts = calloc(thread_count, sizeof(*probe_contexts));
+    if (catalogs == NULL || probe_contexts == NULL) {
         fprintf(stderr, "cannot allocate EGTB catalog\n");
         goto done;
     }
-    initialize_catalog(catalog, READONLY_CACHE_PAGES);
+    for (unsigned worker = 0; worker < thread_count; ++worker) {
+        initialize_catalog(&catalogs[worker], READONLY_CACHE_PAGES);
+        probe_contexts[worker] = &catalogs[worker];
+    }
     if (!egtb_create(&database, path, positions - 1,
                      GENERATION_PAGE_SIZE, &options)) {
         fprintf(stderr, "cannot create %s: %s\n", path, egtb_last_error());
         goto done;
     }
     created = true;
-    if (!egtb_generate(database, &indexer, catalog_probe, catalog,
-                       report_correction, NULL, &generation)) {
+    printf("generating %s with %u thread%s, %zu writable-cache pages total\n",
+           path, thread_count, thread_count == 1 ? "" : "s",
+           (size_t)GENERATION_CACHE_PAGES);
+    fflush(stdout);
+    {
+        EgtbThreadOptions thread_options = {
+            thread_count, GENERATION_CACHE_PAGES, probe_contexts
+        };
+        if (!egtb_generate_threaded(database, &indexer, catalog_probe,
+                                    &catalogs[0], report_correction, NULL,
+                                    &thread_options, &generation)) {
+            const char *catalog_error = "";
+            for (unsigned worker = 0; worker < thread_count; ++worker) {
+                if (catalogs[worker].error[0] != '\0') {
+                    catalog_error = catalogs[worker].error;
+                    break;
+                }
+            }
         fprintf(stderr, "cannot generate %s: %s%s%s\n", path,
-                egtb_generator_last_error(), catalog->error[0] ? ": " : "",
-                catalog->error);
-        goto done;
+                    egtb_generator_last_error(), *catalog_error ? ": " : "",
+                    catalog_error);
+            goto done;
+        }
     }
     if (!egtb_flush(database)) {
         fprintf(stderr, "cannot finalize %s: %s\n", path, egtb_last_error());
@@ -275,7 +321,8 @@ int main(int argc, char **argv)
         goto done;
     }
     database = NULL;
-    close_catalog(catalog);
+    for (unsigned worker = 0; worker < thread_count; ++worker)
+        close_catalog(&catalogs[worker]);
     if (!egtb_compact(path, 9, READONLY_CACHE_PAGES) ||
         !egtb_open_readonly(&database, path, READONLY_CACHE_PAGES) ||
         !egtb_storage_statistics(database, &storage)) {
@@ -295,10 +342,10 @@ int main(int argc, char **argv)
         }
     printf("generated %s: material=%u %u %u %u positions=%" PRIu64
            " maximum-index=%" PRIu64 " passes=%" PRIu64
-           " maximum-dtm=%u\n", path, material.white_kings,
+           " maximum-dtm=%u threads=%u\n", path, material.white_kings,
            material.white_men, material.black_kings, material.black_men,
            positions, positions - 1, generation.retrograde_passes,
-           generation.maximum_dtm);
+           generation.maximum_dtm, thread_count);
     printf("self-consistency: passes=%" PRIu64 " updates=%" PRIu64
            "/%" PRIu64 "\n", generation.consistency_passes,
            generation.consistency_updates[0], generation.consistency_updates[1]);
@@ -340,10 +387,12 @@ int main(int argc, char **argv)
 done:
     if (database != NULL && !egtb_close(database))
         ok = false;
-    if (catalog != NULL) {
-        close_catalog(catalog);
-        free(catalog);
+    if (catalogs != NULL) {
+        for (unsigned worker = 0; worker < thread_count; ++worker)
+            close_catalog(&catalogs[worker]);
+        free(catalogs);
     }
+    free(probe_contexts);
     if (indexer_initialized)
         eg_indexer_destroy(&indexer);
     free(histogram);

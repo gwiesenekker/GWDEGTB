@@ -213,7 +213,13 @@ The generic generator uses the same argument order as GWD:
 
 ```sh
 ./generate_egtb NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
+./generate_egtb -j THREADS NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
 ```
+
+`-j` enables page-partitioned POSIX-thread backtracking. The accepted range is
+1 through 256; one thread retains the original implementation. Initialization
+and the final self-consistency sweep are currently serial, while the repeated
+bitmap/frontier retrograde passes run concurrently.
 
 Filenames use the same order, for example `1wX-0wO-0bX-1bO.dtm` for WK-BM.
 The computed 4D material catalog generates only the GWD-canonical orientation:
@@ -230,6 +236,30 @@ With the generator's 1024-byte page size, the writable database uses a 256 MiB
 uncompressed page cache. Every previously generated database opened for
 read-only dependency lookups uses a 16 MiB cache. These capacities exclude the
 page dictionaries and cache metadata.
+
+During threaded backtracking the 256 MiB writable-cache budget is divided
+across the workers. The original shared cache is temporarily reduced to one
+page, so the threaded views do not add another 256 MiB to it, and is restored
+before the consistency sweep. Each worker owns a contiguous range of complete
+EGTB pages and the corresponding whole bitmap words. It has a private writable
+view, ZSTD contexts, statistics, error state, and external-DTM catalog/cache.
+Consequently the 16 MiB dependency-cache setting is per worker and per opened
+dependency.
+
+Workers compress and update pages that still fit their owned reserved blocks
+with positional `pwrite()` calls, without locking one another. Fixed-offset
+reads likewise use `pread()`, so cache eviction/reload never depends on a
+shared or buffered stream position. A single mutex in the shared writable
+backing protects end-of-file allocation/appending and directory/header writes.
+In particular, choosing the end offset and appending a block that outgrows its
+old reservation is one atomic operation.
+Frontier construction completes before predecessor processing starts, making
+the shared exact/cumulative bitmaps immutable during proof generation.
+
+The `1x1.sh`, `2x1.sh`, `2x2.sh`, `3x1.sh`, and `3x2.sh` jobs accept
+`EGTB_THREADS`; for example, `EGTB_THREADS=16 ./3x2.sh`. They default to one
+thread. Each script removes the target DTM immediately before regenerating it
+and writes separate logs below `logs/<job-name>/`.
 
 DTM page caches are direct-mapped by page number. An `Egtb` backing owns the
 file header and one in-memory immutable page dictionary; additional

@@ -1,6 +1,6 @@
 CC ?= cc
-CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
-BENCH_CFLAGS ?= -O3 -DNDEBUG -march=native -std=c11 -Wall -Wextra -Wpedantic
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -pthread
+BENCH_CFLAGS ?= -O3 -DNDEBUG -march=native -std=c11 -Wall -Wextra -Wpedantic -pthread
 LDLIBS ?= -lzstd
 
 .PHONY: all test check-stats benchmark benchmark-egtb benchmark-movegen clean

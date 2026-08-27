@@ -8,6 +8,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define BIT(square) (UINT64_C(1) << (square))
@@ -313,6 +314,66 @@ done:
     return ok;
 }
 
+static bool test_threaded_wk_bk_generation(void)
+{
+    char serial_path[] = "/tmp/ipd-generator-serial-XXXXXX";
+    char threaded_path[] = "/tmp/ipd-generator-threaded-XXXXXX";
+    EgtbCreateOptions create_options = {16, 20, 3};
+    EgtbThreadOptions thread_options = {4, 16, NULL};
+    EgtbGenerationStatistics serial_statistics, threaded_statistics;
+    EgIndexer indexer;
+    Egtb *serial = NULL, *threaded = NULL;
+    int serial_descriptor = mkstemp(serial_path);
+    int threaded_descriptor = mkstemp(threaded_path);
+    bool ok = false;
+    if (serial_descriptor < 0 || threaded_descriptor < 0)
+        goto done;
+    close(serial_descriptor);
+    close(threaded_descriptor);
+    serial_descriptor = threaded_descriptor = -1;
+    unlink(serial_path);
+    unlink(threaded_path);
+    if (!eg_indexer_init(&indexer, 0, 0, 1, 1))
+        goto done;
+    if (!egtb_create(&serial, serial_path, eg_max_index(&indexer), 1024,
+                     &create_options) ||
+        !egtb_create(&threaded, threaded_path, eg_max_index(&indexer), 1024,
+                     &create_options) ||
+        !egtb_generate(serial, &indexer, NULL, NULL, NULL, NULL,
+                       &serial_statistics) ||
+        !egtb_generate_threaded(threaded, &indexer, NULL, NULL, NULL, NULL,
+                                &thread_options, &threaded_statistics))
+        goto destroy_indexer;
+    if (memcmp(&serial_statistics, &threaded_statistics,
+               sizeof(serial_statistics)) != 0)
+        goto destroy_indexer;
+    for (uint64_t index = 0; index < eg_position_count(&indexer); ++index) {
+        for (unsigned side = 0; side < 2; ++side) {
+            int16_t serial_value, threaded_value;
+            if (!egtb_get(serial, index, (EgtbSide)side, &serial_value) ||
+                !egtb_get(threaded, index, (EgtbSide)side,
+                          &threaded_value) ||
+                serial_value != threaded_value)
+                goto destroy_indexer;
+        }
+    }
+    ok = true;
+destroy_indexer:
+    eg_indexer_destroy(&indexer);
+done:
+    if (serial != NULL && !egtb_close(serial))
+        ok = false;
+    if (threaded != NULL && !egtb_close(threaded))
+        ok = false;
+    if (serial_descriptor >= 0)
+        close(serial_descriptor);
+    if (threaded_descriptor >= 0)
+        close(threaded_descriptor);
+    unlink(serial_path);
+    unlink(threaded_path);
+    return ok;
+}
+
 static bool run_case(unsigned white_men, unsigned black_men,
                      unsigned white_kings, unsigned black_kings,
                      uint64_t expected_positions,
@@ -444,6 +505,11 @@ int main(void)
     if (!test_complete_wk_bk_generation()) {
         fprintf(stderr, "complete WK-BK generation test failed: %s\n",
                 egtb_generator_last_error());
+        return EXIT_FAILURE;
+    }
+    if (!test_threaded_wk_bk_generation()) {
+        fprintf(stderr, "threaded WK-BK equivalence test failed: %s / %s\n",
+                egtb_generator_last_error(), egtb_last_error());
         return EXIT_FAILURE;
     }
     if (wk_bk_backtrack.won_in_one_sources[0] != 408 ||

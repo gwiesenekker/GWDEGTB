@@ -6,10 +6,12 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -57,7 +59,10 @@ struct Egtb {
     bool registered;
     unsigned references;
     unsigned view_count;
-    bool writable_view;
+    unsigned writable_views;
+    pthread_mutex_t mutex;
+    bool mutex_initialized;
+    struct EgtbView *views;
     PageCache cache;
     ZSTD_CCtx *compressor;
     ZSTD_DCtx *decompressor;
@@ -76,12 +81,16 @@ struct EgtbView {
     ZSTD_DCtx *decompressor;
     unsigned char *compressed;
     size_t compressed_capacity;
+    uint64_t first_page;
+    uint64_t end_page;
+    struct EgtbView *next;
     EgtbCacheStatistics statistics;
 };
 
 static const unsigned char egtb_magic[8] = {'I','P','D','E','G','T','B','\0'};
 static Egtb *readonly_registry;
-static char last_error[256];
+static _Thread_local char last_error[256];
+static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 _Static_assert(sizeof(EgtbEntry) == 4, "EgtbEntry must occupy four bytes");
 
@@ -159,22 +168,6 @@ static uint64_t get_u64(const unsigned char *p)
     return value;
 }
 
-static bool seek_file(FILE *file, uint64_t offset)
-{
-    if (offset > (uint64_t)INT64_MAX)
-        return fail("file offset is too large");
-    if (fseeko(file, (off_t)offset, SEEK_SET) != 0)
-        return fail("file seek failed: %s", strerror(errno));
-    return true;
-}
-
-static bool read_at(FILE *file, uint64_t offset, void *data, size_t size)
-{
-    return seek_file(file, offset) &&
-           (fread(data, 1, size, file) == size ||
-            fail("file read failed or was truncated"));
-}
-
 static bool pread_at(int descriptor, uint64_t offset, void *data, size_t size)
 {
     unsigned char *destination = data;
@@ -198,10 +191,36 @@ static bool pread_at(int descriptor, uint64_t offset, void *data, size_t size)
     return true;
 }
 
+static bool read_at(FILE *file, uint64_t offset, void *data, size_t size)
+{
+    int descriptor = fileno(file);
+    if (descriptor < 0)
+        return fail("cannot obtain EGTB file descriptor");
+    return pread_at(descriptor, offset, data, size);
+}
+
 static bool write_at(FILE *file, uint64_t offset, const void *data, size_t size)
 {
-    return seek_file(file, offset) &&
-           (fwrite(data, 1, size, file) == size || fail("file write failed"));
+    const unsigned char *source = data;
+    size_t completed = 0;
+    int descriptor = fileno(file);
+    if (descriptor < 0 || offset > (uint64_t)INT64_MAX ||
+        size > (size_t)((uint64_t)INT64_MAX - offset))
+        return fail("file write offset is too large");
+    while (completed < size) {
+        ssize_t result = pwrite(descriptor, source + completed,
+                                size - completed,
+                                (off_t)(offset + completed));
+        if (result < 0) {
+            if (errno == EINTR)
+                continue;
+            return fail("file write failed: %s", strerror(errno));
+        }
+        if (result == 0)
+            return fail("file write made no progress");
+        completed += (size_t)result;
+    }
+    return true;
 }
 
 static bool write_header(Egtb *egtb)
@@ -370,18 +389,19 @@ static bool append_block(Egtb *egtb, uint32_t checksum,
                          const void *compressed, uint16_t length,
                          uint16_t capacity, uint64_t *offset)
 {
-    off_t end;
+    struct stat status;
     unsigned char header[EGTB_BLOCK_HEADER_SIZE];
-    if (fseeko(egtb->file, 0, SEEK_END) != 0)
-        return fail("cannot seek to end of EGTB: %s", strerror(errno));
-    end = ftello(egtb->file);
-    if (end < 0)
+    int descriptor = fileno(egtb->file);
+    if (descriptor < 0 || fstat(descriptor, &status) != 0)
         return fail("cannot determine EGTB length");
-    *offset = (uint64_t)end;
+    if (status.st_size < 0)
+        return fail("EGTB has a negative file length");
+    *offset = (uint64_t)status.st_size;
     put_u32(header, checksum);
-    if (fwrite(header, 1, sizeof(header), egtb->file) != sizeof(header) ||
-        fwrite(compressed, 1, length, egtb->file) != length)
-        return fail("cannot append compressed page");
+    if (!write_at(egtb->file, *offset, header, sizeof(header)) ||
+        !write_at(egtb->file, *offset + EGTB_BLOCK_HEADER_SIZE,
+                  compressed, length))
+        return false;
     if (capacity > length) {
         uint64_t last = *offset + EGTB_BLOCK_HEADER_SIZE + capacity - 1;
         unsigned char zero = 0;
@@ -395,7 +415,8 @@ static bool store_page_with_runtime(Egtb *egtb, ZSTD_CCtx *compressor,
                                     unsigned char *compressed,
                                     size_t compressed_capacity,
                                     uint64_t page,
-                                    const EgtbEntry *entries, bool exact)
+                                    const EgtbEntry *entries, bool exact,
+                                    bool synchronize_append)
 {
     uint64_t old_offset = egtb->offsets[page];
     uint16_t old_length = egtb->lengths[page];
@@ -440,9 +461,19 @@ static bool store_page_with_runtime(Egtb *egtb, ZSTD_CCtx *compressor,
                       compressed, length))
             return false;
         egtb->offsets[page] = old_offset;
-    } else if (!append_block(egtb, checksum, compressed, length,
-                             minimum, &egtb->offsets[page])) {
-        return false;
+    } else {
+        uint64_t new_offset = 0;
+        bool appended;
+        if (synchronize_append)
+            pthread_mutex_lock(&egtb->mutex);
+        appended = append_block(egtb, checksum, compressed, length,
+                                minimum, &new_offset);
+        if (appended)
+            egtb->offsets[page] = new_offset;
+        if (synchronize_append)
+            pthread_mutex_unlock(&egtb->mutex);
+        if (!appended)
+            return false;
     }
     egtb->lengths[page] = length;
     return true;
@@ -453,7 +484,7 @@ static bool store_page(Egtb *egtb, uint64_t page, const EgtbEntry *entries,
 {
     return store_page_with_runtime(
         egtb, egtb->compressor, egtb->compressed,
-        egtb->compressed_capacity, page, entries, exact);
+        egtb->compressed_capacity, page, entries, exact, false);
 }
 
 static bool flush_cache_entry(Egtb *egtb, size_t index)
@@ -583,7 +614,18 @@ static void destroy_egtb(Egtb *egtb)
     free(egtb->offsets);
     free(egtb->lengths);
     free(egtb->path);
+    if (egtb->mutex_initialized)
+        pthread_mutex_destroy(&egtb->mutex);
     free(egtb);
+}
+
+static bool initialize_mutex(Egtb *egtb)
+{
+    int error = pthread_mutex_init(&egtb->mutex, NULL);
+    if (error != 0)
+        return fail("cannot initialize EGTB mutex: %s", strerror(error));
+    egtb->mutex_initialized = true;
+    return true;
 }
 
 static bool allocate_runtime(Egtb *egtb, size_t cache_pages)
@@ -651,6 +693,11 @@ static bool open_common(Egtb **out, const char *path, bool readonly,
         fclose(file);
         return fail("cannot allocate EGTB handle");
     }
+    if (!initialize_mutex(egtb)) {
+        fclose(file);
+        free(egtb);
+        return false;
+    }
     egtb->file = file;
     egtb->readonly = readonly;
     egtb->references = 1;
@@ -692,6 +739,10 @@ bool egtb_create(Egtb **out, const char *path, uint64_t maximum_index,
     egtb = calloc(1, sizeof(*egtb));
     if (egtb == NULL)
         return fail("cannot allocate EGTB handle");
+    if (!initialize_mutex(egtb)) {
+        free(egtb);
+        return false;
+    }
     egtb->page_size = page_size;
     egtb->entries_per_page = page_size / sizeof(EgtbEntry);
     egtb->maximum_index = maximum_index;
@@ -749,19 +800,24 @@ bool egtb_open_readonly(Egtb **out, const char *path, size_t cache_pages)
     Egtb *current;
     if (out == NULL || path == NULL)
         return fail("invalid read-only open argument");
+    pthread_mutex_lock(&registry_mutex);
     for (current = readonly_registry; current != NULL;
          current = current->registry_next) {
         if (strcmp(current->path, path) == 0) {
             ++current->references;
             *out = current;
+            pthread_mutex_unlock(&registry_mutex);
             return true;
         }
     }
-    if (!open_common(out, path, true, cache_pages))
+    if (!open_common(out, path, true, cache_pages)) {
+        pthread_mutex_unlock(&registry_mutex);
         return false;
+    }
     (*out)->registered = true;
     (*out)->registry_next = readonly_registry;
     readonly_registry = *out;
+    pthread_mutex_unlock(&registry_mutex);
     return true;
 }
 
@@ -770,11 +826,15 @@ bool egtb_open_readwrite(Egtb **out, const char *path, size_t cache_pages)
     Egtb *current;
     if (out == NULL || path == NULL)
         return fail("invalid read/write open argument");
+    pthread_mutex_lock(&registry_mutex);
     for (current = readonly_registry; current != NULL;
          current = current->registry_next) {
-        if (strcmp(current->path, path) == 0)
+        if (strcmp(current->path, path) == 0) {
+            pthread_mutex_unlock(&registry_mutex);
             return fail("EGTB is already open read-only");
+        }
     }
+    pthread_mutex_unlock(&registry_mutex);
     return open_common(out, path, false, cache_pages);
 }
 
@@ -783,7 +843,7 @@ bool egtb_flush(Egtb *egtb)
     size_t i;
     if (egtb == NULL)
         return fail("cannot flush a null EGTB");
-    if (egtb->writable_view)
+    if (egtb->writable_views != 0)
         return fail("cannot flush an EGTB with an active writable view");
     if (egtb->readonly)
         return true;
@@ -804,15 +864,18 @@ bool egtb_close(Egtb *egtb)
         return true;
     if (egtb->view_count != 0)
         return fail("cannot close an EGTB with active cache views");
-    if (egtb->registered && egtb->references > 1) {
-        --egtb->references;
-        return true;
-    }
     if (egtb->registered) {
         Egtb **link = &readonly_registry;
+        pthread_mutex_lock(&registry_mutex);
+        if (egtb->references > 1) {
+            --egtb->references;
+            pthread_mutex_unlock(&registry_mutex);
+            return true;
+        }
         while (*link != egtb)
             link = &(*link)->registry_next;
         *link = egtb->registry_next;
+        pthread_mutex_unlock(&registry_mutex);
     }
     if (!egtb->readonly)
         ok = egtb_flush(egtb);
@@ -835,7 +898,7 @@ bool egtb_get(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value)
     uint32_t slot;
     size_t cache_index;
     EgtbEntry *entries;
-    if (egtb == NULL || egtb->writable_view || value == NULL ||
+    if (egtb == NULL || egtb->writable_views != 0 || value == NULL ||
         index > egtb->maximum_index ||
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid EGTB lookup");
@@ -857,7 +920,7 @@ bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value)
     CacheEntry *cache_entry;
     EgtbEntry *entries;
     EgtbEntry old;
-    if (egtb == NULL || egtb->readonly || egtb->writable_view ||
+    if (egtb == NULL || egtb->readonly || egtb->writable_views != 0 ||
         index > egtb->maximum_index ||
         !valid_value(value) ||
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
@@ -937,8 +1000,10 @@ static bool view_flush_slot(EgtbView *view, size_t slot)
     compressed_write = !all_draws(view->backing, data);
     if (!store_page_with_runtime(
             view->backing, view->compressor, view->compressed,
-            view->compressed_capacity, entry->page_index, data, false))
+            view->compressed_capacity, entry->page_index, data, false,
+            true)) {
         return false;
+    }
     if (compressed_write)
         ++view->statistics.compressed_writes;
     entry->dirty = false;
@@ -975,18 +1040,38 @@ static bool view_cached_page(EgtbView *view, uint64_t page, size_t *result)
 bool egtb_view_create(EgtbView **out, Egtb *backing, size_t cache_pages,
                       bool writable)
 {
+    return egtb_view_create_range(out, backing, cache_pages, writable, 0,
+                                  backing == NULL ? 0 : backing->page_count);
+}
+
+bool egtb_view_create_range(EgtbView **out, Egtb *backing,
+                            size_t cache_pages, bool writable,
+                            uint64_t first_page, uint64_t end_page)
+{
     EgtbView *view;
+    EgtbView *other;
+    uint64_t range_pages;
     if (out == NULL)
         return fail("invalid cache-view output pointer");
     *out = NULL;
     if (backing == NULL || cache_pages == 0 ||
         (writable && backing->readonly) ||
-        (writable && backing->view_count != 0) || backing->writable_view)
+        first_page >= end_page || end_page > backing->page_count)
         return fail("invalid or conflicting cache-view request");
-    if (writable && !egtb_flush(backing))
+    if (writable && backing->writable_views == 0 && !egtb_flush(backing))
         return false;
-    if (backing->page_count < cache_pages)
-        cache_pages = (size_t)backing->page_count;
+    pthread_mutex_lock(&backing->mutex);
+    for (other = backing->views; other != NULL; other = other->next) {
+        if ((writable || other->writable) &&
+            first_page < other->end_page && end_page > other->first_page) {
+            pthread_mutex_unlock(&backing->mutex);
+            return fail("cache-view page ranges overlap");
+        }
+    }
+    pthread_mutex_unlock(&backing->mutex);
+    range_pages = end_page - first_page;
+    if (range_pages < cache_pages)
+        cache_pages = (size_t)range_pages;
     if (cache_pages == 0)
         cache_pages = 1;
     if (cache_pages > SIZE_MAX / backing->page_size)
@@ -997,6 +1082,8 @@ bool egtb_view_create(EgtbView **out, Egtb *backing, size_t cache_pages,
     view->backing = backing;
     view->capacity = cache_pages;
     view->writable = writable;
+    view->first_page = first_page;
+    view->end_page = end_page;
     view->compressed_capacity = ZSTD_compressBound(backing->page_size);
     view->entries = calloc(cache_pages, sizeof(*view->entries));
     view->data = malloc(cache_pages * backing->page_size);
@@ -1015,9 +1102,13 @@ bool egtb_view_create(EgtbView **out, Egtb *backing, size_t cache_pages,
         free(view);
         return fail("cannot allocate direct-mapped cache view");
     }
+    pthread_mutex_lock(&backing->mutex);
+    view->next = backing->views;
+    backing->views = view;
     ++backing->view_count;
     if (writable)
-        backing->writable_view = true;
+        ++backing->writable_views;
+    pthread_mutex_unlock(&backing->mutex);
     *out = view;
     return true;
 }
@@ -1035,9 +1126,13 @@ bool egtb_view_flush(EgtbView *view)
         if (!view_flush_slot(view, slot))
             return false;
     }
+    pthread_mutex_lock(&egtb->mutex);
     if (!write_header(egtb) || !write_directory(egtb) ||
-        fflush(egtb->file) != 0)
+        fflush(egtb->file) != 0) {
+        pthread_mutex_unlock(&egtb->mutex);
         return fail("cannot flush EGTB cache view");
+    }
+    pthread_mutex_unlock(&egtb->mutex);
     return true;
 }
 
@@ -1050,12 +1145,21 @@ bool egtb_view_close(EgtbView *view)
     backing = view->backing;
     if (backing != NULL && view->writable)
         ok = egtb_view_flush(view);
-    if (backing != NULL && backing->view_count != 0) {
-        --backing->view_count;
-        if (view->writable) {
-            backing->writable_view = false;
+    if (backing != NULL) {
+        EgtbView **link;
+        pthread_mutex_lock(&backing->mutex);
+        link = &backing->views;
+        while (*link != NULL && *link != view)
+            link = &(*link)->next;
+        if (*link == view)
+            *link = view->next;
+        if (backing->view_count != 0)
+            --backing->view_count;
+        if (view->writable && backing->writable_views != 0)
+            --backing->writable_views;
+        if (backing->writable_views == 0)
             cache_invalidate(&backing->cache);
-        }
+        pthread_mutex_unlock(&backing->mutex);
     }
     ZSTD_freeCCtx(view->compressor);
     ZSTD_freeDCtx(view->decompressor);
@@ -1081,6 +1185,8 @@ bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid cache-view lookup");
     page = index / egtb->entries_per_page;
+    if (page < view->first_page || page >= view->end_page)
+        return fail("cache-view lookup is outside its page range");
     entry_index = (uint32_t)(index % egtb->entries_per_page);
     if (!view_cached_page(view, page, &cache_slot))
         return false;
@@ -1108,6 +1214,8 @@ bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid cache-view update");
     page = index / egtb->entries_per_page;
+    if (page < view->first_page || page >= view->end_page)
+        return fail("cache-view update is outside its page range");
     entry_index = (uint32_t)(index % egtb->entries_per_page);
     if (!view_cached_page(view, page, &cache_slot))
         return false;
@@ -1159,6 +1267,23 @@ bool egtb_is_readonly(const Egtb *egtb)
 unsigned egtb_reserve_percent(const Egtb *egtb)
 {
     return egtb == NULL ? 0 : egtb->reserve_percent;
+}
+
+size_t egtb_cache_pages(const Egtb *egtb)
+{
+    return egtb == NULL ? 0 : egtb->cache.capacity;
+}
+
+bool egtb_resize_cache(Egtb *egtb, size_t cache_pages)
+{
+    if (egtb == NULL || cache_pages == 0 || egtb->view_count != 0)
+        return fail("invalid EGTB cache resize");
+    if (!egtb_flush(egtb))
+        return false;
+    if (egtb->page_count < cache_pages)
+        cache_pages = (size_t)egtb->page_count;
+    cache_destroy(&egtb->cache);
+    return cache_init(egtb, cache_pages);
 }
 
 bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics)

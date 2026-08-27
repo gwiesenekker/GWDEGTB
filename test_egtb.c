@@ -5,6 +5,7 @@
 #include "wdl.h"
 
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -166,6 +167,95 @@ done:
     return ok;
 }
 
+typedef struct {
+    EgtbView *view;
+    uint64_t first;
+    uint64_t end;
+    bool failed;
+} RangedWriter;
+
+static void *write_ranged_view(void *opaque)
+{
+    RangedWriter *writer = opaque;
+    for (uint64_t index = writer->first; index < writer->end; ++index) {
+        int16_t white = (int16_t)(1 + 2 * (index % 32));
+        int16_t black = (int16_t)(-2 * (int)(index % 33));
+        if (!egtb_view_set(writer->view, index, EGTB_WHITE_TO_MOVE, white) ||
+            !egtb_view_set(writer->view, index, EGTB_BLACK_TO_MOVE, black)) {
+            writer->failed = true;
+            break;
+        }
+    }
+    for (uint64_t index = writer->first;
+         !writer->failed && index < writer->end; ++index) {
+        int16_t white, black;
+        if (!egtb_view_get(writer->view, index, EGTB_WHITE_TO_MOVE, &white) ||
+            !egtb_view_get(writer->view, index, EGTB_BLACK_TO_MOVE, &black) ||
+            white != (int16_t)(1 + 2 * (index % 32)) ||
+            black != (int16_t)(-2 * (int)(index % 33)))
+            writer->failed = true;
+    }
+    return NULL;
+}
+
+static bool test_concurrent_ranged_views(void)
+{
+    char path[] = "/tmp/ipd-egtb-ranged-XXXXXX";
+    EgtbCreateOptions options = {4, 20, 3};
+    Egtb *database = NULL;
+    EgtbView *views[2] = {NULL, NULL};
+    RangedWriter writers[2] = {0};
+    pthread_t threads[2];
+    const uint64_t positions = 64 * 256;
+    int descriptor = mkstemp(path);
+    unsigned created = 0;
+    bool ok = false;
+    if (descriptor < 0)
+        return false;
+    close(descriptor);
+    unlink(path);
+    if (!egtb_create(&database, path, positions - 1, 1024, &options) ||
+        !egtb_view_create_range(&views[0], database, 1, true, 0, 32) ||
+        !egtb_view_create_range(&views[1], database, 1, true, 32, 64))
+        goto done;
+    writers[0] = (RangedWriter){views[0], 0, positions / 2, false};
+    writers[1] = (RangedWriter){views[1], positions / 2, positions, false};
+    for (unsigned i = 0; i < 2; ++i) {
+        if (pthread_create(&threads[i], NULL, write_ranged_view,
+                           &writers[i]) != 0)
+            goto join;
+        ++created;
+    }
+join:
+    for (unsigned i = 0; i < created; ++i)
+        if (pthread_join(threads[i], NULL) != 0)
+            goto done;
+    if (created != 2 || writers[0].failed || writers[1].failed)
+        goto done;
+    for (unsigned i = 0; i < 2; ++i) {
+        if (!egtb_view_close(views[i]))
+            goto done;
+        views[i] = NULL;
+    }
+    for (uint64_t index = 0; index < positions; ++index) {
+        int16_t white, black;
+        if (!egtb_get(database, index, EGTB_WHITE_TO_MOVE, &white) ||
+            !egtb_get(database, index, EGTB_BLACK_TO_MOVE, &black) ||
+            white != (int16_t)(1 + 2 * (index % 32)) ||
+            black != (int16_t)(-2 * (int)(index % 33)))
+            goto done;
+    }
+    ok = true;
+done:
+    for (unsigned i = 0; i < 2; ++i)
+        if (views[i] != NULL)
+            egtb_view_close(views[i]);
+    if (database != NULL)
+        egtb_close(database);
+    unlink(path);
+    return ok;
+}
+
 static bool collect_wdl_statistics(Wdl *wdl, WdlStatistics *statistics)
 {
     uint64_t index;
@@ -251,6 +341,11 @@ int main(void)
 
     if (!test_direct_cache_views()) {
         fprintf(stderr, "direct-mapped cache-view regression failed: %s\n",
+                egtb_last_error());
+        return EXIT_FAILURE;
+    }
+    if (!test_concurrent_ranged_views()) {
+        fprintf(stderr, "concurrent ranged-view regression failed: %s\n",
                 egtb_last_error());
         return EXIT_FAILURE;
     }
