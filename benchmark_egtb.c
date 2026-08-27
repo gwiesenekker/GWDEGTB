@@ -39,8 +39,8 @@ static double now_seconds(void)
 static int16_t random_dtm(void)
 {
     if ((next_random() & 1) != 0)
-        return (int16_t)(1 + 2 * (next_random() % 256));
-    return (int16_t)(-2 * (int)(next_random() % 257));
+        return (int16_t)(1 + 2 * (next_random() % 127));
+    return (int16_t)(-2 * (int)(next_random() % 128));
 }
 
 static bool selected(unsigned density)

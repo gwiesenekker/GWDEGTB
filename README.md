@@ -48,15 +48,19 @@ conversion functions; callers must then satisfy their documented preconditions.
 
 ## Compressed EGTB storage
 
-`egtb.c` stores two signed 16-bit DTM values per position in independently
-Zstd-compressed pages. The versioned header records the page size and maximum
-index. Databases keep their 10-byte-per-page directory in RAM and use a
+`egtb.c` stores two signed bytes per position in independently Zstd-compressed
+pages while exposing exact `int16_t` ply values through its API. Positive odd
+wins `1,3,...,253` are stored as `1,2,...,127`; nonpositive even losses
+`0,-2,...,-254` are stored as `0,-1,...,-127`; stored `-128` represents
+draw/unknown and is returned as `EGTB_DRAW` (`-1`). The version-2 header records
+the page size and maximum index. Version-1 four-byte DTM databases are rejected
+and must be regenerated. Databases keep their 10-byte-per-page directory in RAM and use a
 configurable direct-mapped page cache with dirty write-back and uncompressed
 page checksums. Every stored block also carries a CRC32C of its uncompressed
 page, which is verified after decompression. Read-only backings are shared by
 path; additional views share their immutable directory while owning private
 page caches and ZSTD state. View misses use `pread()` and do not share a seek
-position.
+position. Fixed-offset reads and writes use `pread()` and `pwrite()`.
 
 An offset and length of zero represents an implicit all-draw page. Growing
 compressed pages are appended; `egtb_compact()` rewrites all live pages without
@@ -181,9 +185,9 @@ The win-to-loss pass builds two packed, reusable `uint64_t` bitmaps for one
 successor side at a time: positions won in exactly `N`, and positions won in
 at most `N`. It iterates only the set bits in the exact frontier. Forward
 successors in the current EGTB are proved through the immutable bitmaps rather
-than page-cache lookups. At 256 EGTB entries per 1024-byte page, each page maps
-to exactly four bitmap words, which provides the page/word boundary needed by
-the planned threaded slices.
+than page-cache lookups. At 512 EGTB entries per 1024-byte page, each page maps
+to exactly eight bitmap words, which provides the page/word boundary used by
+the threaded slices.
 
 `egtb_backtrack_losses_to_wins()` performs the existential reverse step for any
 positive even distance `N`. It generates legal predecessors of lost-in-`N`

@@ -65,6 +65,69 @@ static bool same_statistics(const Statistics *a, const Statistics *b)
     return memcmp(a, b, sizeof(*a)) == 0;
 }
 
+static bool test_dtm_byte_encoding(void)
+{
+    static const int16_t values[] = {
+        -EGTB_MAX_LOSS_DTM, -252, -2, 0, EGTB_DRAW, 1, 3,
+        EGTB_MAX_WIN_DTM
+    };
+    static const int8_t stored_values[] = {
+        -127, -126, -1, 0, EGTB_STORED_DRAW, 1, 2, 127
+    };
+    char path[] = "/tmp/ipd-egtb-byte-encoding-XXXXXX";
+    EgtbCreateOptions options = {1, 20, 3};
+    Egtb *database = NULL;
+    int descriptor = mkstemp(path);
+    bool ok = false;
+    if (descriptor < 0)
+        return false;
+    close(descriptor);
+    unlink(path);
+    for (uint64_t index = 0;
+         index < sizeof(values) / sizeof(values[0]); ++index) {
+        int8_t stored;
+        if (!egtb_encode_dtm(values[index], &stored) ||
+            stored != stored_values[index] ||
+            egtb_decode_dtm(stored) != values[index])
+            goto done;
+    }
+    if (!egtb_create(&database, path,
+                     sizeof(values) / sizeof(values[0]) - 1,
+                     1024, &options))
+        goto done;
+    for (uint64_t index = 0;
+         index < sizeof(values) / sizeof(values[0]); ++index) {
+        int16_t read_back;
+        if (!egtb_set(database, index, EGTB_WHITE_TO_MOVE, values[index]) ||
+            !egtb_get(database, index, EGTB_WHITE_TO_MOVE, &read_back) ||
+            read_back != values[index])
+            goto done;
+    }
+    if (egtb_set(database, 0, EGTB_WHITE_TO_MOVE, 255) ||
+        egtb_set(database, 0, EGTB_WHITE_TO_MOVE, -256) ||
+        egtb_set(database, 0, EGTB_WHITE_TO_MOVE, 2) ||
+        egtb_set(database, 0, EGTB_WHITE_TO_MOVE, -3))
+        goto done;
+    if (!egtb_close(database))
+        goto done;
+    database = NULL;
+    if (!egtb_open_readonly(&database, path, 1))
+        goto done;
+    for (uint64_t index = 0;
+         index < sizeof(values) / sizeof(values[0]); ++index) {
+        int16_t read_back;
+        if (!egtb_get(database, index, EGTB_WHITE_TO_MOVE, &read_back) ||
+            read_back != values[index])
+            goto done;
+    }
+    ok = true;
+done:
+    if (database != NULL && !egtb_close(database))
+        ok = false;
+    unlink(path);
+    return ok;
+}
+
 static bool test_direct_cache_views(void)
 {
     char handle_path[] = "/tmp/ipd-egtb-handle-XXXXXX";
@@ -100,8 +163,8 @@ static bool test_direct_cache_views(void)
         index = (state * UINT64_C(2685821657736338717)) % positions;
         side = (EgtbSide)(state & 1);
         value = (state & 2) != 0
-                    ? (int16_t)(1 + 2 * (state % 256))
-                    : (int16_t)(-2 * (int)(state % 257));
+                    ? (int16_t)(1 + 2 * (state % 127))
+                    : (int16_t)(-2 * (int)(state % 128));
         if (!egtb_set(handle, index, side, value) ||
             !egtb_view_set(write_view, index, side, value) ||
             !egtb_view_get(write_view, index, side, &read_back) ||
@@ -206,7 +269,7 @@ static bool test_concurrent_ranged_views(void)
     EgtbView *views[2] = {NULL, NULL};
     RangedWriter writers[2] = {0};
     pthread_t threads[2];
-    const uint64_t positions = 64 * 256;
+    const uint64_t positions = 64 * (1024 / sizeof(EgtbEntry));
     int descriptor = mkstemp(path);
     unsigned created = 0;
     bool ok = false;
@@ -339,6 +402,11 @@ int main(void)
     struct stat before_compaction, after_compaction;
     int descriptor;
 
+    if (!test_dtm_byte_encoding()) {
+        fprintf(stderr, "byte DTM encoding regression failed: %s\n",
+                egtb_last_error());
+        return EXIT_FAILURE;
+    }
     if (!test_direct_cache_views()) {
         fprintf(stderr, "direct-mapped cache-view regression failed: %s\n",
                 egtb_last_error());
@@ -385,9 +453,9 @@ int main(void)
         int16_t value;
         int16_t read_back;
         if ((next_random() & 1) != 0)
-            value = (int16_t)(1 + 2 * (next_random() % 256));
+            value = (int16_t)(1 + 2 * (next_random() % 127));
         else
-            value = (int16_t)(-2 * (int)(next_random() % 257));
+            value = (int16_t)(-2 * (int)(next_random() % 128));
         if (!egtb_set(egtb, index, side, value) ||
             !egtb_get(egtb, index, side, &read_back) || read_back != value)
             return report_failure("cached write/read validation", path);
@@ -558,7 +626,7 @@ int main(void)
     {
         unsigned char directory_entry[10];
         unsigned char original_checksum_byte;
-        uint64_t page = last_index / 256;
+        uint64_t page = last_index / (1024 / sizeof(EgtbEntry));
         uint64_t block_offset;
         int16_t ignored;
         FILE *file = fopen(path, "r+b");
@@ -604,7 +672,7 @@ int main(void)
     {
         FILE *file = fopen(path, "r+b");
         bool prepared = file != NULL && fseek(file, 8, SEEK_SET) == 0 &&
-                        fputc(EGTB_FORMAT_VERSION + 1, file) != EOF;
+                        fputc(EGTB_FORMAT_VERSION - 1, file) != EOF;
         if (file != NULL) {
             prepared = fclose(file) == 0 && prepared;
             file = NULL;
@@ -615,7 +683,7 @@ int main(void)
             return EXIT_FAILURE;
         }
         if (egtb_open_readonly(&egtb, path, 1)) {
-            fprintf(stderr, "unsupported EGTB version was accepted\n");
+            fprintf(stderr, "legacy EGTB version was accepted\n");
             egtb_close(egtb);
             unlink(path);
             return EXIT_FAILURE;
@@ -625,7 +693,8 @@ int main(void)
     printf("EGTB regression: PASS\n");
     printf("positions=%" PRIu64 " randomized writes=%" PRIu64
            " pages=%" PRIu64 "\n", count, writes,
-           (count + 255) / 256);
+           (count + (1024 / sizeof(EgtbEntry)) - 1) /
+               (1024 / sizeof(EgtbEntry)));
     print_statistics(&after);
     print_storage_statistics("before compaction", &before_storage);
     print_storage_statistics("after compaction", &after_storage);

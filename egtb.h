@@ -5,8 +5,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EGTB_FORMAT_VERSION 1
+#define EGTB_FORMAT_VERSION 2
 #define EGTB_DRAW INT16_C(-1)
+#define EGTB_MAX_WIN_DTM INT16_C(253)
+#define EGTB_MAX_LOSS_DTM INT16_C(254)
+#define EGTB_STORED_DRAW INT8_MIN
 
 typedef enum {
     EGTB_WHITE_TO_MOVE = 0,
@@ -14,8 +17,8 @@ typedef enum {
 } EgtbSide;
 
 typedef struct {
-    int16_t white_to_move;
-    int16_t black_to_move;
+    int8_t white_to_move;
+    int8_t black_to_move;
 } EgtbEntry;
 
 typedef struct Egtb Egtb;
@@ -45,6 +48,10 @@ typedef struct {
 } EgtbCacheStatistics;
 
 const char *egtb_last_error(void);
+
+/* Convert between exact public ply values and the version-2 signed byte. */
+bool egtb_encode_dtm(int16_t value, int8_t *stored);
+int16_t egtb_decode_dtm(int8_t stored);
 
 /* Build "<wk>wX-<wm>wO-<bk>bX-<bm>bO.<extension>" (GWD order). */
 bool egtb_material_filename(char *buffer, size_t buffer_size,

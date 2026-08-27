@@ -92,7 +92,7 @@ static Egtb *readonly_registry;
 static _Thread_local char last_error[256];
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-_Static_assert(sizeof(EgtbEntry) == 4, "EgtbEntry must occupy four bytes");
+_Static_assert(sizeof(EgtbEntry) == 2, "EgtbEntry must occupy two bytes");
 
 static bool fail(const char *format, ...)
 {
@@ -106,6 +106,34 @@ static bool fail(const char *format, ...)
 const char *egtb_last_error(void)
 {
     return last_error;
+}
+
+bool egtb_encode_dtm(int16_t value, int8_t *stored)
+{
+    if (stored == NULL)
+        return false;
+    if (value == EGTB_DRAW) {
+        *stored = EGTB_STORED_DRAW;
+        return true;
+    }
+    if (value > 0 && value <= EGTB_MAX_WIN_DTM && value % 2 != 0) {
+        *stored = (int8_t)((value + 1) / 2);
+        return true;
+    }
+    if (value <= 0 && value >= -EGTB_MAX_LOSS_DTM && value % 2 == 0) {
+        *stored = (int8_t)(value / 2);
+        return true;
+    }
+    return false;
+}
+
+int16_t egtb_decode_dtm(int8_t stored)
+{
+    if (stored == EGTB_STORED_DRAW)
+        return EGTB_DRAW;
+    if (stored >= 1)
+        return (int16_t)(2 * (int16_t)stored - 1);
+    return (int16_t)(2 * (int16_t)stored);
 }
 
 bool egtb_material_filename(char *buffer, size_t buffer_size,
@@ -316,8 +344,8 @@ static uint32_t crc32c(const void *data, size_t size)
 
 static uint32_t slot_checksum(uint32_t slot, const EgtbEntry *entry)
 {
-    uint32_t values = (uint16_t)entry->white_to_move |
-                      (uint32_t)(uint16_t)entry->black_to_move << 16;
+    uint32_t values = (uint8_t)entry->white_to_move |
+                      (uint32_t)(uint8_t)entry->black_to_move << 8;
     return mix32(values ^ mix32(slot + UINT32_C(0x9e3779b9)));
 }
 
@@ -378,8 +406,8 @@ static bool all_draws(const Egtb *egtb, const EgtbEntry *entries)
 {
     uint32_t i;
     for (i = 0; i < egtb->entries_per_page; ++i) {
-        if (entries[i].white_to_move != EGTB_DRAW ||
-            entries[i].black_to_move != EGTB_DRAW)
+        if (entries[i].white_to_move != EGTB_STORED_DRAW ||
+            entries[i].black_to_move != EGTB_STORED_DRAW)
             return false;
     }
     return true;
@@ -509,8 +537,8 @@ static void fill_draw_page(Egtb *egtb, EgtbEntry *entries)
 {
     uint32_t i;
     for (i = 0; i < egtb->entries_per_page; ++i) {
-        entries[i].white_to_move = EGTB_DRAW;
-        entries[i].black_to_move = EGTB_DRAW;
+        entries[i].white_to_move = EGTB_STORED_DRAW;
+        entries[i].black_to_move = EGTB_STORED_DRAW;
     }
 }
 
@@ -886,12 +914,6 @@ bool egtb_close(Egtb *egtb)
     return ok;
 }
 
-static bool valid_value(int16_t value)
-{
-    return value == EGTB_DRAW || (value > 0 && value % 2 != 0) ||
-           (value <= 0 && value % 2 == 0);
-}
-
 bool egtb_get(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value)
 {
     uint64_t page;
@@ -907,8 +929,9 @@ bool egtb_get(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value)
     if (!cached_page(egtb, page, &cache_index))
         return false;
     entries = cache_data(egtb, cache_index);
-    *value = side == EGTB_WHITE_TO_MOVE ? entries[slot].white_to_move :
-                                          entries[slot].black_to_move;
+    *value = egtb_decode_dtm(side == EGTB_WHITE_TO_MOVE
+                                ? entries[slot].white_to_move
+                                : entries[slot].black_to_move);
     return true;
 }
 
@@ -920,9 +943,10 @@ bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value)
     CacheEntry *cache_entry;
     EgtbEntry *entries;
     EgtbEntry old;
+    int8_t stored;
     if (egtb == NULL || egtb->readonly || egtb->writable_views != 0 ||
         index > egtb->maximum_index ||
-        !valid_value(value) ||
+        !egtb_encode_dtm(value, &stored) ||
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid EGTB update");
     page = index / egtb->entries_per_page;
@@ -933,9 +957,9 @@ bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value)
     entries = cache_data(egtb, cache_index);
     old = entries[slot];
     if (side == EGTB_WHITE_TO_MOVE)
-        entries[slot].white_to_move = value;
+        entries[slot].white_to_move = stored;
     else
-        entries[slot].black_to_move = value;
+        entries[slot].black_to_move = stored;
     cache_entry->checksum ^= slot_checksum(slot, &old) ^
                              slot_checksum(slot, &entries[slot]);
     cache_entry->dirty = true;
@@ -1191,9 +1215,9 @@ bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
     if (!view_cached_page(view, page, &cache_slot))
         return false;
     entries = view_cache_data(view, cache_slot);
-    *value = side == EGTB_WHITE_TO_MOVE
-                 ? entries[entry_index].white_to_move
-                 : entries[entry_index].black_to_move;
+    *value = egtb_decode_dtm(side == EGTB_WHITE_TO_MOVE
+                                ? entries[entry_index].white_to_move
+                                : entries[entry_index].black_to_move);
     return true;
 }
 
@@ -1207,7 +1231,9 @@ bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
     DirectCacheEntry *cache_entry;
     EgtbEntry *entries;
     EgtbEntry old;
-    if (view == NULL || !view->writable || !valid_value(value))
+    int8_t stored;
+    if (view == NULL || !view->writable ||
+        !egtb_encode_dtm(value, &stored))
         return fail("invalid cache-view update");
     egtb = view->backing;
     if (index > egtb->maximum_index ||
@@ -1223,9 +1249,9 @@ bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
     entries = view_cache_data(view, cache_slot);
     old = entries[entry_index];
     if (side == EGTB_WHITE_TO_MOVE)
-        entries[entry_index].white_to_move = value;
+        entries[entry_index].white_to_move = stored;
     else
-        entries[entry_index].black_to_move = value;
+        entries[entry_index].black_to_move = stored;
     cache_entry->checksum ^= slot_checksum(entry_index, &old) ^
                              slot_checksum(entry_index,
                                            &entries[entry_index]);
