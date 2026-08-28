@@ -1,351 +1,482 @@
-# International draughts endgame index
+# International draughts endgame database generator
 
-This C library gives a dense index to positions on the 50 playable squares.
-It stores positions as four `uint64_t` bitboards (only bits 0 through 49 are
-used). White men are restricted to squares 5..49 and black men to 0..44.
+This C library can calculate Distance-To-Mate (DTM) EGTBs for International Polish Draughts.
 
-The index order scans squares 0..49. At each square the order is empty, white
-man, black man, white king, black king. A dynamic-programming table counts the
-valid suffixes, so illegal man placements create neither holes nor duplicate
-indices. Each fixed-material indexer also precomputes the complete rank addition
-for every state and actual piece type. Ranking therefore needs one transition
-lookup per occupied square while preserving the original index order.
+GWDEGTB generates exact two-through-seven-piece endgame databases on the 50
+playable squares of a 10x10 board. It includes a dense reversible position
+index, international-rules move generation, multithreaded retrograde analysis,
+compressed DTM and WDL storage, consistency repair, final verification, and
+regression and performance tests.
 
-Build and run the exhaustive round-trip test:
+## Highlights
+
+- Exact WTM and BTM distance-to-mate values in plies.
+- Dense indexing with no holes for illegal man placements.
+- International draughts captures: compulsory capture, maximum capture count,
+  flying kings, and delayed removal of captured pieces.
+- Page-partitioned POSIX threading for initialization, retrograde propagation,
+  compilation, consistency checking, and final verification.
+- Checksummed Zstd-compressed DTM and WDL pages.
+- Canonical material orientation with automatic color/board mirroring.
+- Compressed on-disk frontier streams and persistent outcome bitmaps, avoiding
+  a full database scan for every DTM layer.
+- A repair pass for exact-DTM transpositions and otherwise unreachable setup
+  positions, followed by fatal read-only verification.
+- Tested position counts for all 120 seven-piece material distributions.
+
+## Requirements and build
+
+The code targets a POSIX system and requires a C11 compiler, POSIX threads, and
+the Zstandard development library. On Debian or Ubuntu the required package is
+`libzstd-dev`.
+
+The default production build is optimized for the local processor:
+
+```sh
+make generate_egtb
+```
+
+The Makefile uses:
+
+```text
+-O3 -DNDEBUG -march=native -std=c11 -Wall -Wextra -Wpedantic -pthread
+```
+
+`-DNDEBUG` removes validation from hot indexing and cache paths. The caller
+must then honor their documented preconditions. Because `-march=native` may
+emit CPU-specific instructions, rebuild after copying the source to a machine
+with a different processor.
+
+For a portable build, override `CFLAGS`, for example:
+
+```sh
+make clean
+make CFLAGS='-O3 -DNDEBUG -std=c11 -Wall -Wextra -Wpedantic -pthread' generate_egtb
+```
+
+Run the complete regression suite and verify all known seven-piece counts:
 
 ```sh
 make test
-./test_index 1 1 1 1
-```
-
-The four arguments are the numbers of white men, black men, white kings and
-black kings. The program prints the legal-position count and maximum index,
-then independently enumerates every legal placement and verifies
-`position -> index -> position`. Large material configurations may require a
-very long exhaustive test. Counts that do not fit in `uint64_t` are rejected.
-
-To compare count-only results against the uploaded seven-piece reference data
-(without attempting to enumerate billions of positions), run:
-
-```sh
 make check-stats
 ```
 
-Benchmark the largest database for every size from two through seven pieces:
+The manually maintained `REVISION` file supplies the revision printed at
+startup. It is independent of Git tags and commit identifiers:
+
+```sh
+./generate_egtb --revision
+```
+
+## Board and material representation
+
+Squares are numbered 0 through 49. A position contains four `uint64_t`
+bitboards; only their low 50 bits are used:
+
+- white men, legal on squares 5..49;
+- black men, legal on squares 0..44;
+- white kings, legal on squares 0..49;
+- black kings, legal on squares 0..49.
+
+Material names and generator arguments follow GWD order: white kings, white
+men, black kings, black men. A database name has the form:
+
+```text
+<WK>wX-<WM>wO-<BK>bX-<BM>bO.dtm
+```
+
+For example, `1wX-1wO-1bX-1bO.dtm` contains one king and one man of each
+color. The equivalent WDL file ends in `.wdl`.
+
+Only one orientation of a color-swapped pair is generated. The side with more
+pieces is stored as White. If both sides have the same number of pieces, the
+side with more kings is stored as White. A mirrored lookup rotates every
+square by `s -> 49-s`, swaps the colors, and swaps WTM with BTM.
+
+## Dense position index
+
+For a fixed material signature, `endgame_index.c` maps every legal placement
+to exactly one index in `0..maximum_index` and provides the inverse mapping.
+The index order scans squares 0..49 with the choices empty, white man, black
+man, white king, and black king. A dynamic-programming suffix table excludes
+illegal promotion-row man placements without creating holes.
+
+The production ranker precomputes the complete rank addition for each state
+and actual piece type. Ranking then requires one table transition per occupied
+square. The inverse walks the same state space in the other direction. The API
+uses the internal argument order white men, black men, white kings, black
+kings; the generator command line uses GWD order.
+
+Exhaustively verify a fixed material index with:
+
+```sh
+./test_index 1 1 1 1
+```
+
+This enumerates every legal position and checks
+`position -> index -> position`. Large signatures can take a long time; use
+`make check-stats` for count-only verification against `7piece-stats.txt`.
+
+### Index benchmark
+
+Run:
 
 ```sh
 make benchmark
 ```
 
-By default, small databases are repeated for stable timing, databases through
-five pieces are traversed completely, and six- and seven-piece databases are
-sampled in evenly spaced blocks across their full index ranges. Use
-`./benchmark_index --full` for exhaustive traversal of all six databases (this
-takes a long time), or `./benchmark_index --samples COUNT` to change the sample
-limit.
+The benchmark separately times index inversion and inversion followed by
+ranking. Ranking time is the delta between those measurements. Small
+databases are repeated to exceed 100 million operations; the six- and
+seven-piece cases sample 110 million indices in 1,024 evenly spaced blocks.
+Use `./benchmark_index --full` for a complete traversal or
+`./benchmark_index --samples COUNT` to change the sample count.
 
-The benchmark uses `-O3 -DNDEBUG -march=native`. Defining `NDEBUG` removes
-argument, bitboard, material-count, and index-range checks from the two hot
-conversion functions; callers must then satisfy their documented preconditions.
+The following results were measured with GCC 13.3.0, `-O3 -DNDEBUG
+-march=native`, on an AMD Ryzen 9 5950X. Throughput varies with CPU frequency,
+compiler, and memory placement.
 
-## Compressed EGTB storage
+| Pieces | Material (WM/BM/WK/BK) | Positions | Inversions/s | Round trips/s | Rankings/s by delta |
+|---:|:---:|---:|---:|---:|---:|
+| 2 | 0/0/1/1 | 2,450 | 42.28 M | 36.64 M | 274.35 M |
+| 3 | 1/0/1/1 | 105,840 | 36.46 M | 31.65 M | 240.23 M |
+| 4 | 1/1/1/1 | 4,478,160 | 35.74 M | 30.65 M | 215.16 M |
+| 5 | 1/1/2/1 | 102,997,680 | 34.84 M | 28.86 M | 168.21 M |
+| 6 | 1/1/2/2 | 2,317,447,800 | 33.14 M | 26.77 M | 139.12 M |
+| 7 | 1/2/2/2 | 45,793,430,100 | 31.99 M | 25.45 M | 124.36 M |
 
-`egtb.c` stores two signed bytes per position in independently Zstd-compressed
-pages while exposing exact `int16_t` ply values through its API. Positive odd
-wins `1,3,...,253` are stored as `1,2,...,127`; nonpositive even losses
-`0,-2,...,-254` are stored as `0,-1,...,-127`; stored `-128` represents
-draw/unknown and is returned as `EGTB_DRAW` (`-1`). The version-2 header records
-the page size and maximum index. Version-1 four-byte DTM databases are rejected
-and must be regenerated. Databases keep their 10-byte-per-page directory in RAM and use a
-configurable direct-mapped page cache with dirty write-back and uncompressed
-page checksums. Every stored block also carries a CRC32C of its uncompressed
-page, which is verified after decompression. Read-only backings are shared by
-path; additional views share their immutable directory while owning private
-page caches and ZSTD state. View misses use `pread()` and do not share a seek
-position. Fixed-offset reads and writes use `pread()` and `pwrite()`.
-
-An offset and length of zero represents an implicit all-draw page. Growing
-compressed pages are appended; `egtb_compact()` rewrites all live pages without
-holes and atomically replaces the original file.
-
-The default reserved payload capacity is 20% of the uncompressed page size and
-is configurable at creation. `egtb_storage_statistics()` reports logical raw
-bytes, live Zstd payload bytes, live block bytes including CRC32C headers, total
-file bytes, and live-page count so callers can print payload and overall
-compression ratios before and after compaction.
-
-Run the deterministic randomized storage regression with `make test`. It
-updates 10% as many entries as the largest four-piece database contains, checks
-every immediate cached read, scans all entries, compacts, reopens read-only,
-and verifies identical WTM/BTM win, loss, and draw statistics.
-
-Benchmark compressed storage at 10%, 50%, and 90% non-draw value density:
+An experimental combinatorial indexer is retained for comparison:
 
 ```sh
-make benchmark-egtb
+make benchmark-combinatorial-index
 ```
 
-The benchmark fills WTM and BTM values independently, compacts each database,
-then reports write/flush throughput, sequential and uniformly random read-only
-throughput, compaction time, and final compression ratios. It uses 4,194,304
-positions, 4,194,304 random lookups, 1,024-byte pages, and a 1 MiB read cache by
-default. Use `--positions COUNT`, `--lookups COUNT`, `--page-size BYTES`, and
-`--cache-mib COUNT` to change them. Random DTM values intentionally give a
-pessimistic compression workload compared with the locally correlated values
-expected in generated databases.
-
-## Packed WDL databases
-
-Material database filenames use GWD order:
-`<wk>wX-<wm>wO-<bk>bX-<bm>bO.dtm`; for example,
-`3wX-1wO-1bX-2bO.dtm`. The corresponding packed database uses the `.wdl`
-extension. `egtb_material_filename()` constructs either name.
-
-Each WDL position is a four-bit nibble: two bits for WTM followed by two bits
-for BTM. In each pair, `00` is draw/unknown, `01` is won, and `10` is lost.
-Sixteen positions are packed into each `uint64_t` while compiling. WDL files
-use fixed 1,024-byte uncompressed pages, so one page covers 2,048 positions.
-
-`wdl_open()` first opens the requested `.wdl`. If it does not exist, the
-function derives the `.dtm` name, allocates and fills the packed bitmap,
-collects WTM and BTM statistics, compresses each page with Zstd, installs the
-file atomically, logs its compression ratio and statistics, and opens it.
-All-draw pages are implicit. Each 14-byte in-memory directory entry contains
-the compressed block offset, 16-bit length, and CRC32C of the uncompressed
-page.
-
-The read-only WDL cache is deliberately direct-mapped. A page uses cache slot
-`page_number % cache_pages`; each slot contains only its page number and the
-1,024-byte uncompressed page.
+On the same system, the transition ranker was faster for every material size.
+The combinatorial inverse became faster from four pieces onward, reaching
+17.43 M inversions/s versus 13.40 M/s for the transition inverse at seven
+pieces. The production generator retains the transition index because random
+position-to-index calculation is its dominant indexing workload.
 
 ## Move generation
 
-`movegen.c` generates legal international draughts moves directly from the
-four bitboards. Men move forward but capture in all four directions; kings
-scan across empty diagonal squares and consider every empty landing square
-beyond a victim. Captures are compulsory and only globally maximum-length
-capture paths are emitted.
+`movegen.c` implements international draughts rules:
 
-The production padded backend maps compact squares 0..49 to GWD fields
-6..15, 17..26, 28..37, 39..48, and 50..59. Diagonal steps then become fixed
-unsigned shifts by 5 or 6; the unused fields prevent row wrapping. Builds with
-BMI2 use PDEP/PEXT to convert whole bitboards at the API boundary and portable
-builds use a set-bit fallback. The public position and move representations
-remain compact. Precomputed diagonal ray and between-square masks find the
-nearest king blocker and all legal landing squares without walking each empty
-square. The padded entry points have a `_padded` suffix and are used by the
-normal `generate_egtb` executable. `generate_egtb_table` retains the compact
-table backend for comparison.
+- men move one diagonal square forward and capture in all four directions;
+- kings move and capture over arbitrary diagonal distances;
+- captures are compulsory;
+- only moves with the global maximum number of captured pieces are emitted;
+- every legal landing square beyond a king's final victim is retained;
+- captured pieces remain blocking until the complete capture move ends;
+- the same piece cannot be captured twice.
 
-Captured pieces remain occupied during recursive generation and are tracked in
-a separate captured mask. Capture recursion keeps only the longest paths found
-so far, so it does not repeat the entire capture search merely to emit moves.
-This both prevents capturing a piece twice and makes
-an already captured piece continue to block a king ray until the move ends.
-Capture paths with identical final effects are intentionally not deduplicated.
+Capture recursion carries a bitboard of captured pieces, and every emitted move
+contains its captured-piece mask. `draughts_do_move()` removes that mask in one
+operation and may save the original four bitboards in `DraughtsUndo`;
+`draughts_undo_move()` restores the snapshot. Duplicate final positions from
+different capture paths are intentionally not removed.
 
-`draughts_do_move()` can save the original four bitboards in a
-`DraughtsUndo`; `draughts_undo_move()` restores that snapshot. Quiet inverse
-generation reverses regular man and king moves, rejecting every predecessor
-in which the previous mover had a compulsory capture. Neither direction may
-promote, so every predecessor retains the EGTB's exact material signature.
+The production padded backend maps the compact squares onto GWD fields
+6..15, 17..26, 28..37, 39..48, and 50..59. Diagonal steps become shifts by 5
+or 6, while unused fields prevent row wrapping. BMI2 builds use PDEP/PEXT for
+whole-bitboard conversion; portable builds use a set-bit fallback. Precomputed
+diagonal rays and between-square masks accelerate king blockers, captures, and
+landing-square enumeration.
 
-The regression suite compares the table and padded backends and includes
-focused tests for forced maximum capture,
-backward man captures, flying-king landing choices, delayed captured-piece
-removal, forward promotion, inverse material preservation, inverse capture filtering, and
-do/undo. It also checks 100,000 random seven-piece positions for both sides,
-plus inverse predecessors for the first 10,000:
+Quiet inverse generation is used only within the same material database. It
+does not reverse captures or promotions and rejects a predecessor if the
+previous mover would have had a compulsory capture. Thus every inverse move is
+a legal quiet forward move that preserves the material signature.
+
+The tests compare the compact table and padded implementations on focused rule
+cases and 100,000 random seven-piece positions for both sides:
 
 ```sh
 make test
-```
-
-Benchmark both backends for capture detection, full legal generation,
-generation plus do/undo, and inverse quiet predecessors with:
-
-```sh
 make benchmark-movegen
 ```
 
-The default benchmark samples one million positions from the largest
-seven-piece material configuration. Use
-`./benchmark_movegen --samples COUNT` to change the sample count.
+## DTM values and compressed storage
 
-## Initial EGTB generation
+Every position has a white-to-move and black-to-move DTM value. Public values
+are exact signed ply counts:
 
-`egtb_initialize_terminal_positions()` initializes both the white-to-move and
-black-to-move values of a newly created all-draw database. A position without a
-legal move is stored as lost in zero plies (`0`). If any legal move reaches a
-position in which the opponent has no legal move, it is stored as won in one
-ply (`1`). All other positions remain draw/unknown (`-1`) for subsequent
-retrograde passes. This also handles the special case where the side to move
-has no pieces.
+- positive odd values `1, 3, 5, ...` mean won in that many plies;
+- zero and negative even values `0, -2, -4, ...` mean lost in that many plies;
+- `-1` means draw or not yet known during generation;
+- a side with no pieces or no legal move is lost in zero.
 
-The initialization routine does not flush, close, compact, or report final
-storage statistics. Its open read/write handle is passed directly to the later
-retrograde passes. The database is finalized only after those passes converge.
+Version-2 DTM storage uses two signed bytes per position. Wins `1,3,...,253`
+are stored as `1,2,...,127`; losses `0,-2,...,-254` as `0,-1,...,-127`; stored
+`-128` represents draw/unknown. The API converts these bytes to public
+`int16_t` values.
 
-`egtb_backtrack_wins_to_losses()` performs the universal reverse step for any
-positive odd distance `N`. For every WTM won-in-`N` position it generates legal
-black quiet predecessors, then replays every legal Black move from each
-predecessor. The predecessor's BTM value becomes lost in `N+1` only if every
-successor is a known White win no longer than `N`, with at least one successor
-exactly won in `N`. This maximum is necessary because the losing side chooses
-the longest defense. BTM sources are handled symmetrically. Unknown entries
-and longer existing losses are updated; shorter losses are preserved.
-`egtb_backtrack_won_in_one()` remains as a convenience wrapper using `N=1`.
-Neither function flushes the database.
+Entries are grouped in 1,024-byte pages, normally 512 positions per page.
+Pages are independently Zstd compressed. Every stored block carries a CRC32C
+of the uncompressed data. An implicit directory entry `(offset=0,length=0)`
+represents an all-draw page and consumes no block storage.
 
-The win-to-loss pass builds two packed, reusable `uint64_t` bitmaps for one
-successor side at a time: positions won in exactly `N`, and positions won in
-at most `N`. It iterates only the set bits in the exact frontier. Forward
-successors in the current EGTB are proved through the immutable bitmaps rather
-than page-cache lookups. At 512 EGTB entries per 1024-byte page, each page maps
-to exactly eight bitmap words, which provides the page/word boundary used by
-the threaded slices.
+The file begins with a versioned header containing the page size and maximum
+index, followed by an in-memory directory with a 64-bit block offset and
+16-bit compressed length per page. A newly written block reserves 20% of the
+uncompressed page size by default. A dirty page that outgrows its slot is
+appended and its directory entry is updated. `egtb_compact()` rewrites only
+live blocks, removes reserved slack and abandoned blocks, and atomically
+installs the compacted file.
 
-`egtb_backtrack_losses_to_wins()` performs the existential reverse step for any
-positive even distance `N`. It generates legal predecessors of lost-in-`N`
-positions. The inverse generator supplies the corresponding legal forward
-move, which itself proves that the predecessor can reach the lost-in-`N`
-position; forward moves are therefore not regenerated. Unknown entries and
-longer positive wins are updated to won in `N+1`; shorter wins are retained.
-`egtb_backtrack_lost_in_two()` is the convenience wrapper for `N=2`. Neither
-function flushes the database.
+DTM caches are direct-mapped by page number. Read-only handles share the file
+header and immutable directory by path, while each `EgtbView` owns its cache,
+Zstd contexts, buffers, and statistics. Cache misses use `pread()`, so worker
+threads do not share a seek pointer. Writable views use `pwrite()` and flush a
+dirty slot before replacement.
 
-The loss-to-win pass needs only one frontier bitmap: positions lost in exactly
-`N`. Iterating that bitmap and generating legal inverse moves provides the
-existential proof directly. The current EGTB value is still read before writing
-to preserve an already known shorter win; that eligibility state does not
-require a second bitmap.
+## Generation command and dependency order
 
-`egtb_generate()` starts with terminal initialization and alternates the two
-parameterized passes for distances 1, 2, 3, 4, and so on. It stops when a pass
-creates no new or shortened entries. No intermediate pass is explicitly
-saved. It then runs `egtb_make_consistent()`, whose first pass recomputes both
-side-to-move values of every position from all legal successors. Corrections
-seed a deduplicated worklist with their quiet, non-promoting predecessors and
-successors. Later passes check only that affected worklist and continue until
-a pass makes no corrections. Corrections report the index, side, four
-bitboards, and old/new DTM. Transitions to another material signature can be
-resolved by an external EGTB probe callback.
-
-The generic generator uses the same argument order as GWD:
+Generate a canonical database with:
 
 ```sh
-./generate_egtb NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
-./generate_egtb -j THREADS NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
-./generate_egtb --revision
+./generate_egtb [-j THREADS] NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
 ```
 
-A plain `make generate_egtb` is the native production build and uses
-`-O3 -DNDEBUG -march=native`. Override `CFLAGS` explicitly for a portable or
-debug build. Because `-march=native` specializes the executable for the build
-machine, rebuild after copying the source to a machine with a different CPU.
+For example:
 
-The manually maintained `REVISION` file supplies the revision printed at
-startup. Change its value explicitly in increments of 0.001; Make treats the
-file as an input and rebuilds the revision object without modifying it. For
-example, development builds following version 1.9 can be numbered `1.901`,
-`1.902`, and so on. This revision is intentionally independent of commit
-identifiers.
+```sh
+./generate_egtb -j 16 1 1 1 1
+```
 
-`-j` enables page-partitioned POSIX-thread backtracking. The accepted range is
-1 through 256. Initialization, bitmap/frontier retrograde propagation,
-frontier compilation, snapshot-based consistency repair, and the final
-read-only consistency verification are divided across the requested threads.
-After compaction, any mismatch found by final verification is fatal.
+The accepted thread count is 1..256. The target file must not already exist.
+Captures and promotions enter smaller or earlier material databases, so all
+dependencies must be present in the working directory. The supplied family
+scripts generate material in GWD order and remove each target immediately
+before regenerating it:
 
-Filenames use the same order, for example `1wX-0wO-0bX-1bO.dtm` for WK-BM.
-The computed 4D material catalog generates only the GWD-canonical orientation:
-the side with more pieces is White, or, when piece counts are equal, the side
-with more kings is White. A request for the other orientation is redirected to
-the canonical database. Mirrored lookups rotate squares with `s -> 49-s`, swap
-colors and swap WTM/BTM.
+```sh
+EGTB_THREADS=16 ./1x1.sh
+EGTB_THREADS=16 ./2x1.sh
+EGTB_THREADS=16 ./2x2.sh
+EGTB_THREADS=16 ./3x1.sh
+# Continue with 3x2.sh, 3x3.sh, 4x1.sh, ... through the seven-piece jobs.
+```
 
-Within each piece count, generation order places the larger material side on
-White and enumerates White kings descending, then Black kings descending. This
-matches the GWD job order and ensures promotions target earlier databases.
+Logs are written below `logs/<family>/`. Generation order sorts by total piece
+count, larger White side first, then White kings descending and Black kings
+descending. This matches the historical GWD order and ensures promotion
+targets are available.
 
-With the generator's 1024-byte page size, the writable database uses a 1 GiB
-uncompressed page cache. Every previously generated database opened for
-read-only dependency lookups uses a 64 MiB cache per worker. These capacities
-exclude the page dictionaries and cache metadata. The final read-only consistency check
-uses a separate 1 GiB cache budget divided across its workers, so increasing
-verification locality does not multiply the dependency-cache allocation.
+## Generation pipeline
 
-During threaded backtracking each worker owns a contiguous range of complete
-EGTB pages and the corresponding whole bitmap words. Exact DTM layers are
-stored as temporary, append-only streams of 64-bit indices. The streams use
-checksummed ZSTD blocks and one unlinked temporary backing file per worker, so
-they require neither a global stream lock nor thousands of open files.
+The generator deliberately separates retrograde propagation from the final
+random-access DTM file. This avoids repeatedly scanning and rewriting the
+compressed database for every mate distance.
 
-Initialization uses the same page-aligned partition. Every worker evaluates
-both side-to-move values in its slice with a private external-DTM catalog and
-appends every non-draw result to the appropriate private stream. This includes
-terminal loss-in-zero, win-in-one, and higher DTMs introduced by captures or
-promotions into previously generated databases.
+1. **Create the index and empty database.** The legal position count and
+   maximum index are calculated for the fixed material. A version-2 DTM is
+   created logically as all draws.
 
-Persistent WTM/BTM won and lost bitmaps replace the writable working EGTB.
-Each exact source position is processed by its owner exactly once. Generated
-predecessors are routed through a shared candidate bitmap using atomic 64-bit
-OR operations. After a barrier, workers inspect only the candidate bits in
-their page-aligned slices and append proven results to their private next-DTM
-streams. Previously generated dependency EGTBs still use a private read-only
-catalog and cache per worker.
+2. **Partition work at page boundaries.** Each worker owns a contiguous range
+   of complete DTM pages and the corresponding whole 64-bit bitmap words. No
+   two workers write the same final page.
 
-After retrograde convergence, workers compile their DTM streams into disjoint
-page ranges of the final all-draw database. Streams are applied from the
-largest distance down to zero, so a later shorter result supersedes a stale
-longer record. Only this compilation phase uses the 1 GiB writable-cache
-budget, divided across the workers. The shared cache is temporarily reduced to
-one page and restored before the sparse consistency repair.
+3. **Initialize exact known values.** Workers enumerate their slices for both
+   WTM and BTM. No-move positions become lost-in-zero; immediate mates become
+   won-in-one. Captures and promotions query previously generated databases,
+   so initialization can also discover DTM values larger than one. Every known
+   result is appended to the worker's exact-DTM frontier stream.
 
-The family job scripts from `1x1.sh` through the seven-piece `4x3.sh`,
-`5x2.sh`, and `6x1.sh` jobs accept `EGTB_THREADS`; for example,
-`EGTB_THREADS=16 ./3x2.sh`. They default to one thread. Each script removes the
-target DTM immediately before regenerating it and writes separate logs below
-`logs/<job-name>/`.
+4. **Maintain persistent outcomes.** Shared WTM/BTM won and lost bitmaps hold
+   accumulated outcomes. The compressed streams identify the exact current
+   frontier, while a shared atomic candidate bitmap routes its predecessors to
+   their owning workers. These structures replace random writes to a working
+   DTM during propagation.
 
-DTM page caches are direct-mapped by page number. An `Egtb` backing owns the
-file header and one in-memory immutable page dictionary; additional
-`EgtbView` objects share that backing while keeping their decompressed pages,
-ZSTD contexts, compressed buffers, and cache statistics private. Read-only
-view misses use `pread()` and therefore do not share a seek position. Writable
-views use the same direct mapping and flush a dirty slot before replacing it.
+5. **Propagate won to lost.** For a won-in-N frontier, legal quiet inverse moves
+   generate candidate opponent predecessors. A predecessor is lost in N+1 only
+   when every legal forward move is a known win no longer than N and at least
+   one is exactly N. This implements the losing side's longest defense.
 
-Consistency repair uses snapshot iterations. Every worker has a private
-one-page sequential scan view plus a separate random-access successor view and
-writes mismatches from its owned range to an in-memory correction stream. A
-paired sequential cursor decodes both side-to-move bytes with one page lookup
-and advances within the resident page without another cache lookup. After the
-views close, one thread
-applies the range-ordered streams through the writable backing and constructs
-the affected-position bitmap. Later parallel iterations inspect only affected
-successors and predecessors. The initial full pass also builds a verified-
-position bitmap. Any corrected position and all of its quiet predecessors are
-permanently cleared from that bitmap; corrections discovered by later sparse
-passes extend this unverified predecessor closure. The generator then flushes
-the repaired pages, compacts the live blocks into a temporary file, and
-atomically installs the
-compacted database. It reopens the finished file read-only. If its uncompressed
-size is at most `EGTB_RESIDENT_LIMIT_GIB` (32 GiB by default), page-aligned
-workers decompress it into a shared flat array using private ZSTD contexts,
-`pread()`, and CRC32C verification. Each loader builds a private DTM histogram;
-these are merged after loading, so resident databases need no separate
-statistics scan. Final consistency checks use direct immutable array access.
-Set the limit to zero to disable resident loading. Larger databases use a
-random-access cache totaling
-`EGTB_VERIFICATION_CACHE_GIB` (32 GiB by default), divided across workers.
-The verifier skips positions that the initial snapshot already certified and
-runs the parallel fatal consistency verification over the remaining affected
-region. It then prints WTM and BTM counts for every stored
-DTM value together with final compression statistics. The summary also prints
-monotonic wall-clock timings for setup, initialization, backpropagation,
-frontier compilation, consistency repair, the final DTM scan, finalization,
-compaction/reopen, final verification, the statistics scan, and total runtime.
-It also reports aggregate lookups, hits, misses, hit rate, decompressions,
-dirty evictions, and compressed writes for the current-database views and the
-external dependency caches. Dependency statistics cover the complete generator
-phase and, separately, the freshly reopened final-verification catalogs.
+6. **Propagate lost to won.** For a lost-in-N frontier, every legal inverse move
+   directly proves a candidate win in N+1: the inverse generator already
+   supplies the legal forward move reaching the loss. Forward moves are not
+   regenerated for this existential step. An existing shorter win is retained.
+
+7. **Store frontier streams.** Each worker writes 512-index blocks to one
+   checksummed Zstd-compressed append-only temporary file. Files are created as
+   `.gwdegtb-frontier-*` in the working directory and immediately unlinked, so
+   the filesystem reclaims them automatically when their descriptors close or
+   the process exits. No global stream lock or collection of per-distance files
+   is required.
+
+8. **Compile the final DTM.** After no new frontier exists, workers apply their
+   streams to disjoint page ranges of the all-draw DTM. Distances are applied
+   from longest to shortest, allowing a later shorter result to replace a stale
+   transposition result. Only this phase needs the large writable page cache.
+
+9. **Repair exact-DTM consistency.** The first snapshot pass recomputes both
+   side-to-move values for every legal position. Workers use a one-page paired
+   sequential cursor for the scan and a separate random-access successor view.
+   Corrections are merged and applied by one thread. Corrected positions and
+   their quiet predecessors/successors form the next sparse worklist; passes
+   continue until no correction remains. This handles initialization
+   transpositions and setup positions that have no legal predecessor in the
+   current material database.
+
+10. **Recompute the maximum DTM.** After repair, one final linear DTM scan
+    determines the actual maximum distance, including any values changed by
+    consistency repair.
+
+11. **Record verified positions.** The initial consistency pass also builds a
+    bitmap of positions already proved correct. Any correction and its quiet
+    predecessor closure are cleared from that bitmap. Final verification can
+    safely skip positions that remained verified.
+
+12. **Finalize and compact.** Dirty pages are flushed, the writable database is
+    closed, and live compressed blocks are rewritten without holes. The compact
+    file atomically replaces the working file and is reopened read-only.
+
+13. **Verify the immutable result.** If the uncompressed database fits the
+    resident-memory limit, workers decompress disjoint pages into a shared flat
+    array using private Zstd contexts, `pread()`, and CRC32C validation. They
+    simultaneously build private DTM histograms, which are merged without a
+    separate statistics scan. Larger databases use a large read-only cache.
+    The final parallel consistency check is read-only and any mismatch is
+    fatal.
+
+## Memory, caches, and configuration
+
+The default 1,024-byte DTM page gives 512 positions and exactly eight 64-bit
+bitmap words. Current production defaults are:
+
+| Purpose | Default |
+|---|---:|
+| Target writable cache | 1 GiB total |
+| Dependency cache | 64 MiB per worker per opened dependency |
+| Ordinary read-only handle cache | 16 MiB |
+| Resident final-database limit | 32 GiB |
+| Nonresident final-verification cache | 32 GiB total |
+
+The dependency-cache figure is potentially multiplied by both the worker
+count and the number of dependency databases actually opened. Cache metadata
+and page directories are additional. Configure final handling with:
+
+```sh
+EGTB_RESIDENT_LIMIT_GIB=0 ./generate_egtb -j 16 3 0 3 0
+EGTB_RESIDENT_LIMIT_GIB=64 ./generate_egtb -j 16 3 0 3 0
+EGTB_VERIFICATION_CACHE_GIB=64 ./generate_egtb -j 16 4 0 3 0
+```
+
+Setting `EGTB_RESIDENT_LIMIT_GIB=0` disables the resident path. Resident
+loading is parallel. It is normally fastest when the complete two-byte-per-
+position database fits comfortably in physical RAM. The generator reports
+cache lookups, hits, misses, decompressions, dirty evictions, compressed
+writes, storage ratios, and wall-clock time for each major phase.
+
+## Example: 1 king + 1 man against 1 king + 1 man
+
+The following run used revision 2.101, 16 threads, and the optimized native
+build on the Ryzen 9 5950X described above. Individual correction records,
+repetitive cache tables, and the BTM frequency table are omitted here; WTM and
+BTM distributions were identical.
+
+```text
+$ ./generate_egtb -j 16 1 1 1 1
+GWDEGTB revision 2.101
+generating 1wX-1wO-1bX-1bO.dtm with 16 threads, 1024 MiB writable cache total, 64 MiB dependency cache per worker/database
+generated 1wX-1wO-1bX-1bO.dtm: material=1 1 1 1 positions=4478160 maximum-index=4478159 passes=19 maximum-dtm=19 threads=16
+self-consistency: passes=2 updates=277/277
+final read-only consistency verification: threads=16 resident=8 MiB positions-checked=8540 positions-skipped=8947780
+WTM: wins=882645 losses=26562 draws=3568953
+WTM DTM statistics:
+     DTM            Frequency
+     -18                   30
+     -16                  120
+     -14                  194
+     -12                  237
+     -10                  913
+      -8                 5919
+      -6                 4109
+      -4                 2861
+      -2                12088
+      -1              3568953
+       0                   91
+       1               262080
+       3               123240
+       5               199481
+       7               260127
+       9                27705
+      11                 5969
+      13                 1895
+      15                 1266
+      17                  684
+      19                  198
+BTM: wins=882645 losses=26562 draws=3568953
+storage: raw=8956320 payload=1587465 file=1709863 bytes overall=19.09% (5.24:1)
+wall-clock timings:
+  setup/create                      0.020 s
+  initialization                    0.149 s
+  backpropagation                   0.319 s
+  frontier compilation              0.340 s
+  consistency repair                0.301 s
+  final DTM scan                    0.116 s
+  generator total                   1.227 s
+  finalize/close                    0.003 s
+  compact/reopen                    0.369 s
+  resident load                     0.008 s
+  final verification                0.008 s
+  statistics extraction             0.001 s
+  total                             1.637 s
+```
+
+The `positions-checked` and `positions-skipped` totals count WTM and BTM
+separately, hence twice the number of indexed placements.
+
+## Packed WDL databases
+
+A WDL entry uses four bits: two bits for WTM followed by two for BTM. In each
+pair, `00` is draw/unknown, `01` is won, and `10` is lost. Sixteen positions fit
+in one `uint64_t`. WDL pages are 1,024 bytes and cover 2,048 positions.
+
+`wdl_open()` opens the requested `.wdl`; if it does not exist, it derives the
+corresponding `.dtm`, compiles the complete WDL bitmap in memory, collects WTM
+and BTM statistics, compresses and checksums the pages, atomically installs the
+file, and opens it read-only. Its deliberately simple cache maps page N to
+`N % cache_pages` and stores only the page number and uncompressed bytes.
+
+## Storage and move-generation benchmarks
+
+The storage benchmark writes independent randomized WTM/BTM values at 10%,
+50%, and 90% non-draw density, compacts the files, and reports write, flush,
+sequential-read, random-read, and compression results:
+
+```sh
+make benchmark-egtb
+./benchmark_egtb --positions 4194304 --lookups 4194304 \
+  --page-size 4096 --cache-mib 16
+```
+
+Random DTM values deliberately form a pessimistic compression workload
+compared with the locally correlated values of generated databases.
+
+The move-generation benchmark measures capture detection, complete legal move
+generation, generation plus do/undo, and quiet inverse generation for both the
+compact table and padded backends:
+
+```sh
+make benchmark-movegen
+./benchmark_movegen --samples 1000000
+```
+
+## Source layout
+
+| Files | Purpose |
+|---|---|
+| `endgame_index.c/.h` | Production dense position index and inverse |
+| `combinatorial_index.c/.h` | Experimental alternative indexer |
+| `movegen.c/.h` | International-rules move generation and do/undo |
+| `bitmap.c/.h` | Persistent and frontier bitmap primitives |
+| `frontier.c/.h` | Compressed per-worker exact-DTM streams |
+| `egtb.c/.h` | Versioned compressed DTM storage and caches |
+| `wdl.c/.h` | Packed compressed WDL compilation and lookup |
+| `material.c/.h` | Canonical material ordering and mirroring |
+| `generator.c/.h` | Initialization, retrograde analysis, repair, verification |
+| `generate_egtb.c` | Command-line orchestration, dependencies, reporting |
+| `test_*.c`, `check_stats.c` | Regression and reference-count validation |
+| `benchmark_*.c` | Index, cache/storage, and move-generation benchmarks |
