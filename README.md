@@ -320,10 +320,16 @@ read-only view of the compiled database and writes mismatches from its owned
 range to an in-memory correction stream. After the views close, one thread
 applies the range-ordered streams through the writable backing and constructs
 the affected-position bitmap. Later parallel iterations inspect only affected
-successors and predecessors. The generator then flushes the repaired pages,
-compacts the live blocks into a temporary file, and atomically installs the
-compacted database. It reopens the finished file read-only, runs the parallel
-fatal consistency verification, and prints WTM and BTM counts for every stored
+successors and predecessors. The initial full pass also builds a verified-
+position bitmap. Any corrected position and all of its quiet predecessors are
+permanently cleared from that bitmap; corrections discovered by later sparse
+passes extend this unverified predecessor closure. The generator then flushes
+the repaired pages, compacts the live blocks into a temporary file, and
+atomically installs the
+compacted database. It reopens the finished file read-only, skips positions
+that the initial snapshot already certified, and runs the parallel fatal
+consistency verification over the remaining affected region. It then prints
+WTM and BTM counts for every stored
 DTM value together with final compression statistics. The summary also prints
 monotonic wall-clock timings for setup, initialization, backpropagation,
 frontier compilation, consistency repair, the final DTM scan, finalization,

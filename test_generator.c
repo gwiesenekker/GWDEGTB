@@ -225,6 +225,7 @@ static bool test_complete_wk_bk_generation(void)
     EgtbCreateOptions options = {16, 20, 3};
     EgtbGenerationStatistics statistics;
     EgtbConsistencyStatistics consistency;
+    Bitmap verified_positions = {0};
     ConsistencyReportCheck report = {0};
     EgIndexer indexer;
     Egtb *database = NULL;
@@ -287,11 +288,14 @@ static bool test_complete_wk_bk_generation(void)
     {
         EgtbVerificationOptions repair_options = {4, 16, NULL};
         if (win_three_index == UINT64_MAX || lost_two_index == UINT64_MAX ||
+            !bitmap_create(&verified_positions,
+                           eg_position_count(&indexer)) ||
             !egtb_set(database, win_three_index, EGTB_WHITE_TO_MOVE, 5) ||
             !egtb_set(database, lost_two_index, EGTB_WHITE_TO_MOVE, 0) ||
             !egtb_make_consistent_threaded(
                 database, &indexer, NULL, NULL, check_consistency_report,
-                &report, &repair_options, &consistency))
+                &report, &repair_options, &verified_positions,
+                &consistency))
             goto destroy_indexer;
     }
     {
@@ -322,10 +326,13 @@ static bool test_complete_wk_bk_generation(void)
             !egtb_open_readonly(&database, path, 4) ||
             !egtb_verify_consistent_threaded(
                 database, &indexer, NULL, NULL, &verify_options,
-                &verification) ||
+                &verified_positions, &verification) ||
             verification.passes != 1 ||
-            verification.positions_checked !=
-                eg_position_count(&indexer) * 2)
+            verification.positions_checked +
+                    verification.positions_skipped !=
+                eg_position_count(&indexer) * 2 ||
+            verification.positions_checked == 0 ||
+            verification.positions_skipped == 0)
             goto destroy_indexer;
         if (!egtb_close(database)) {
             database = NULL;
@@ -342,11 +349,12 @@ static bool test_complete_wk_bk_generation(void)
         if (!egtb_open_readonly(&database, path, 4) ||
             egtb_verify_consistent_threaded(
                 database, &indexer, NULL, NULL, &verify_options,
-                &verification))
+                NULL, &verification))
             goto destroy_indexer;
     }
     ok = true;
 destroy_indexer:
+    bitmap_destroy(&verified_positions);
     eg_indexer_destroy(&indexer);
 done:
     if (database != NULL && !egtb_close(database))
@@ -360,7 +368,7 @@ static bool test_threaded_wk_bk_generation(void)
     char serial_path[] = "/tmp/ipd-generator-serial-XXXXXX";
     char threaded_path[] = "/tmp/ipd-generator-threaded-XXXXXX";
     EgtbCreateOptions create_options = {16, 20, 3};
-    EgtbThreadOptions thread_options = {4, 16, NULL};
+    EgtbThreadOptions thread_options = {4, 16, NULL, NULL};
     EgtbGenerationStatistics serial_statistics, threaded_statistics;
     EgIndexer indexer;
     Egtb *serial = NULL, *threaded = NULL;

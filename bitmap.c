@@ -72,6 +72,13 @@ void bitmap_set(Bitmap *bitmap, uint64_t index)
     bitmap->words[index >> 6] |= UINT64_C(1) << (index & 63u);
 }
 
+void bitmap_unset(Bitmap *bitmap, uint64_t index)
+{
+    assert(bitmap != NULL && bitmap->words != NULL);
+    assert(index < bitmap->bit_count);
+    bitmap->words[index >> 6] &= ~(UINT64_C(1) << (index & 63u));
+}
+
 void bitmap_set_atomic(Bitmap *bitmap, uint64_t index)
 {
     uint64_t mask;

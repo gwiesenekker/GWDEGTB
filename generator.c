@@ -1075,6 +1075,50 @@ static bool mark_consistency_neighbours(
     return true;
 }
 
+typedef struct {
+    const EgIndexer *indexer;
+    Bitmap *verified_positions;
+    bool failed;
+} ConsistencyUnverifyContext;
+
+static bool mark_unverified_predecessor(
+    const DraughtsPosition *predecessor,
+    const DraughtsMove *forward_move, void *opaque)
+{
+    ConsistencyUnverifyContext *context = opaque;
+    uint64_t index;
+    (void)forward_move;
+    if (!has_indexer_material(context->indexer, predecessor) ||
+        !position_index(context->indexer, predecessor, &index)) {
+        context->failed = true;
+        return false;
+    }
+    bitmap_unset(context->verified_positions, index);
+    return true;
+}
+
+static bool mark_consistency_unverified(
+    const EgIndexer *indexer, uint64_t index,
+    const DraughtsPosition *position, Bitmap *verified_positions)
+{
+    ConsistencyUnverifyContext context;
+    unsigned side;
+    if (verified_positions == NULL)
+        return true;
+    bitmap_unset(verified_positions, index);
+    memset(&context, 0, sizeof(context));
+    context.indexer = indexer;
+    context.verified_positions = verified_positions;
+    for (side = 0; side < 2; ++side) {
+        size_t count;
+        if (!GENERATE_QUIET_PREDECESSORS(
+                position, (EgtbSide)side, mark_unverified_predecessor,
+                &context, &count) || context.failed)
+            return false;
+    }
+    return true;
+}
+
 static bool repair_consistency_position(
     Egtb *database, const EgIndexer *indexer, uint64_t index,
     EgtbExternalProbe external_probe, void *external_context,
@@ -1205,6 +1249,7 @@ typedef struct {
     EgtbExternalProbe external_probe;
     void *external_context;
     const Bitmap *pending;
+    Bitmap *verified_positions;
     bool full_pass;
     uint64_t first_index;
     uint64_t end_index;
@@ -1246,6 +1291,7 @@ static bool inspect_consistency_position(ConsistencyRepairWorker *worker,
 {
     EgPosition indexed;
     DraughtsPosition position;
+    size_t corrections_before = worker->correction_count;
     unsigned side;
     if (!eg_index_to_position(worker->indexer, index, &indexed))
         return false;
@@ -1268,6 +1314,9 @@ static bool inspect_consistency_position(ConsistencyRepairWorker *worker,
                 worker, index, (EgtbSide)side, old_value, new_value))
             return false;
     }
+    if (worker->full_pass && worker->verified_positions != NULL &&
+        worker->correction_count == corrections_before)
+        bitmap_set(worker->verified_positions, index);
     return true;
 }
 
@@ -1302,7 +1351,8 @@ static bool apply_consistency_corrections(
     Egtb *database, const EgIndexer *indexer,
     ConsistencyRepairWorker *workers, unsigned thread_count,
     EgtbConsistencyReporter reporter, void *reporter_context,
-    Bitmap *affected, EgtbConsistencyStatistics *statistics,
+    Bitmap *affected, Bitmap *verified_positions,
+    EgtbConsistencyStatistics *statistics,
     uint64_t *updates_this_pass)
 {
     unsigned worker_index;
@@ -1320,8 +1370,11 @@ static bool apply_consistency_corrections(
             if (correction->index != last_index) {
                 EgPosition indexed;
                 if (last_index != UINT64_MAX &&
-                    !mark_consistency_neighbours(indexer, &position,
-                                                 affected))
+                    (!mark_consistency_neighbours(indexer, &position,
+                                                  affected) ||
+                     !mark_consistency_unverified(
+                         indexer, last_index, &position,
+                         verified_positions)))
                     return fail("cannot collect consistency neighbours");
                 if (!eg_index_to_position(indexer, correction->index,
                                           &indexed))
@@ -1357,7 +1410,9 @@ static bool apply_consistency_corrections(
         }
     }
     if (last_index != UINT64_MAX &&
-        !mark_consistency_neighbours(indexer, &position, affected))
+        (!mark_consistency_neighbours(indexer, &position, affected) ||
+         !mark_consistency_unverified(indexer, last_index, &position,
+                                      verified_positions)))
         return fail("cannot collect consistency neighbours");
     return true;
 }
@@ -1367,6 +1422,7 @@ bool egtb_make_consistent_threaded(
     EgtbExternalProbe external_probe, void *external_context,
     EgtbConsistencyReporter reporter, void *reporter_context,
     const EgtbVerificationOptions *options,
+    Bitmap *verified_positions,
     EgtbConsistencyStatistics *statistics)
 {
     EgtbConsistencyStatistics local = {0};
@@ -1390,6 +1446,16 @@ bool egtb_make_consistent_threaded(
     if (position_count == 0 || page_count == 0 ||
         egtb_maximum_index(database) != position_count - 1)
         return fail("database and indexer sizes do not match");
+    if (verified_positions != NULL &&
+        (verified_positions->words == NULL ||
+         verified_positions->bit_count != position_count))
+        return fail("verified-position bitmap has the wrong size");
+    if (verified_positions != NULL &&
+        (egtb_page_size(database) / sizeof(EgtbEntry)) % 64 != 0)
+        return fail("verified-position bitmap requires a multiple of 64 "
+                    "entries per page");
+    if (verified_positions != NULL)
+        bitmap_clear(verified_positions);
     thread_count = options->thread_count;
     if (page_count < thread_count)
         thread_count = (unsigned)page_count;
@@ -1414,6 +1480,7 @@ bool egtb_make_consistent_threaded(
         workers[i].external_context = options->external_contexts != NULL
                                           ? options->external_contexts[i]
                                           : external_context;
+        workers[i].verified_positions = verified_positions;
         workers[i].first_index = first_page * entries_per_page;
         workers[i].end_index =
             (first_page + owned_pages) * entries_per_page;
@@ -1495,7 +1562,7 @@ bool egtb_make_consistent_threaded(
         created_views = 0;
         if (!apply_consistency_corrections(
                 database, indexer, workers, thread_count, reporter,
-                reporter_context, &affected, &local,
+                reporter_context, &affected, verified_positions, &local,
                 &updates_this_pass))
             goto done;
         if (updates_this_pass == 0)
@@ -1541,9 +1608,11 @@ typedef struct {
     const EgIndexer *indexer;
     EgtbExternalProbe external_probe;
     void *external_context;
+    const Bitmap *verified_positions;
     uint64_t first_index;
     uint64_t end_index;
     uint64_t positions_checked;
+    uint64_t positions_skipped;
     uint64_t mismatch_index;
     EgtbSide mismatch_side;
     int16_t stored_value;
@@ -1560,6 +1629,11 @@ static void *run_consistency_verify_worker(void *opaque)
         EgPosition indexed;
         DraughtsPosition position;
         unsigned side;
+        if (worker->verified_positions != NULL &&
+            bitmap_test(worker->verified_positions, index)) {
+            worker->positions_skipped += 2;
+            continue;
+        }
         if (!eg_index_to_position(worker->indexer, index, &indexed)) {
             worker->failed = true;
             return NULL;
@@ -1597,6 +1671,7 @@ bool egtb_verify_consistent_threaded(
     Egtb *database, const EgIndexer *indexer,
     EgtbExternalProbe external_probe, void *external_context,
     const EgtbVerificationOptions *options,
+    const Bitmap *verified_positions,
     EgtbConsistencyStatistics *statistics)
 {
     EgtbConsistencyStatistics local = {0};
@@ -1616,6 +1691,10 @@ bool egtb_verify_consistent_threaded(
     if (position_count == 0 || page_count == 0 ||
         egtb_maximum_index(database) != position_count - 1)
         return fail("database and indexer sizes do not match");
+    if (verified_positions != NULL &&
+        (verified_positions->words == NULL ||
+         verified_positions->bit_count != position_count))
+        return fail("verified-position bitmap has the wrong size");
     thread_count = options->thread_count;
     if (page_count < thread_count)
         thread_count = (unsigned)page_count;
@@ -1642,6 +1721,7 @@ bool egtb_verify_consistent_threaded(
         workers[i].external_context = options->external_contexts != NULL
                                           ? options->external_contexts[i]
                                           : external_context;
+        workers[i].verified_positions = verified_positions;
         workers[i].first_index = first_page * entries_per_page;
         workers[i].end_index = (first_page + owned_pages) * entries_per_page;
         if (workers[i].end_index > position_count)
@@ -1681,6 +1761,7 @@ join:
     for (i = 0; i < thread_count; ++i) {
         EgtbCacheStatistics cache;
         local.positions_checked += workers[i].positions_checked;
+        local.positions_skipped += workers[i].positions_skipped;
         egtb_view_cache_statistics(workers[i].view, &cache);
         add_cache_statistics(&local.cache, &cache);
         if (workers[i].failed) {
@@ -2727,6 +2808,20 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     local.compilation_seconds = monotonic_seconds() - phase_started;
 
     phase_started = monotonic_seconds();
+    frontier_store_destroy(frontiers);
+    frontiers = NULL;
+    bitmap_destroy(&candidates);
+    bitmap_destroy(&lost[1]);
+    bitmap_destroy(&lost[0]);
+    bitmap_destroy(&won[1]);
+    bitmap_destroy(&won[0]);
+    if (options->verified_positions != NULL) {
+        if (options->verified_positions->words != NULL ||
+            !bitmap_create(options->verified_positions, position_count)) {
+            fail("cannot allocate verified-position bitmap");
+            goto done;
+        }
+    }
     {
         EgtbVerificationOptions repair_options = {
             thread_count, options->writable_cache_pages,
@@ -2735,6 +2830,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         if (!egtb_make_consistent_threaded(
                 database, indexer, external_probe, initial_context,
                 reporter, reporter_context, &repair_options,
+                options->verified_positions,
                 &consistency))
             goto done;
     }

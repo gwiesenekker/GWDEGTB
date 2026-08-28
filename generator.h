@@ -2,6 +2,7 @@
 #define GENERATOR_H
 
 #include "egtb.h"
+#include "bitmap.h"
 #include "endgame_index.h"
 #include "movegen.h"
 
@@ -75,6 +76,8 @@ typedef struct {
     size_t writable_cache_pages;
     /* Optional array of thread_count private probe contexts. */
     void *const *external_contexts;
+    /* Optional output, allocated and populated by threaded generation. */
+    Bitmap *verified_positions;
 } EgtbThreadOptions;
 
 typedef struct {
@@ -96,6 +99,7 @@ typedef void (*EgtbConsistencyReporter)(
 typedef struct {
     uint64_t passes;
     uint64_t positions_checked;
+    uint64_t positions_skipped;
     uint64_t updates[2];
     uint64_t shorter_wins[2];
     uint64_t longer_losses[2];
@@ -201,23 +205,29 @@ bool egtb_make_consistent(
  * Snapshot-based parallel consistency repair. Workers collect corrections
  * through private read-only views; after their views close, one thread applies
  * the merged corrections to the writable backing. Later passes inspect only
- * positions affected by the preceding correction batch.
+ * positions affected by the preceding correction batch. When supplied, the
+ * verified-position bitmap is cleared, then records positions whose two DTM
+ * values passed the initial full snapshot and were not invalidated by a
+ * correction to themselves or one of their immediate successors.
  */
 bool egtb_make_consistent_threaded(
     Egtb *database, const EgIndexer *indexer,
     EgtbExternalProbe external_probe, void *external_context,
     EgtbConsistencyReporter reporter, void *reporter_context,
     const EgtbVerificationOptions *options,
+    Bitmap *verified_positions,
     EgtbConsistencyStatistics *statistics);
 
 /*
- * Verify a compacted, read-only database without changing it. Index ranges
- * and cache views are private per worker. Any mismatch is a fatal failure.
+ * Verify a compacted, read-only database without changing it. Positions set
+ * in the optional verified-position bitmap are skipped. Index ranges and
+ * cache views are private per worker. Any mismatch is a fatal failure.
  */
 bool egtb_verify_consistent_threaded(
     Egtb *database, const EgIndexer *indexer,
     EgtbExternalProbe external_probe, void *external_context,
     const EgtbVerificationOptions *options,
+    const Bitmap *verified_positions,
     EgtbConsistencyStatistics *statistics);
 
 #endif

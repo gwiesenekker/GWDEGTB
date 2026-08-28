@@ -294,6 +294,7 @@ int main(int argc, char **argv)
     EgtbStorageStatistics storage;
     EgtbCacheStatistics generation_dependencies = {0};
     EgtbCacheStatistics verification_dependencies = {0};
+    Bitmap verified_positions = {0};
     DatabaseCatalog *catalogs = NULL;
     void **probe_contexts = NULL;
     EgIndexer indexer;
@@ -379,7 +380,8 @@ int main(int argc, char **argv)
     setup_seconds = generation_started - program_started;
     {
         EgtbThreadOptions thread_options = {
-            thread_count, GENERATION_CACHE_PAGES, probe_contexts
+            thread_count, GENERATION_CACHE_PAGES, probe_contexts,
+            &verified_positions
         };
         if (!egtb_generate_threaded(database, &indexer, catalog_probe,
                                     &catalogs[0], report_correction, NULL,
@@ -433,7 +435,9 @@ int main(int argc, char **argv)
         };
         if (!egtb_verify_consistent_threaded(
                 database, &indexer, catalog_probe, &catalogs[0],
-                &verify_options, &final_verification)) {
+                &verify_options,
+                verified_positions.words != NULL ? &verified_positions : NULL,
+                &final_verification)) {
             const char *catalog_error = "";
             for (unsigned worker = 0; worker < thread_count; ++worker) {
                 if (catalogs[worker].error[0] != '\0') {
@@ -478,9 +482,11 @@ int main(int argc, char **argv)
            "/%" PRIu64 "\n", generation.consistency_passes,
            generation.consistency_updates[0], generation.consistency_updates[1]);
     printf("final read-only consistency verification: threads=%u "
-           "cache=%u MiB total positions-checked=%" PRIu64 "\n",
+           "cache=%u MiB total positions-checked=%" PRIu64
+           " positions-skipped=%" PRIu64 "\n",
            thread_count, FINAL_VERIFICATION_CACHE_BYTES / (1024 * 1024),
-           final_verification.positions_checked);
+           final_verification.positions_checked,
+           final_verification.positions_skipped);
     print_cache_statistics("consistency current-DB cache",
                            &generation.consistency_cache);
     print_cache_statistics("generator dependency caches",
@@ -554,6 +560,7 @@ done:
         free(catalogs);
     }
     free(probe_contexts);
+    bitmap_destroy(&verified_positions);
     if (indexer_initialized)
         eg_indexer_destroy(&indexer);
     free(histogram);

@@ -41,6 +41,9 @@ int main(void)
     CHECK(bitmap_test(&bitmap, 299));
     bitmap_set_atomic(&bitmap, 42);
     CHECK(bitmap_test(&bitmap, 42));
+    bitmap_unset(&bitmap, 42);
+    CHECK(!bitmap_test(&bitmap, 42));
+    bitmap_set(&bitmap, 42);
     bitmap_clear_range(&bitmap, 63, 257);
     CHECK(bitmap_test(&bitmap, 0));
     CHECK(!bitmap_test(&bitmap, 63));

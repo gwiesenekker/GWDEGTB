@@ -16,6 +16,7 @@ void bitmap_destroy(Bitmap *bitmap);
 void bitmap_clear(Bitmap *bitmap);
 void bitmap_clear_range(Bitmap *bitmap, uint64_t first, uint64_t end);
 void bitmap_set(Bitmap *bitmap, uint64_t index);
+void bitmap_unset(Bitmap *bitmap, uint64_t index);
 /* Thread-safe when several producers may set bits in the same word. */
 void bitmap_set_atomic(Bitmap *bitmap, uint64_t index);
 bool bitmap_test(const Bitmap *bitmap, uint64_t index);
