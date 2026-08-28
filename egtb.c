@@ -102,10 +102,19 @@ struct EgtbView {
     EgtbCacheStatistics statistics;
 };
 
+struct EgtbResident {
+    Egtb *backing;
+    EgtbEntry *entries;
+    uint64_t allocated_bytes;
+    uint64_t stored_histogram[2][256];
+};
+
 static const unsigned char egtb_magic[8] = {'I','P','D','E','G','T','B','\0'};
 static Egtb *readonly_registry;
 static _Thread_local char last_error[256];
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
+static uint32_t crc32c_table[256];
 
 _Static_assert(sizeof(EgtbEntry) == 2, "EgtbEntry must occupy two bytes");
 
@@ -365,29 +374,28 @@ static uint32_t mix32(uint32_t value)
     return value ^ (value >> 16);
 }
 
+static void initialize_crc32c_table(void)
+{
+    unsigned entry;
+    for (entry = 0; entry < 256; ++entry) {
+        uint32_t value = entry;
+        unsigned bit;
+        for (bit = 0; bit < 8; ++bit)
+            value = (value >> 1) ^
+                    (UINT32_C(0x82f63b78) &
+                     (UINT32_C(0) - (value & 1)));
+        crc32c_table[entry] = value;
+    }
+}
+
 static uint32_t crc32c(const void *data, size_t size)
 {
-    static uint32_t table[256];
-    static bool initialized;
     const unsigned char *bytes = data;
     uint32_t crc = UINT32_MAX;
     size_t i;
-
-    if (!initialized) {
-        unsigned entry;
-        for (entry = 0; entry < 256; ++entry) {
-            uint32_t value = entry;
-            unsigned bit;
-            for (bit = 0; bit < 8; ++bit)
-                value = (value >> 1) ^
-                        (UINT32_C(0x82f63b78) &
-                         (UINT32_C(0) - (value & 1)));
-            table[entry] = value;
-        }
-        initialized = true;
-    }
+    pthread_once(&crc32c_once, initialize_crc32c_table);
     for (i = 0; i < size; ++i)
-        crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >> 8);
+        crc = crc32c_table[(crc ^ bytes[i]) & 0xff] ^ (crc >> 8);
     return ~crc;
 }
 
@@ -1295,6 +1303,96 @@ bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
     return true;
 }
 
+bool egtb_view_get_pair(EgtbView *view, uint64_t index,
+                        int16_t *white_to_move, int16_t *black_to_move)
+{
+    Egtb *egtb;
+    uint64_t page;
+    uint32_t entry_index;
+    EgtbEntry *entries;
+#ifndef NDEBUG
+    if (view == NULL || white_to_move == NULL || black_to_move == NULL)
+        return fail("invalid paired cache-view lookup");
+#endif
+    egtb = view->backing;
+#ifndef NDEBUG
+    if (index > egtb->maximum_index)
+        return fail("invalid paired cache-view lookup");
+#endif
+    split_entry_index(egtb, index, &page, &entry_index);
+#ifndef NDEBUG
+    if (page < view->first_page || page >= view->end_page)
+        return fail("paired cache-view lookup is outside its page range");
+#endif
+    entries = view_cached_page(view, page, NULL);
+    if (entries == NULL)
+        return false;
+    *white_to_move = egtb_decode_dtm(entries[entry_index].white_to_move);
+    *black_to_move = egtb_decode_dtm(entries[entry_index].black_to_move);
+    return true;
+}
+
+bool egtb_sequential_reader_init(EgtbSequentialReader *reader,
+                                 EgtbView *view, uint64_t first_index,
+                                 uint64_t end_index)
+{
+    Egtb *egtb;
+    uint64_t first_page, last_page;
+    uint32_t ignored;
+    if (reader == NULL || view == NULL)
+        return fail("invalid sequential-reader request");
+    egtb = view->backing;
+    if (first_index > end_index || end_index > egtb->maximum_index + 1)
+        return fail("invalid sequential-reader range");
+    if (first_index != end_index) {
+        split_entry_index(egtb, first_index, &first_page, &ignored);
+        split_entry_index(egtb, end_index - 1, &last_page, &ignored);
+        if (first_page < view->first_page || last_page >= view->end_page)
+            return fail("sequential-reader range is outside its cache view");
+    }
+    reader->view = view;
+    reader->next_index = first_index;
+    reader->end_index = end_index;
+    reader->next_entry = NULL;
+    reader->page_end = NULL;
+    return true;
+}
+
+bool egtb_sequential_reader_next(EgtbSequentialReader *reader,
+                                 int16_t *white_to_move,
+                                 int16_t *black_to_move)
+{
+    const EgtbEntry *entry;
+#ifndef NDEBUG
+    if (reader == NULL || reader->view == NULL || white_to_move == NULL ||
+        black_to_move == NULL || reader->next_index >= reader->end_index)
+        return fail("invalid or exhausted sequential-reader lookup");
+#endif
+    if (reader->next_entry == reader->page_end) {
+        Egtb *egtb = reader->view->backing;
+        EgtbEntry *entries;
+        uint64_t page;
+        uint64_t remaining;
+        uint32_t entry_index;
+        uint32_t available;
+        split_entry_index(egtb, reader->next_index, &page, &entry_index);
+        entries = view_cached_page(reader->view, page, NULL);
+        if (entries == NULL)
+            return false;
+        available = egtb->entries_per_page - entry_index;
+        remaining = reader->end_index - reader->next_index;
+        if (remaining < available)
+            available = (uint32_t)remaining;
+        reader->next_entry = entries + entry_index;
+        reader->page_end = reader->next_entry + available;
+    }
+    entry = reader->next_entry++;
+    ++reader->next_index;
+    *white_to_move = egtb_decode_dtm(entry->white_to_move);
+    *black_to_move = egtb_decode_dtm(entry->black_to_move);
+    return true;
+}
+
 bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
                    int16_t value)
 {
@@ -1348,6 +1446,251 @@ void egtb_view_cache_statistics(const EgtbView *view,
         memset(statistics, 0, sizeof(*statistics));
     else
         *statistics = view->statistics;
+}
+
+typedef struct {
+    Egtb *backing;
+    EgtbEntry *entries;
+    uint64_t first_page;
+    uint64_t end_page;
+    uint64_t stored_histogram[2][256];
+    bool failed;
+    char error[256];
+} ResidentLoadWorker;
+
+static void *load_resident_pages(void *opaque)
+{
+    ResidentLoadWorker *worker = opaque;
+    Egtb *egtb = worker->backing;
+    ZSTD_DCtx *decompressor = ZSTD_createDCtx();
+    size_t compressed_capacity = ZSTD_compressBound(egtb->page_size);
+    unsigned char *compressed = malloc(compressed_capacity);
+    uint64_t page;
+    if (decompressor == NULL || compressed == NULL) {
+        snprintf(worker->error, sizeof(worker->error),
+                 "cannot allocate resident decompression workspace");
+        worker->failed = true;
+        goto done;
+    }
+    for (page = worker->first_page; page < worker->end_page; ++page) {
+        EgtbEntry *destination =
+            (EgtbEntry *)(void *)((unsigned char *)worker->entries +
+                                  page * egtb->page_size);
+        uint64_t offset = egtb->offsets[page];
+        uint16_t length = egtb->lengths[page];
+        uint64_t first_index = page * egtb->entries_per_page;
+        uint64_t remaining = egtb->maximum_index - first_index + 1;
+        uint32_t valid_entries = remaining < egtb->entries_per_page
+                                     ? (uint32_t)remaining
+                                     : egtb->entries_per_page;
+        unsigned char checksum_bytes[EGTB_BLOCK_HEADER_SIZE];
+        uint32_t expected_checksum;
+        size_t decompressed;
+        if (offset == 0) {
+            fill_draw_page(egtb, destination);
+            worker->stored_histogram[EGTB_WHITE_TO_MOVE]
+                                    [(uint8_t)EGTB_STORED_DRAW] +=
+                valid_entries;
+            worker->stored_histogram[EGTB_BLACK_TO_MOVE]
+                                    [(uint8_t)EGTB_STORED_DRAW] +=
+                valid_entries;
+            continue;
+        }
+        if (length > compressed_capacity ||
+            !pread_at(fileno(egtb->file), offset, checksum_bytes,
+                      sizeof(checksum_bytes)) ||
+            !pread_at(fileno(egtb->file),
+                      offset + EGTB_BLOCK_HEADER_SIZE,
+                      compressed, length)) {
+            snprintf(worker->error, sizeof(worker->error), "%s",
+                     egtb_last_error());
+            worker->failed = true;
+            break;
+        }
+        expected_checksum = get_u32(checksum_bytes);
+        decompressed = ZSTD_decompressDCtx(
+            decompressor, destination, egtb->page_size, compressed, length);
+        if (ZSTD_isError(decompressed) || decompressed != egtb->page_size) {
+            snprintf(worker->error, sizeof(worker->error),
+                     "Zstd decompression failed for page %" PRIu64 ": %s",
+                     page, ZSTD_isError(decompressed)
+                               ? ZSTD_getErrorName(decompressed)
+                               : "invalid decompressed size");
+            worker->failed = true;
+            break;
+        }
+        if (crc32c(destination, egtb->page_size) != expected_checksum) {
+            snprintf(worker->error, sizeof(worker->error),
+                     "CRC32C mismatch for uncompressed page %" PRIu64,
+                     page);
+            worker->failed = true;
+            break;
+        }
+        for (uint32_t entry = 0; entry < valid_entries; ++entry) {
+            ++worker->stored_histogram[EGTB_WHITE_TO_MOVE]
+                                      [(uint8_t)destination[entry]
+                                           .white_to_move];
+            ++worker->stored_histogram[EGTB_BLACK_TO_MOVE]
+                                      [(uint8_t)destination[entry]
+                                           .black_to_move];
+        }
+    }
+done:
+    free(compressed);
+    ZSTD_freeDCtx(decompressor);
+    return NULL;
+}
+
+bool egtb_resident_load(EgtbResident **out, Egtb *backing,
+                        unsigned thread_count)
+{
+    EgtbResident *resident = NULL;
+    ResidentLoadWorker *workers = NULL;
+    pthread_t *threads = NULL;
+    uint64_t bytes, pages_per_worker, extra_pages;
+    unsigned i, created_threads = 0;
+    bool ok = false;
+    if (out == NULL)
+        return fail("invalid resident EGTB output pointer");
+    *out = NULL;
+    if (backing == NULL || !backing->readonly || thread_count == 0)
+        return fail("resident EGTB requires a read-only backing and workers");
+    if (backing->page_count > UINT64_MAX / backing->page_size)
+        return fail("resident EGTB size overflows uint64_t");
+    bytes = backing->page_count * backing->page_size;
+    if (bytes > SIZE_MAX)
+        return fail("resident EGTB does not fit in address space");
+    if (backing->page_count < thread_count)
+        thread_count = (unsigned)backing->page_count;
+    resident = calloc(1, sizeof(*resident));
+    workers = calloc(thread_count, sizeof(*workers));
+    threads = calloc(thread_count, sizeof(*threads));
+    if (resident == NULL || workers == NULL || threads == NULL ||
+        (resident->entries = malloc((size_t)bytes)) == NULL) {
+        fail("cannot allocate resident EGTB");
+        goto done;
+    }
+    resident->backing = backing;
+    resident->allocated_bytes = bytes;
+    pages_per_worker = backing->page_count / thread_count;
+    extra_pages = backing->page_count % thread_count;
+    for (i = 0; i < thread_count; ++i) {
+        uint64_t first_page = i * pages_per_worker +
+                              (i < extra_pages ? i : extra_pages);
+        workers[i].backing = backing;
+        workers[i].entries = resident->entries;
+        workers[i].first_page = first_page;
+        workers[i].end_page = first_page + pages_per_worker +
+                              (i < extra_pages);
+        {
+            int error = pthread_create(&threads[i], NULL,
+                                       load_resident_pages, &workers[i]);
+            if (error != 0) {
+                fail("cannot create resident loader %u: %s", i,
+                     strerror(error));
+                break;
+            }
+        }
+        ++created_threads;
+    }
+    for (i = 0; i < created_threads; ++i) {
+        int error = pthread_join(threads[i], NULL);
+        if (error != 0) {
+            fail("cannot join resident loader %u: %s", i, strerror(error));
+            goto done;
+        }
+    }
+    if (created_threads != thread_count)
+        goto done;
+    for (i = 0; i < thread_count; ++i)
+        if (workers[i].failed) {
+            fail("resident loader %u failed: %s", i, workers[i].error);
+            goto done;
+        }
+    for (i = 0; i < thread_count; ++i)
+        for (unsigned side = 0; side < 2; ++side)
+            for (unsigned stored = 0; stored < 256; ++stored)
+                resident->stored_histogram[side][stored] +=
+                    workers[i].stored_histogram[side][stored];
+    *out = resident;
+    resident = NULL;
+    ok = true;
+done:
+    if (resident != NULL) {
+        free(resident->entries);
+        free(resident);
+    }
+    free(threads);
+    free(workers);
+    return ok;
+}
+
+void egtb_resident_destroy(EgtbResident *resident)
+{
+    if (resident == NULL)
+        return;
+    free(resident->entries);
+    free(resident);
+}
+
+bool egtb_resident_get(const EgtbResident *resident, uint64_t index,
+                       EgtbSide side, int16_t *value)
+{
+#ifndef NDEBUG
+    if (resident == NULL || value == NULL ||
+        index > resident->backing->maximum_index ||
+        (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
+        return fail("invalid resident EGTB lookup");
+#endif
+    *value = egtb_decode_dtm(side == EGTB_WHITE_TO_MOVE
+                                ? resident->entries[index].white_to_move
+                                : resident->entries[index].black_to_move);
+    return true;
+}
+
+bool egtb_resident_get_pair(const EgtbResident *resident, uint64_t index,
+                            int16_t *white_to_move,
+                            int16_t *black_to_move)
+{
+    const EgtbEntry *entry;
+#ifndef NDEBUG
+    if (resident == NULL || white_to_move == NULL || black_to_move == NULL ||
+        index > resident->backing->maximum_index)
+        return fail("invalid paired resident EGTB lookup");
+#endif
+    entry = &resident->entries[index];
+    *white_to_move = egtb_decode_dtm(entry->white_to_move);
+    *black_to_move = egtb_decode_dtm(entry->black_to_move);
+    return true;
+}
+
+bool egtb_resident_matches(const EgtbResident *resident,
+                           const Egtb *backing)
+{
+    return resident != NULL && resident->backing == backing;
+}
+
+uint64_t egtb_resident_bytes(const EgtbResident *resident)
+{
+    return resident == NULL ? 0 : resident->allocated_bytes;
+}
+
+bool egtb_resident_dtm_histogram(const EgtbResident *resident,
+                                 uint64_t *histogram,
+                                 size_t bins_per_side)
+{
+    if (resident == NULL || histogram == NULL ||
+        bins_per_side < UINT16_MAX + 1u)
+        return fail("invalid resident DTM histogram output");
+    memset(histogram, 0, 2 * bins_per_side * sizeof(*histogram));
+    for (unsigned side = 0; side < 2; ++side)
+        for (int stored = INT8_MIN; stored <= INT8_MAX; ++stored) {
+            uint8_t bucket = (uint8_t)stored;
+            int16_t dtm = egtb_decode_dtm((int8_t)stored);
+            histogram[(size_t)side * bins_per_side + (uint16_t)dtm] +=
+                resident->stored_histogram[side][bucket];
+        }
+    return true;
 }
 
 uint64_t egtb_maximum_index(const Egtb *egtb)

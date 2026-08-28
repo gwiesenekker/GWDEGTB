@@ -86,6 +86,8 @@ typedef struct {
     size_t cache_pages;
     /* Optional array of thread_count private probe contexts. */
     void *const *external_contexts;
+    /* Optional fully decompressed current database; bypasses current-DB views. */
+    const EgtbResident *resident;
 } EgtbVerificationOptions;
 
 typedef bool (*EgtbExternalProbe)(

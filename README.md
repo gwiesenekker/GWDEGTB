@@ -298,7 +298,7 @@ catalog and cache per worker.
 After retrograde convergence, workers compile their DTM streams into disjoint
 page ranges of the final all-draw database. Streams are applied from the
 largest distance down to zero, so a later shorter result supersedes a stale
-longer record. Only this compilation phase uses the 256 MiB writable-cache
+longer record. Only this compilation phase uses the 1 GiB writable-cache
 budget, divided across the workers. The shared cache is temporarily reduced to
 one page and restored before the sparse consistency repair.
 
@@ -315,9 +315,12 @@ ZSTD contexts, compressed buffers, and cache statistics private. Read-only
 view misses use `pread()` and therefore do not share a seek position. Writable
 views use the same direct mapping and flush a dirty slot before replacing it.
 
-Consistency repair uses snapshot iterations. Every worker opens a private
-read-only view of the compiled database and writes mismatches from its owned
-range to an in-memory correction stream. After the views close, one thread
+Consistency repair uses snapshot iterations. Every worker has a private
+one-page sequential scan view plus a separate random-access successor view and
+writes mismatches from its owned range to an in-memory correction stream. A
+paired sequential cursor decodes both side-to-move bytes with one page lookup
+and advances within the resident page without another cache lookup. After the
+views close, one thread
 applies the range-ordered streams through the writable backing and constructs
 the affected-position bitmap. Later parallel iterations inspect only affected
 successors and predecessors. The initial full pass also builds a verified-
@@ -326,10 +329,18 @@ permanently cleared from that bitmap; corrections discovered by later sparse
 passes extend this unverified predecessor closure. The generator then flushes
 the repaired pages, compacts the live blocks into a temporary file, and
 atomically installs the
-compacted database. It reopens the finished file read-only, skips positions
-that the initial snapshot already certified, and runs the parallel fatal
-consistency verification over the remaining affected region. It then prints
-WTM and BTM counts for every stored
+compacted database. It reopens the finished file read-only. If its uncompressed
+size is at most `EGTB_RESIDENT_LIMIT_GIB` (32 GiB by default), page-aligned
+workers decompress it into a shared flat array using private ZSTD contexts,
+`pread()`, and CRC32C verification. Each loader builds a private DTM histogram;
+these are merged after loading, so resident databases need no separate
+statistics scan. Final consistency checks use direct immutable array access.
+Set the limit to zero to disable resident loading. Larger databases use a
+random-access cache totaling
+`EGTB_VERIFICATION_CACHE_GIB` (32 GiB by default), divided across workers.
+The verifier skips positions that the initial snapshot already certified and
+runs the parallel fatal consistency verification over the remaining affected
+region. It then prints WTM and BTM counts for every stored
 DTM value together with final compression statistics. The summary also prints
 monotonic wall-clock timings for setup, initialization, backpropagation,
 frontier compilation, consistency repair, the final DTM scan, finalization,

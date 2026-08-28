@@ -23,6 +23,20 @@ typedef struct {
 
 typedef struct Egtb Egtb;
 typedef struct EgtbView EgtbView;
+typedef struct EgtbResident EgtbResident;
+
+/*
+ * Forward-only paired-entry reader. The cache view must not be used by any
+ * other lookup while a reader is active, because the reader retains a direct
+ * pointer into the view's current cache page.
+ */
+typedef struct {
+    EgtbView *view;
+    uint64_t next_index;
+    uint64_t end_index;
+    const EgtbEntry *next_entry;
+    const EgtbEntry *page_end;
+} EgtbSequentialReader;
 
 typedef struct {
     size_t cache_pages;
@@ -88,10 +102,35 @@ bool egtb_view_close(EgtbView *view);
 bool egtb_view_flush(EgtbView *view);
 bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
                    int16_t *value);
+bool egtb_view_get_pair(EgtbView *view, uint64_t index,
+                        int16_t *white_to_move, int16_t *black_to_move);
 bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
                    int16_t value);
+bool egtb_sequential_reader_init(EgtbSequentialReader *reader,
+                                 EgtbView *view, uint64_t first_index,
+                                 uint64_t end_index);
+bool egtb_sequential_reader_next(EgtbSequentialReader *reader,
+                                 int16_t *white_to_move,
+                                 int16_t *black_to_move);
 void egtb_view_cache_statistics(const EgtbView *view,
                                 EgtbCacheStatistics *statistics);
+
+/* Parallel, checksum-verifying decompression into a flat read-only array. */
+bool egtb_resident_load(EgtbResident **out, Egtb *backing,
+                        unsigned thread_count);
+void egtb_resident_destroy(EgtbResident *resident);
+bool egtb_resident_get(const EgtbResident *resident, uint64_t index,
+                       EgtbSide side, int16_t *value);
+bool egtb_resident_get_pair(const EgtbResident *resident, uint64_t index,
+                            int16_t *white_to_move,
+                            int16_t *black_to_move);
+bool egtb_resident_matches(const EgtbResident *resident,
+                           const Egtb *backing);
+uint64_t egtb_resident_bytes(const EgtbResident *resident);
+/* Produces decoded int16_t DTM bins, indexed by (uint16_t)dtm. */
+bool egtb_resident_dtm_histogram(const EgtbResident *resident,
+                                 uint64_t *histogram,
+                                 size_t bins_per_side);
 
 uint64_t egtb_maximum_index(const Egtb *egtb);
 uint64_t egtb_page_count(const Egtb *egtb);

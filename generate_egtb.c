@@ -12,18 +12,19 @@
 #include <time.h>
 #include <unistd.h>
 
+#define GIBIBYTE (UINT64_C(1024) * 1024 * 1024)
+#define DEFAULT_RESIDENT_LIMIT_BYTES (UINT64_C(32) * GIBIBYTE)
+#define DEFAULT_VERIFICATION_CACHE_BYTES (UINT64_C(32) * GIBIBYTE)
+
 enum {
     GENERATION_PAGE_SIZE = 1024,
     GENERATION_CACHE_BYTES = 1024 * 1024 * 1024,
     READONLY_CACHE_BYTES = 16 * 1024 * 1024,
     DEPENDENCY_CACHE_BYTES = 64 * 1024 * 1024,
-    FINAL_VERIFICATION_CACHE_BYTES = 1024 * 1024 * 1024,
     GENERATION_CACHE_PAGES = GENERATION_CACHE_BYTES / GENERATION_PAGE_SIZE,
     READONLY_CACHE_PAGES = READONLY_CACHE_BYTES / GENERATION_PAGE_SIZE,
     DEPENDENCY_CACHE_PAGES =
-        DEPENDENCY_CACHE_BYTES / GENERATION_PAGE_SIZE,
-    FINAL_VERIFICATION_CACHE_PAGES =
-        FINAL_VERIFICATION_CACHE_BYTES / GENERATION_PAGE_SIZE
+        DEPENDENCY_CACHE_BYTES / GENERATION_PAGE_SIZE
 };
 
 static double wall_seconds(void)
@@ -283,6 +284,25 @@ static bool parse_thread_count(const char *text, unsigned *count)
     return true;
 }
 
+static bool configuration_bytes(const char *name, uint64_t default_bytes,
+                                bool allow_zero, uint64_t *bytes)
+{
+    const char *text = getenv(name);
+    char *end;
+    unsigned long long gibibytes;
+    if (text == NULL || *text == '\0') {
+        *bytes = default_bytes;
+        return true;
+    }
+    errno = 0;
+    gibibytes = strtoull(text, &end, 10);
+    if (errno != 0 || *end != '\0' || (!allow_zero && gibibytes == 0) ||
+        gibibytes > UINT64_MAX / GIBIBYTE)
+        return false;
+    *bytes = (uint64_t)gibibytes * GIBIBYTE;
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     EgtbMaterial requested, material;
@@ -299,8 +319,10 @@ int main(int argc, char **argv)
     void **probe_contexts = NULL;
     EgIndexer indexer;
     Egtb *database = NULL;
+    EgtbResident *resident = NULL;
     uint64_t *histogram = NULL;
-    uint64_t positions;
+    uint64_t positions, resident_limit_bytes, verification_cache_bytes;
+    size_t verification_cache_pages;
     bool indexer_initialized = false;
     bool created = false;
     bool ok = false;
@@ -309,13 +331,26 @@ int main(int argc, char **argv)
     double program_started = wall_seconds();
     double generation_started, phase_started;
     double setup_seconds, generation_seconds, finalize_seconds;
-    double compact_seconds, verification_seconds, statistics_seconds;
+    double compact_seconds, resident_load_seconds = 0.0;
+    double verification_seconds, statistics_seconds;
     double total_seconds;
     if (argc == 2 && strcmp(argv[1], "--revision") == 0) {
         printf("GWDEGTB revision %s\n", gwdegtb_revision);
         return EXIT_SUCCESS;
     }
     printf("GWDEGTB revision %s\n", gwdegtb_revision);
+    if (!configuration_bytes("EGTB_RESIDENT_LIMIT_GIB",
+                             DEFAULT_RESIDENT_LIMIT_BYTES, true,
+                             &resident_limit_bytes) ||
+        !configuration_bytes("EGTB_VERIFICATION_CACHE_GIB",
+                             DEFAULT_VERIFICATION_CACHE_BYTES, false,
+                             &verification_cache_bytes) ||
+        verification_cache_bytes / GENERATION_PAGE_SIZE > SIZE_MAX) {
+        fprintf(stderr, "invalid resident/cache GiB configuration\n");
+        return EXIT_FAILURE;
+    }
+    verification_cache_pages =
+        (size_t)(verification_cache_bytes / GENERATION_PAGE_SIZE);
     if (argc == 7 && strcmp(argv[1], "-j") == 0) {
         if (!parse_thread_count(argv[2], &thread_count)) {
             fprintf(stderr, "thread count must be 1..%u\n",
@@ -425,13 +460,27 @@ int main(int argc, char **argv)
     }
     compact_seconds = wall_seconds() - phase_started;
     phase_started = wall_seconds();
+    {
+        uint64_t resident_bytes =
+            egtb_page_count(database) * (uint64_t)egtb_page_size(database);
+        if (resident_limit_bytes != 0 &&
+            resident_bytes <= resident_limit_bytes) {
+            if (!egtb_resident_load(&resident, database, thread_count)) {
+                fprintf(stderr, "cannot load resident %s: %s\n", path,
+                        egtb_last_error());
+                goto done;
+            }
+            resident_load_seconds = wall_seconds() - phase_started;
+        }
+    }
+    phase_started = wall_seconds();
     for (unsigned worker = 0; worker < thread_count; ++worker) {
         initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_PAGES);
         probe_contexts[worker] = &catalogs[worker];
     }
     {
         EgtbVerificationOptions verify_options = {
-            thread_count, FINAL_VERIFICATION_CACHE_PAGES, probe_contexts
+            thread_count, verification_cache_pages, probe_contexts, resident
         };
         if (!egtb_verify_consistent_threaded(
                 database, &indexer, catalog_probe, &catalogs[0],
@@ -464,13 +513,20 @@ int main(int argc, char **argv)
     histogram = calloc((size_t)2 * (UINT16_MAX + 1u), sizeof(*histogram));
     if (histogram == NULL)
         goto done;
-    for (uint64_t index = 0; index < positions; ++index)
-        for (unsigned side = 0; side < 2; ++side) {
-            int16_t value;
-            if (!egtb_get(database, index, (EgtbSide)side, &value))
-                goto done;
-            ++histogram[(size_t)side * (UINT16_MAX + 1u) + (uint16_t)value];
-        }
+    if (resident != NULL) {
+        if (!egtb_resident_dtm_histogram(resident, histogram,
+                                         UINT16_MAX + 1u))
+            goto done;
+    } else {
+        for (uint64_t index = 0; index < positions; ++index)
+            for (unsigned side = 0; side < 2; ++side) {
+                int16_t value;
+                if (!egtb_get(database, index, (EgtbSide)side, &value))
+                    goto done;
+                ++histogram[(size_t)side * (UINT16_MAX + 1u) +
+                            (uint16_t)value];
+            }
+    }
     statistics_seconds = wall_seconds() - phase_started;
     printf("generated %s: material=%u %u %u %u positions=%" PRIu64
            " maximum-index=%" PRIu64 " passes=%" PRIu64
@@ -481,12 +537,20 @@ int main(int argc, char **argv)
     printf("self-consistency: passes=%" PRIu64 " updates=%" PRIu64
            "/%" PRIu64 "\n", generation.consistency_passes,
            generation.consistency_updates[0], generation.consistency_updates[1]);
-    printf("final read-only consistency verification: threads=%u "
-           "cache=%u MiB total positions-checked=%" PRIu64
-           " positions-skipped=%" PRIu64 "\n",
-           thread_count, FINAL_VERIFICATION_CACHE_BYTES / (1024 * 1024),
-           final_verification.positions_checked,
-           final_verification.positions_skipped);
+    if (resident != NULL)
+        printf("final read-only consistency verification: threads=%u "
+               "resident=%" PRIu64 " MiB positions-checked=%" PRIu64
+               " positions-skipped=%" PRIu64 "\n",
+               thread_count, egtb_resident_bytes(resident) / (1024 * 1024),
+               final_verification.positions_checked,
+               final_verification.positions_skipped);
+    else
+        printf("final read-only consistency verification: threads=%u "
+               "cache=%" PRIu64 " MiB total positions-checked=%" PRIu64
+               " positions-skipped=%" PRIu64 "\n",
+               thread_count, verification_cache_bytes / (1024 * 1024),
+               final_verification.positions_checked,
+               final_verification.positions_skipped);
     print_cache_statistics("consistency current-DB cache",
                            &generation.consistency_cache);
     print_cache_statistics("generator dependency caches",
@@ -546,12 +610,16 @@ int main(int argc, char **argv)
     printf("  %-28s %10.3f s\n", "generator total", generation_seconds);
     printf("  %-28s %10.3f s\n", "finalize/close", finalize_seconds);
     printf("  %-28s %10.3f s\n", "compact/reopen", compact_seconds);
+    printf("  %-28s %10.3f s\n", "resident load", resident_load_seconds);
     printf("  %-28s %10.3f s\n", "final verification",
            verification_seconds);
-    printf("  %-28s %10.3f s\n", "statistics scan", statistics_seconds);
+    printf("  %-28s %10.3f s\n",
+           resident != NULL ? "statistics extraction" : "statistics scan",
+           statistics_seconds);
     printf("  %-28s %10.3f s\n", "total", total_seconds);
     ok = true;
 done:
+    egtb_resident_destroy(resident);
     if (database != NULL && !egtb_close(database))
         ok = false;
     if (catalogs != NULL) {

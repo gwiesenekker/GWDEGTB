@@ -877,6 +877,7 @@ static bool parallel_backtrack_losses(
 typedef struct {
     Egtb *database;
     EgtbView *view;
+    const EgtbResident *resident;
     const EgIndexer *indexer;
     DraughtsPosition position;
     EgtbSide mover;
@@ -934,8 +935,11 @@ static bool resolve_successor(ConsistencyMoveContext *context,
     if (has_indexer_material(context->indexer, successor)) {
         uint64_t index;
         if (!position_index(context->indexer, successor, &index) ||
-            !generator_get(context->database, context->view, index,
-                           context->successor_side, value))
+            (context->resident != NULL
+                 ? !egtb_resident_get(context->resident, index,
+                                      context->successor_side, value)
+                 : !generator_get(context->database, context->view, index,
+                                  context->successor_side, value)))
             return false;
         return true;
     }
@@ -969,7 +973,7 @@ static bool evaluate_consistency_move(const DraughtsMove *move, void *opaque)
 }
 
 static bool expected_dtm(Egtb *database, const EgIndexer *indexer,
-                         EgtbView *view,
+                         EgtbView *view, const EgtbResident *resident,
                          const DraughtsPosition *position, EgtbSide side,
                          EgtbExternalProbe external_probe,
                          void *external_context, int16_t *value)
@@ -979,6 +983,7 @@ static bool expected_dtm(Egtb *database, const EgIndexer *indexer,
     memset(&context, 0, sizeof(context));
     context.database = database;
     context.view = view;
+    context.resident = resident;
     context.indexer = indexer;
     context.position = *position;
     context.mover = side;
@@ -1139,7 +1144,7 @@ static bool repair_consistency_position(
     for (side = 0; side < 2; ++side) {
         int16_t old_value = EGTB_DRAW, new_value = EGTB_DRAW;
         if (!egtb_get(database, index, (EgtbSide)side, &old_value) ||
-            !expected_dtm(database, indexer, NULL, &position,
+            !expected_dtm(database, indexer, NULL, NULL, &position,
                           (EgtbSide)side, external_probe,
                           external_context, &new_value))
             return fail("cannot verify index %llu, side %u",
@@ -1244,7 +1249,8 @@ typedef struct {
 
 typedef struct {
     Egtb *database;
-    EgtbView *view;
+    EgtbView *scan_view;
+    EgtbView *successor_view;
     const EgIndexer *indexer;
     EgtbExternalProbe external_probe;
     void *external_context;
@@ -1287,7 +1293,8 @@ static bool append_consistency_correction(
 }
 
 static bool inspect_consistency_position(ConsistencyRepairWorker *worker,
-                                         uint64_t index)
+                                         uint64_t index,
+                                         const int16_t old_values[2])
 {
     EgPosition indexed;
     DraughtsPosition position;
@@ -1300,10 +1307,9 @@ static bool inspect_consistency_position(ConsistencyRepairWorker *worker,
     position.white_kings = indexed.white_kings;
     position.black_kings = indexed.black_kings;
     for (side = 0; side < 2; ++side) {
-        int16_t old_value = EGTB_DRAW, new_value = EGTB_DRAW;
-        if (!egtb_view_get(worker->view, index, (EgtbSide)side,
-                           &old_value) ||
-            !expected_dtm(worker->database, worker->indexer, worker->view,
+        int16_t old_value = old_values[side], new_value = EGTB_DRAW;
+        if (!expected_dtm(worker->database, worker->indexer,
+                          worker->successor_view, NULL,
                           &position, (EgtbSide)side,
                           worker->external_probe, worker->external_context,
                           &new_value))
@@ -1328,23 +1334,63 @@ static void *run_consistency_repair_worker(void *opaque)
     worker->correction_count = 0;
     worker->failed = false;
     if (worker->full_pass) {
-        for (index = worker->first_index; index < worker->end_index; ++index)
-            if (!inspect_consistency_position(worker, index)) {
+        EgtbSequentialReader reader;
+        if (!egtb_sequential_reader_init(&reader, worker->scan_view,
+                                         worker->first_index,
+                                         worker->end_index)) {
+            worker->failed = true;
+            return NULL;
+        }
+        for (index = worker->first_index; index < worker->end_index; ++index) {
+            int16_t old_values[2];
+            if (!egtb_sequential_reader_next(&reader, &old_values[0],
+                                             &old_values[1]) ||
+                !inspect_consistency_position(worker, index, old_values)) {
                 worker->failed = true;
                 return NULL;
             }
+        }
     } else {
         index = worker->first_index;
         while (bitmap_find_next(worker->pending, index, &index) &&
                index < worker->end_index) {
             uint64_t current = index++;
-            if (!inspect_consistency_position(worker, current)) {
+            int16_t old_values[2];
+            if (!egtb_view_get_pair(worker->scan_view, current,
+                                    &old_values[0], &old_values[1]) ||
+                !inspect_consistency_position(worker, current, old_values)) {
                 worker->failed = true;
                 return NULL;
             }
         }
     }
     return NULL;
+}
+
+static bool close_consistency_repair_views(ConsistencyRepairWorker *workers,
+                                           unsigned thread_count,
+                                           EgtbCacheStatistics *statistics)
+{
+    unsigned i;
+    bool ok = true;
+    for (i = 0; i < thread_count; ++i) {
+        EgtbView **views[2] = {&workers[i].scan_view,
+                              &workers[i].successor_view};
+        unsigned view_index;
+        for (view_index = 0; view_index < 2; ++view_index) {
+            if (*views[view_index] != NULL) {
+                EgtbCacheStatistics cache;
+                if (statistics != NULL) {
+                    egtb_view_cache_statistics(*views[view_index], &cache);
+                    add_cache_statistics(statistics, &cache);
+                }
+                if (!egtb_view_close(*views[view_index]))
+                    ok = false;
+                *views[view_index] = NULL;
+            }
+        }
+    }
+    return ok;
 }
 
 static bool apply_consistency_corrections(
@@ -1432,7 +1478,7 @@ bool egtb_make_consistent_threaded(
     uint64_t position_count, page_count, pages_per_worker, extra_pages;
     uint64_t entries_per_page;
     size_t original_cache_pages = 0;
-    unsigned thread_count, i, created_views = 0, created_threads = 0;
+    unsigned thread_count, i, created_threads = 0;
     bool full_pass = true;
     bool cache_shrunk = false;
     bool ok = false;
@@ -1502,21 +1548,24 @@ bool egtb_make_consistent_threaded(
             fail("cannot flush consistency snapshot: %s", egtb_last_error());
             goto done;
         }
-        created_views = 0;
         for (i = 0; i < thread_count; ++i) {
             size_t cache_pages = options->cache_pages / thread_count +
                                  (i < options->cache_pages % thread_count);
+            uint64_t first_page = workers[i].first_index / entries_per_page;
+            uint64_t end_page = (workers[i].end_index +
+                                 entries_per_page - 1) / entries_per_page;
             if (cache_pages == 0)
                 cache_pages = 1;
             workers[i].pending = &pending;
             workers[i].full_pass = full_pass;
-            if (!egtb_view_create(&workers[i].view, database, cache_pages,
-                                  false)) {
-                fail("cannot create consistency view %u: %s", i,
+            if (!egtb_view_create_range(&workers[i].scan_view, database, 1,
+                                        false, first_page, end_page) ||
+                !egtb_view_create(&workers[i].successor_view, database,
+                                  cache_pages, false)) {
+                fail("cannot create consistency views %u: %s", i,
                      egtb_last_error());
                 goto done;
             }
-            ++created_views;
         }
         created_threads = 0;
         for (i = 0; i < thread_count; ++i) {
@@ -1547,19 +1596,11 @@ bool egtb_make_consistent_threaded(
                 goto done;
             }
         }
-        for (i = 0; i < created_views; ++i) {
-            EgtbCacheStatistics cache;
-            egtb_view_cache_statistics(workers[i].view, &cache);
-            add_cache_statistics(&local.cache, &cache);
-            if (!egtb_view_close(workers[i].view)) {
-                workers[i].view = NULL;
-                fail("cannot close consistency view %u: %s", i,
-                     egtb_last_error());
-                goto done;
-            }
-            workers[i].view = NULL;
+        if (!close_consistency_repair_views(workers, thread_count,
+                                            &local.cache)) {
+            fail("cannot close consistency views: %s", egtb_last_error());
+            goto done;
         }
-        created_views = 0;
         if (!apply_consistency_corrections(
                 database, indexer, workers, thread_count, reporter,
                 reporter_context, &affected, verified_positions, &local,
@@ -1584,12 +1625,9 @@ bool egtb_make_consistent_threaded(
         *statistics = local;
     ok = true;
 done:
-    for (i = 0; i < created_views; ++i)
-        if (workers[i].view != NULL) {
-            if (!egtb_view_close(workers[i].view))
-                ok = false;
-            workers[i].view = NULL;
-        }
+    if (workers != NULL &&
+        !close_consistency_repair_views(workers, thread_count, NULL))
+        ok = false;
     if (cache_shrunk && !egtb_resize_cache(database, original_cache_pages))
         ok = false;
     if (workers != NULL)
@@ -1604,7 +1642,9 @@ done:
 
 typedef struct {
     Egtb *database;
-    EgtbView *view;
+    EgtbView *scan_view;
+    EgtbView *successor_view;
+    const EgtbResident *resident;
     const EgIndexer *indexer;
     EgtbExternalProbe external_probe;
     void *external_context;
@@ -1624,15 +1664,38 @@ typedef struct {
 static void *run_consistency_verify_worker(void *opaque)
 {
     ConsistencyVerifyWorker *worker = opaque;
+    EgtbSequentialReader reader;
+    bool sequential = worker->resident == NULL &&
+                      worker->verified_positions == NULL;
     uint64_t index;
+    if (sequential &&
+        !egtb_sequential_reader_init(&reader, worker->scan_view,
+                                     worker->first_index,
+                                     worker->end_index)) {
+        worker->failed = true;
+        return NULL;
+    }
     for (index = worker->first_index; index < worker->end_index; ++index) {
         EgPosition indexed;
         DraughtsPosition position;
+        int16_t stored_values[2];
         unsigned side;
         if (worker->verified_positions != NULL &&
             bitmap_test(worker->verified_positions, index)) {
             worker->positions_skipped += 2;
             continue;
+        }
+        if ((worker->resident != NULL &&
+             !egtb_resident_get_pair(worker->resident, index,
+                                     &stored_values[0], &stored_values[1])) ||
+            (worker->resident == NULL && sequential &&
+             !egtb_sequential_reader_next(&reader, &stored_values[0],
+                                          &stored_values[1])) ||
+            (worker->resident == NULL && !sequential &&
+             !egtb_view_get_pair(worker->scan_view, index,
+                                 &stored_values[0], &stored_values[1]))) {
+            worker->failed = true;
+            return NULL;
         }
         if (!eg_index_to_position(worker->indexer, index, &indexed)) {
             worker->failed = true;
@@ -1643,11 +1706,11 @@ static void *run_consistency_verify_worker(void *opaque)
         position.white_kings = indexed.white_kings;
         position.black_kings = indexed.black_kings;
         for (side = 0; side < 2; ++side) {
-            int16_t stored, expected;
-            if (!generator_get(worker->database, worker->view, index,
-                               (EgtbSide)side, &stored) ||
-                !expected_dtm(worker->database, worker->indexer,
-                              worker->view, &position, (EgtbSide)side,
+            int16_t stored = stored_values[side], expected;
+            if (!expected_dtm(worker->database, worker->indexer,
+                              worker->successor_view, worker->resident,
+                              &position,
+                              (EgtbSide)side,
                               worker->external_probe,
                               worker->external_context, &expected)) {
                 worker->failed = true;
@@ -1679,7 +1742,7 @@ bool egtb_verify_consistent_threaded(
     pthread_t *threads = NULL;
     uint64_t position_count, page_count, pages_per_worker, extra_pages;
     uint64_t entries_per_page;
-    unsigned thread_count, created_views = 0, created_threads = 0, i;
+    unsigned thread_count, created_threads = 0, i;
     bool ok = false;
     if (database == NULL || indexer == NULL || options == NULL ||
         options->thread_count == 0 ||
@@ -1695,6 +1758,9 @@ bool egtb_verify_consistent_threaded(
         (verified_positions->words == NULL ||
          verified_positions->bit_count != position_count))
         return fail("verified-position bitmap has the wrong size");
+    if (options->resident != NULL &&
+        !egtb_resident_matches(options->resident, database))
+        return fail("resident EGTB does not match verification database");
     thread_count = options->thread_count;
     if (page_count < thread_count)
         thread_count = (unsigned)page_count;
@@ -1722,18 +1788,23 @@ bool egtb_verify_consistent_threaded(
                                           ? options->external_contexts[i]
                                           : external_context;
         workers[i].verified_positions = verified_positions;
+        workers[i].resident = options->resident;
         workers[i].first_index = first_page * entries_per_page;
         workers[i].end_index = (first_page + owned_pages) * entries_per_page;
         if (workers[i].end_index > position_count)
             workers[i].end_index = position_count;
-        /* The scan range is private, but successor probes span the full DB. */
-        if (!egtb_view_create(&workers[i].view, database, cache_pages,
-                              false)) {
-            fail("cannot create verification view %u: %s", i,
-                 egtb_last_error());
-            goto done;
+        if (options->resident == NULL) {
+            /* Keep the linear old-value stream out of the random probe cache. */
+            if (!egtb_view_create_range(&workers[i].scan_view, database, 1,
+                                        false, first_page,
+                                        first_page + owned_pages) ||
+                !egtb_view_create(&workers[i].successor_view, database,
+                                  cache_pages, false)) {
+                fail("cannot create verification views %u: %s", i,
+                     egtb_last_error());
+                goto done;
+            }
         }
-        ++created_views;
     }
     for (i = 0; i < thread_count; ++i) {
         int error = pthread_create(&threads[i], NULL,
@@ -1762,7 +1833,9 @@ join:
         EgtbCacheStatistics cache;
         local.positions_checked += workers[i].positions_checked;
         local.positions_skipped += workers[i].positions_skipped;
-        egtb_view_cache_statistics(workers[i].view, &cache);
+        egtb_view_cache_statistics(workers[i].scan_view, &cache);
+        add_cache_statistics(&local.cache, &cache);
+        egtb_view_cache_statistics(workers[i].successor_view, &cache);
         add_cache_statistics(&local.cache, &cache);
         if (workers[i].failed) {
             fail("consistency verification worker %u failed", i);
@@ -1782,9 +1855,15 @@ join:
         *statistics = local;
     ok = true;
 done:
-    for (i = 0; i < created_views; ++i)
-        if (workers[i].view != NULL && !egtb_view_close(workers[i].view))
-            ok = false;
+    if (workers != NULL)
+        for (i = 0; i < thread_count; ++i) {
+            if (workers[i].scan_view != NULL &&
+                !egtb_view_close(workers[i].scan_view))
+                ok = false;
+            if (workers[i].successor_view != NULL &&
+                !egtb_view_close(workers[i].successor_view))
+                ok = false;
+        }
     free(threads);
     free(workers);
     return ok;
@@ -2825,7 +2904,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     {
         EgtbVerificationOptions repair_options = {
             thread_count, options->writable_cache_pages,
-            options->external_contexts
+            options->external_contexts, NULL
         };
         if (!egtb_make_consistent_threaded(
                 database, indexer, external_probe, initial_context,

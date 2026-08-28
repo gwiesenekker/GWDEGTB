@@ -229,6 +229,7 @@ static bool test_complete_wk_bk_generation(void)
     ConsistencyReportCheck report = {0};
     EgIndexer indexer;
     Egtb *database = NULL;
+    EgtbResident *resident = NULL;
     uint64_t counts[2][4] = {{0}};
     uint64_t index;
     uint64_t win_three_index = UINT64_MAX;
@@ -286,7 +287,7 @@ static bool test_complete_wk_bk_generation(void)
             goto destroy_indexer;
     }
     {
-        EgtbVerificationOptions repair_options = {4, 16, NULL};
+        EgtbVerificationOptions repair_options = {4, 16, NULL, NULL};
         if (win_three_index == UINT64_MAX || lost_two_index == UINT64_MAX ||
             !bitmap_create(&verified_positions,
                            eg_position_count(&indexer)) ||
@@ -315,7 +316,7 @@ static bool test_complete_wk_bk_generation(void)
             goto destroy_indexer;
     }
     {
-        EgtbVerificationOptions verify_options = {4, 16, NULL};
+        EgtbVerificationOptions verify_options = {4, 16, NULL, NULL};
         EgtbConsistencyStatistics verification;
         if (!egtb_flush(database) || !egtb_close(database)) {
             database = NULL;
@@ -324,6 +325,10 @@ static bool test_complete_wk_bk_generation(void)
         database = NULL;
         if (!egtb_compact(path, 3, 4) ||
             !egtb_open_readonly(&database, path, 4) ||
+            !egtb_resident_load(&resident, database, 4))
+            goto destroy_indexer;
+        verify_options.resident = resident;
+        if (
             !egtb_verify_consistent_threaded(
                 database, &indexer, NULL, NULL, &verify_options,
                 &verified_positions, &verification) ||
@@ -334,6 +339,8 @@ static bool test_complete_wk_bk_generation(void)
             verification.positions_checked == 0 ||
             verification.positions_skipped == 0)
             goto destroy_indexer;
+        egtb_resident_destroy(resident);
+        resident = NULL;
         if (!egtb_close(database)) {
             database = NULL;
             goto destroy_indexer;
@@ -346,6 +353,7 @@ static bool test_complete_wk_bk_generation(void)
             goto destroy_indexer;
         }
         database = NULL;
+        verify_options.resident = NULL;
         if (!egtb_open_readonly(&database, path, 4) ||
             egtb_verify_consistent_threaded(
                 database, &indexer, NULL, NULL, &verify_options,
@@ -357,6 +365,7 @@ destroy_indexer:
     bitmap_destroy(&verified_positions);
     eg_indexer_destroy(&indexer);
 done:
+    egtb_resident_destroy(resident);
     if (database != NULL && !egtb_close(database))
         ok = false;
     unlink(path);

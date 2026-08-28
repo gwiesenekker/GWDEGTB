@@ -134,7 +134,8 @@ static bool test_direct_cache_views(void)
     char direct_path[] = "/tmp/ipd-egtb-direct-XXXXXX";
     EgtbCreateOptions options = {4, 20, 3};
     Egtb *handle = NULL, *direct = NULL;
-    EgtbView *write_view = NULL, *read_view = NULL;
+    EgtbView *write_view = NULL, *read_view = NULL, *scan_view = NULL;
+    EgtbResident *resident = NULL;
     EgtbCacheStatistics cache_statistics;
     uint64_t state = UINT64_C(0x4d595df4d0f33173);
     const uint64_t positions = 16384;
@@ -211,12 +212,99 @@ static bool test_direct_cache_views(void)
     if (cache_statistics.lookups != positions * 2 ||
         cache_statistics.hits == 0 || cache_statistics.misses == 0)
         goto done;
+    if (!egtb_view_create(&scan_view, direct, 1, false))
+        goto done;
+    {
+        EgtbSequentialReader reader;
+        if (!egtb_sequential_reader_init(&reader, scan_view, 0, positions))
+            goto done;
+        for (uint64_t index = 0; index < positions; ++index) {
+            int16_t handle_white, handle_black, scan_white, scan_black;
+            if (!egtb_get(handle, index, EGTB_WHITE_TO_MOVE,
+                          &handle_white) ||
+                !egtb_get(handle, index, EGTB_BLACK_TO_MOVE,
+                          &handle_black) ||
+                !egtb_sequential_reader_next(&reader, &scan_white,
+                                             &scan_black) ||
+                handle_white != scan_white || handle_black != scan_black)
+                goto done;
+        }
+    }
+    egtb_view_cache_statistics(scan_view, &cache_statistics);
+    if (cache_statistics.lookups != positions / (1024 / sizeof(EgtbEntry)) ||
+        cache_statistics.misses != cache_statistics.lookups ||
+        cache_statistics.hits != 0)
+        goto done;
+    {
+        int16_t handle_white, handle_black, pair_white, pair_black;
+        uint64_t index = positions - 1;
+        if (!egtb_get(handle, index, EGTB_WHITE_TO_MOVE, &handle_white) ||
+            !egtb_get(handle, index, EGTB_BLACK_TO_MOVE, &handle_black) ||
+            !egtb_view_get_pair(scan_view, index, &pair_white, &pair_black) ||
+            handle_white != pair_white || handle_black != pair_black)
+            goto done;
+    }
+    if (!egtb_resident_load(&resident, direct, 4) ||
+        !egtb_resident_matches(resident, direct) ||
+        egtb_resident_bytes(resident) != positions * sizeof(EgtbEntry))
+        goto done;
+    {
+        uint64_t *histogram =
+            calloc((size_t)2 * (UINT16_MAX + 1u), sizeof(*histogram));
+        uint64_t *expected =
+            calloc((size_t)2 * (UINT16_MAX + 1u), sizeof(*expected));
+        uint64_t totals[2] = {0, 0};
+        if (histogram == NULL || expected == NULL ||
+            !egtb_resident_dtm_histogram(resident, histogram,
+                                         UINT16_MAX + 1u)) {
+            free(histogram);
+            free(expected);
+            goto done;
+        }
+        for (uint64_t index = 0; index < positions; ++index)
+            for (unsigned side = 0; side < 2; ++side) {
+                int16_t value;
+                if (!egtb_get(handle, index, (EgtbSide)side, &value)) {
+                    free(histogram);
+                    free(expected);
+                    goto done;
+                }
+                ++expected[(size_t)side * (UINT16_MAX + 1u) +
+                           (uint16_t)value];
+            }
+        for (unsigned side = 0; side < 2; ++side)
+            for (unsigned bin = 0; bin <= UINT16_MAX; ++bin)
+                totals[side] +=
+                    histogram[(size_t)side * (UINT16_MAX + 1u) + bin];
+        if (memcmp(histogram, expected,
+                   (size_t)2 * (UINT16_MAX + 1u) * sizeof(*histogram)) != 0) {
+            free(histogram);
+            free(expected);
+            goto done;
+        }
+        free(histogram);
+        free(expected);
+        if (totals[0] != positions || totals[1] != positions)
+            goto done;
+    }
+    for (uint64_t index = 0; index < positions; ++index) {
+        int16_t handle_white, handle_black, resident_white, resident_black;
+        if (!egtb_get(handle, index, EGTB_WHITE_TO_MOVE, &handle_white) ||
+            !egtb_get(handle, index, EGTB_BLACK_TO_MOVE, &handle_black) ||
+            !egtb_resident_get_pair(resident, index, &resident_white,
+                                    &resident_black) ||
+            handle_white != resident_white || handle_black != resident_black)
+            goto done;
+    }
     ok = true;
 done:
+    egtb_resident_destroy(resident);
     if (write_view != NULL)
         egtb_view_close(write_view);
     if (read_view != NULL)
         egtb_view_close(read_view);
+    if (scan_view != NULL)
+        egtb_view_close(scan_view);
     if (handle != NULL)
         egtb_close(handle);
     if (direct != NULL)
