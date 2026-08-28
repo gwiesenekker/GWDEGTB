@@ -7,7 +7,9 @@ used). White men are restricted to squares 5..49 and black men to 0..44.
 The index order scans squares 0..49. At each square the order is empty, white
 man, black man, white king, black king. A dynamic-programming table counts the
 valid suffixes, so illegal man placements create neither holes nor duplicate
-indices.
+indices. Each fixed-material indexer also precomputes the complete rank addition
+for every state and actual piece type. Ranking therefore needs one transition
+lookup per occupied square while preserving the original index order.
 
 Build and run the exhaustive round-trip test:
 
@@ -124,16 +126,21 @@ scan across empty diagonal squares and consider every empty landing square
 beyond a victim. Captures are compulsory and only globally maximum-length
 capture paths are emitted.
 
-The alternative padded backend maps compact squares 0..49 to GWD fields
+The production padded backend maps compact squares 0..49 to GWD fields
 6..15, 17..26, 28..37, 39..48, and 50..59. Diagonal steps then become fixed
 unsigned shifts by 5 or 6; the unused fields prevent row wrapping. Builds with
 BMI2 use PDEP/PEXT to convert whole bitboards at the API boundary and portable
 builds use a set-bit fallback. The public position and move representations
-remain compact. The padded entry points have a `_padded` suffix, and
-`generate_egtb_padded` builds the generator against them.
+remain compact. Precomputed diagonal ray and between-square masks find the
+nearest king blocker and all legal landing squares without walking each empty
+square. The padded entry points have a `_padded` suffix and are used by the
+normal `generate_egtb` executable. `generate_egtb_table` retains the compact
+table backend for comparison.
 
 Captured pieces remain occupied during recursive generation and are tracked in
-a separate captured mask. This both prevents capturing a piece twice and makes
+a separate captured mask. Capture recursion keeps only the longest paths found
+so far, so it does not repeat the entire capture search merely to emit moves.
+This both prevents capturing a piece twice and makes
 an already captured piece continue to block a king ray until the move ends.
 Capture paths with identical final effects are intentionally not deduplicated.
 
@@ -237,13 +244,12 @@ A plain `make generate_egtb` is the native production build and uses
 debug build. Because `-march=native` specializes the executable for the build
 machine, rebuild after copying the source to a machine with a different CPU.
 
-Every actual generator build receives a local revision in increments of 0.001
-and prints it at startup. An up-to-date `make` does not increment it; `make -B`
-does because it explicitly forces a rebuild. The ignored build state is tied
-to Git `HEAD`, so the first build after a commit resets to `.001`. The base is
-taken from the latest version tag; for example, builds after `v1.7` are
-`1.701`, `1.702`, and so on. This build revision is intentionally independent
-of commit identifiers.
+The manually maintained `REVISION` file supplies the revision printed at
+startup. Change its value explicitly in increments of 0.001; Make treats the
+file as an input and rebuilds the revision object without modifying it. For
+example, development builds following version 1.9 can be numbered `1.901`,
+`1.902`, and so on. This revision is intentionally independent of commit
+identifiers.
 
 `-j` enables page-partitioned POSIX-thread backtracking. The accepted range is
 1 through 256. Initialization, bitmap/frontier retrograde propagation,
@@ -262,11 +268,11 @@ Within each piece count, generation order places the larger material side on
 White and enumerates White kings descending, then Black kings descending. This
 matches the GWD job order and ensures promotions target earlier databases.
 
-With the generator's 1024-byte page size, the writable database uses a 256 MiB
+With the generator's 1024-byte page size, the writable database uses a 1 GiB
 uncompressed page cache. Every previously generated database opened for
-read-only dependency lookups uses a 16 MiB cache. These capacities exclude the
-page dictionaries and cache metadata. The final read-only consistency check
-uses a separate 256 MiB cache budget divided across its workers, so increasing
+read-only dependency lookups uses a 64 MiB cache per worker. These capacities
+exclude the page dictionaries and cache metadata. The final read-only consistency check
+uses a separate 1 GiB cache budget divided across its workers, so increasing
 verification locality does not multiply the dependency-cache allocation.
 
 During threaded backtracking each worker owns a contiguous range of complete

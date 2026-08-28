@@ -1,7 +1,17 @@
 #include "bitmap.h"
 
-#include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+#define CHECK(condition)                                                   \
+    do {                                                                   \
+        if (!(condition)) {                                                \
+            fprintf(stderr, "bitmap test failed at line %d: %s\n",       \
+                    __LINE__, #condition);                                 \
+            bitmap_destroy(&bitmap);                                       \
+            return EXIT_FAILURE;                                           \
+        }                                                                  \
+    } while (0)
 
 int main(void)
 {
@@ -10,35 +20,35 @@ int main(void)
     uint64_t found;
     uint64_t first = 0;
     size_t i;
-    assert(bitmap_create(&bitmap, 300));
+    CHECK(bitmap_create(&bitmap, 300));
     for (i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i)
         bitmap_set(&bitmap, expected[i]);
     for (i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
-        assert(bitmap_find_next(&bitmap, first, &found));
-        assert(found == expected[i]);
-        assert(bitmap_test(&bitmap, found));
+        CHECK(bitmap_find_next(&bitmap, first, &found));
+        CHECK(found == expected[i]);
+        CHECK(bitmap_test(&bitmap, found));
         first = found + 1;
     }
-    assert(!bitmap_find_next(&bitmap, first, &found));
+    CHECK(!bitmap_find_next(&bitmap, first, &found));
 
     bitmap_clear_range(&bitmap, 64, 256);
-    assert(bitmap_test(&bitmap, 0));
-    assert(bitmap_test(&bitmap, 63));
-    assert(!bitmap_test(&bitmap, 64));
-    assert(!bitmap_test(&bitmap, 127));
-    assert(!bitmap_test(&bitmap, 255));
-    assert(bitmap_test(&bitmap, 256));
-    assert(bitmap_test(&bitmap, 299));
+    CHECK(bitmap_test(&bitmap, 0));
+    CHECK(bitmap_test(&bitmap, 63));
+    CHECK(!bitmap_test(&bitmap, 64));
+    CHECK(!bitmap_test(&bitmap, 127));
+    CHECK(!bitmap_test(&bitmap, 255));
+    CHECK(bitmap_test(&bitmap, 256));
+    CHECK(bitmap_test(&bitmap, 299));
     bitmap_set_atomic(&bitmap, 42);
-    assert(bitmap_test(&bitmap, 42));
+    CHECK(bitmap_test(&bitmap, 42));
     bitmap_clear_range(&bitmap, 63, 257);
-    assert(bitmap_test(&bitmap, 0));
-    assert(!bitmap_test(&bitmap, 63));
-    assert(!bitmap_test(&bitmap, 256));
-    assert(bitmap_test(&bitmap, 42));
-    assert(bitmap_test(&bitmap, 299));
+    CHECK(bitmap_test(&bitmap, 0));
+    CHECK(!bitmap_test(&bitmap, 63));
+    CHECK(!bitmap_test(&bitmap, 256));
+    CHECK(bitmap_test(&bitmap, 42));
+    CHECK(bitmap_test(&bitmap, 299));
     bitmap_clear(&bitmap);
-    assert(!bitmap_find_next(&bitmap, 0, &found));
+    CHECK(!bitmap_find_next(&bitmap, 0, &found));
     bitmap_destroy(&bitmap);
     puts("bitmap tests passed");
     return 0;

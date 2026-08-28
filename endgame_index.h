@@ -17,8 +17,10 @@ typedef struct {
     unsigned white_kings;
     unsigned black_kings;
     uint64_t *ways;
+    uint64_t *rank_add;
     unsigned char *overflow;
     uint64_t piece_stride[4];
+    uint64_t square_base[50];
     uint64_t square_stride;
     uint64_t position_count;
     uint64_t table_size;

@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__BMI2__) && (defined(__x86_64__) || defined(_M_X64))
@@ -25,21 +26,27 @@ enum {
 };
 
 typedef struct {
+    DraughtsMove *moves;
+    DraughtsMove *allocated;
+    size_t count;
+    size_t capacity;
+} CaptureBuffer;
+
+typedef struct {
     const DraughtsPosition *position;
     EgtbSide side;
     uint64_t opponents;
     uint64_t fixed_occupied;
     uint8_t start;
     unsigned maximum;
-    DraughtsMoveVisitor visitor;
-    void *visitor_context;
-    size_t emitted;
-    bool emitting;
+    CaptureBuffer *buffer;
     bool ok;
 } CaptureSearch;
 
 static uint8_t next_square[50][DIRECTION_COUNT];
 static uint8_t jump_square[50][DIRECTION_COUNT];
+static uint64_t ray_mask[50][DIRECTION_COUNT];
+static uint64_t between_mask[50][50];
 static atomic_uint geometry_state;
 static char last_error[256];
 
@@ -50,6 +57,46 @@ static bool fail(const char *format, ...)
     vsnprintf(last_error, sizeof(last_error), format, arguments);
     va_end(arguments);
     return false;
+}
+
+static bool record_capture(CaptureBuffer *buffer, unsigned *maximum,
+                           const DraughtsMove *move)
+{
+    if (move->capture_count < *maximum)
+        return true;
+    if (move->capture_count > *maximum) {
+        *maximum = move->capture_count;
+        buffer->count = 0;
+    }
+    if (buffer->count == buffer->capacity) {
+        size_t capacity = buffer->capacity * 2;
+        DraughtsMove *moves;
+        if (capacity < buffer->capacity ||
+            capacity > SIZE_MAX / sizeof(*moves))
+            return fail("too many maximum capture moves");
+        moves = malloc(capacity * sizeof(*moves));
+        if (moves == NULL)
+            return fail("cannot grow maximum capture move buffer");
+        memcpy(moves, buffer->moves, buffer->count * sizeof(*moves));
+        free(buffer->allocated);
+        buffer->allocated = moves;
+        buffer->moves = moves;
+        buffer->capacity = capacity;
+    }
+    buffer->moves[buffer->count++] = *move;
+    return true;
+}
+
+static bool visit_captures(const CaptureBuffer *buffer,
+                           DraughtsMoveVisitor visitor, void *context)
+{
+    size_t index;
+    if (visitor == NULL)
+        return true;
+    for (index = 0; index < buffer->count; ++index)
+        if (!visitor(&buffer->moves[index], context))
+            return fail("move visitor rejected a generated capture");
+    return true;
 }
 
 const char *draughts_movegen_last_error(void)
@@ -92,6 +139,18 @@ static void initialize_geometry(void)
                 next < 0 ? INVALID_SQUARE : (uint8_t)next;
             jump_square[square][direction] =
                 jump < 0 ? INVALID_SQUARE : (uint8_t)jump;
+        }
+    }
+    for (square = 0; square < 50; ++square) {
+        for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
+            uint8_t scan = next_square[square][direction];
+            uint64_t between = 0;
+            while (scan != INVALID_SQUARE) {
+                between_mask[square][scan] = between;
+                ray_mask[square][direction] |= BIT(scan);
+                between |= BIT(scan);
+                scan = next_square[scan][direction];
+            }
         }
     }
     atomic_store_explicit(&geometry_state, 2, memory_order_release);
@@ -162,6 +221,30 @@ static unsigned first_square(uint64_t value)
 #endif
 }
 
+static unsigned last_square(uint64_t value)
+{
+#if defined(__GNUC__) || defined(__clang__)
+    return 63U - (unsigned)__builtin_clzll(value);
+#else
+    unsigned square = 0;
+    while (value >>= 1)
+        ++square;
+    return square;
+#endif
+}
+
+static unsigned nearest_square(uint64_t squares, unsigned direction)
+{
+    return direction < DIR_SW ? last_square(squares) : first_square(squares);
+}
+
+static unsigned take_nearest_square(uint64_t *squares, unsigned direction)
+{
+    unsigned square = nearest_square(*squares, direction);
+    *squares &= ~BIT(square);
+    return square;
+}
+
 bool draughts_position_is_valid(const DraughtsPosition *position)
 {
     uint64_t all;
@@ -184,24 +267,12 @@ static bool emit_move(CaptureSearch *search, uint8_t current,
                       uint64_t captured, unsigned count)
 {
     DraughtsMove move;
-    if (!search->emitting) {
-        if (count > search->maximum)
-            search->maximum = count;
-        return true;
-    }
-    if (count != search->maximum)
-        return true;
     move.from = search->start;
     move.to = current;
     move.captured = captured;
     move.capture_count = (uint8_t)count;
-    if (search->visitor != NULL &&
-        !search->visitor(&move, search->visitor_context)) {
-        search->ok = fail("move visitor rejected a generated capture");
-        return false;
-    }
-    ++search->emitted;
-    return true;
+    search->ok = record_capture(search->buffer, &search->maximum, &move);
+    return search->ok;
 }
 
 static void search_man_captures(CaptureSearch *search, uint8_t current,
@@ -235,22 +306,28 @@ static void search_king_captures(CaptureSearch *search, uint8_t current,
     unsigned direction;
     for (direction = 0; direction < DIRECTION_COUNT && search->ok;
          ++direction) {
-        uint8_t victim = next_square[current][direction];
-        uint8_t landing;
-        while (victim != INVALID_SQUARE &&
-               (current_occupied & BIT(victim)) == 0)
-            victim = next_square[victim][direction];
-        if (victim == INVALID_SQUARE ||
-            (search->opponents & BIT(victim)) == 0 ||
+        uint64_t blockers = ray_mask[current][direction] & current_occupied;
+        uint64_t landings;
+        unsigned victim, blocker;
+        if (blockers == 0)
+            continue;
+        victim = nearest_square(blockers, direction);
+        if ((search->opponents & BIT(victim)) == 0 ||
             (captured & BIT(victim)) != 0)
             continue;
-        landing = next_square[victim][direction];
-        while (landing != INVALID_SQUARE &&
-               (current_occupied & BIT(landing)) == 0) {
+        blockers = ray_mask[victim][direction] & current_occupied;
+        if (blockers == 0)
+            landings = ray_mask[victim][direction];
+        else {
+            blocker = nearest_square(blockers, direction);
+            landings = between_mask[victim][blocker];
+        }
+        while (landings != 0) {
+            unsigned landing = take_nearest_square(&landings, direction);
             found = true;
-            search_king_captures(search, landing, captured | BIT(victim),
+            search_king_captures(search, (uint8_t)landing,
+                                 captured | BIT(victim),
                                  count + 1);
-            landing = next_square[landing][direction];
         }
     }
     if (!found && count != 0)
@@ -299,11 +376,12 @@ static bool king_has_capture(uint8_t square, uint64_t opponents,
 {
     unsigned direction;
     for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
-        uint8_t scan = next_square[square][direction];
-        while (scan != INVALID_SQUARE && (all & BIT(scan)) == 0)
-            scan = next_square[scan][direction];
-        if (scan != INVALID_SQUARE && (opponents & BIT(scan)) != 0) {
+        uint64_t blockers = ray_mask[square][direction] & all;
+        if (blockers != 0) {
+            unsigned scan = nearest_square(blockers, direction);
             uint8_t landing = next_square[scan][direction];
+            if ((opponents & BIT(scan)) == 0)
+                continue;
             if (landing != INVALID_SQUARE && (all & BIT(landing)) == 0)
                 return true;
         }
@@ -381,12 +459,17 @@ static bool generate_quiet_moves(const DraughtsPosition *position,
         unsigned direction;
         kings &= kings - 1;
         for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
-            uint8_t target = next_square[square][direction];
-            while (target != INVALID_SQUARE && (all & BIT(target)) == 0) {
-                if (!visit_quiet_move((uint8_t)square, target, visitor,
+            uint64_t blockers = ray_mask[square][direction] & all;
+            uint64_t targets = ray_mask[square][direction];
+            if (blockers != 0) {
+                unsigned blocker = nearest_square(blockers, direction);
+                targets = between_mask[square][blocker];
+            }
+            while (targets != 0) {
+                unsigned target = take_nearest_square(&targets, direction);
+                if (!visit_quiet_move((uint8_t)square, (uint8_t)target, visitor,
                                       context, count))
                     return false;
-                target = next_square[target][direction];
             }
         }
     }
@@ -397,6 +480,8 @@ bool draughts_generate_moves(const DraughtsPosition *position, EgtbSide side,
                              DraughtsMoveVisitor visitor, void *context,
                              size_t *move_count)
 {
+    DraughtsMove stack_moves[256];
+    CaptureBuffer buffer = {stack_moves, NULL, 0, 256};
     CaptureSearch search;
     size_t quiet_count = 0;
     initialize_geometry();
@@ -411,21 +496,24 @@ bool draughts_generate_moves(const DraughtsPosition *position, EgtbSide side,
     search.position = position;
     search.side = side;
     search.opponents = opponent_pieces(position, side);
+    search.buffer = &buffer;
     search.ok = true;
     search_all_captures(position, side, &search);
-    if (!search.ok)
+    if (!search.ok) {
+        free(buffer.allocated);
         return false;
+    }
     if (search.maximum != 0) {
-        search.emitting = true;
-        search.visitor = visitor;
-        search.visitor_context = context;
-        search_all_captures(position, side, &search);
-        if (!search.ok)
+        if (!visit_captures(&buffer, visitor, context)) {
+            free(buffer.allocated);
             return false;
+        }
         if (move_count != NULL)
-            *move_count = search.emitted;
+            *move_count = buffer.count;
+        free(buffer.allocated);
         return true;
     }
+    free(buffer.allocated);
     if (!generate_quiet_moves(position, side, visitor, context, &quiet_count))
         return false;
     if (move_count != NULL)
@@ -637,10 +725,7 @@ typedef struct {
     uint64_t fixed_occupied;
     uint64_t start;
     unsigned maximum;
-    DraughtsMoveVisitor visitor;
-    void *visitor_context;
-    size_t emitted;
-    bool emitting;
+    CaptureBuffer *buffer;
     bool ok;
 } PaddedCaptureSearch;
 
@@ -668,6 +753,64 @@ static inline unsigned padded_square_from_field(unsigned field)
 static inline unsigned padded_square_from_bit(uint64_t bit)
 {
     return padded_square_from_field(first_square(bit));
+}
+
+static uint64_t padded_ray_mask[64][DIRECTION_COUNT];
+static uint64_t padded_between_mask[64][64];
+static atomic_uint padded_geometry_state;
+
+static void initialize_padded_geometry(void)
+{
+    unsigned square, direction;
+    unsigned expected = 0;
+    if (atomic_load_explicit(&padded_geometry_state,
+                             memory_order_acquire) == 2)
+        return;
+    if (!atomic_compare_exchange_strong_explicit(
+            &padded_geometry_state, &expected, 1, memory_order_acq_rel,
+            memory_order_acquire)) {
+        while (atomic_load_explicit(&padded_geometry_state,
+                                    memory_order_acquire) != 2)
+            ;
+        return;
+    }
+    for (square = 0; square < 50; ++square) {
+        unsigned field = padded_field_from_square(square);
+        uint64_t start = BIT(field);
+        for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
+            uint64_t scan = padded_step(start, direction);
+            uint64_t between = 0;
+            while (scan != 0) {
+                unsigned scan_field = first_square(scan);
+                padded_between_mask[field][scan_field] = between;
+                padded_ray_mask[field][direction] |= scan;
+                between |= scan;
+                scan = padded_step(scan, direction);
+            }
+        }
+    }
+    atomic_store_explicit(&padded_geometry_state, 2, memory_order_release);
+}
+
+static inline uint64_t padded_ray(uint64_t square, unsigned direction)
+{
+    return padded_ray_mask[first_square(square)][direction];
+}
+
+static inline uint64_t padded_nearest_bit(uint64_t bits,
+                                          unsigned direction)
+{
+    unsigned field = direction < DIR_SW ? last_square(bits) :
+                                           first_square(bits);
+    return BIT(field);
+}
+
+static inline uint64_t padded_take_nearest_bit(uint64_t *bits,
+                                               unsigned direction)
+{
+    uint64_t bit = padded_nearest_bit(*bits, direction);
+    *bits &= ~bit;
+    return bit;
 }
 
 static uint64_t compact_to_padded(uint64_t compact)
@@ -705,6 +848,7 @@ static PaddedPosition make_padded_position(
     const DraughtsPosition *position)
 {
     PaddedPosition padded;
+    initialize_padded_geometry();
     padded.white_men = compact_to_padded(position->white_men);
     padded.black_men = compact_to_padded(position->black_men);
     padded.white_kings = compact_to_padded(position->white_kings);
@@ -745,25 +889,12 @@ static bool padded_emit_capture(PaddedCaptureSearch *search,
                                 unsigned count)
 {
     DraughtsMove move;
-    if (!search->emitting) {
-        if (count > search->maximum)
-            search->maximum = count;
-        return true;
-    }
-    if (count != search->maximum)
-        return true;
-    if (search->visitor != NULL) {
-        move.from = (uint8_t)padded_square_from_bit(search->start);
-        move.to = (uint8_t)padded_square_from_bit(current);
-        move.captured = padded_to_compact(captured);
-        move.capture_count = (uint8_t)count;
-        if (!search->visitor(&move, search->visitor_context)) {
-            search->ok = fail("move visitor rejected a padded capture");
-            return false;
-        }
-    }
-    ++search->emitted;
-    return true;
+    move.from = (uint8_t)padded_square_from_bit(search->start);
+    move.to = (uint8_t)padded_square_from_bit(current);
+    move.captured = padded_to_compact(captured);
+    move.capture_count = (uint8_t)count;
+    search->ok = record_capture(search->buffer, &search->maximum, &move);
+    return search->ok;
 }
 
 static void padded_search_man_captures(PaddedCaptureSearch *search,
@@ -797,18 +928,26 @@ static void padded_search_king_captures(PaddedCaptureSearch *search,
     unsigned direction;
     for (direction = 0; direction < DIRECTION_COUNT && search->ok;
          ++direction) {
-        uint64_t victim = padded_step(current, direction);
-        uint64_t landing;
-        while (victim != 0 && (current_occupied & victim) == 0)
-            victim = padded_step(victim, direction);
+        uint64_t blockers = padded_ray(current, direction) & current_occupied;
+        uint64_t victim, landings;
+        if (blockers == 0)
+            continue;
+        victim = padded_nearest_bit(blockers, direction);
         if ((victim & search->opponents & ~captured) == 0)
             continue;
-        landing = padded_step(victim, direction);
-        while (landing != 0 && (current_occupied & landing) == 0) {
+        blockers = padded_ray(victim, direction) & current_occupied;
+        if (blockers == 0)
+            landings = padded_ray(victim, direction);
+        else {
+            uint64_t blocker = padded_nearest_bit(blockers, direction);
+            landings = padded_between_mask[first_square(victim)]
+                                           [first_square(blocker)];
+        }
+        while (landings != 0) {
+            uint64_t landing = padded_take_nearest_bit(&landings, direction);
             found = true;
             padded_search_king_captures(search, landing,
                                         captured | victim, count + 1);
-            landing = padded_step(landing, direction);
         }
     }
     if (!found && count != 0)
@@ -843,11 +982,12 @@ static bool padded_king_has_capture(uint64_t king, uint64_t opponents,
 {
     unsigned direction;
     for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
-        uint64_t scan = padded_step(king, direction);
-        while (scan != 0 && (all & scan) == 0)
-            scan = padded_step(scan, direction);
-        if ((scan & opponents) != 0) {
+        uint64_t blockers = padded_ray(king, direction) & all;
+        if (blockers != 0) {
+            uint64_t scan = padded_nearest_bit(blockers, direction);
             uint64_t landing = padded_step(scan, direction);
+            if ((scan & opponents) == 0)
+                continue;
             if (landing != 0 && (all & landing) == 0)
                 return true;
         }
@@ -941,12 +1081,19 @@ static bool padded_generate_quiet_moves(const PaddedPosition *position,
         uint64_t king = kings & (UINT64_C(0) - kings);
         kings &= kings - 1;
         for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
-            uint64_t target = padded_step(king, direction);
-            while (target != 0 && (all & target) == 0) {
+            uint64_t blockers = padded_ray(king, direction) & all;
+            uint64_t targets = padded_ray(king, direction);
+            if (blockers != 0) {
+                uint64_t blocker = padded_nearest_bit(blockers, direction);
+                targets = padded_between_mask[first_square(king)]
+                                             [first_square(blocker)];
+            }
+            while (targets != 0) {
+                uint64_t target =
+                    padded_take_nearest_bit(&targets, direction);
                 if (!padded_visit_quiet_move(king, target, visitor, context,
                                              count))
                     return false;
-                target = padded_step(target, direction);
             }
         }
     }
@@ -957,6 +1104,8 @@ bool draughts_generate_moves_padded(
     const DraughtsPosition *position, EgtbSide side,
     DraughtsMoveVisitor visitor, void *context, size_t *move_count)
 {
+    DraughtsMove stack_moves[256];
+    CaptureBuffer buffer = {stack_moves, NULL, 0, 256};
     PaddedPosition padded;
     PaddedCaptureSearch search;
     size_t quiet_count = 0;
@@ -970,21 +1119,24 @@ bool draughts_generate_moves_padded(
     padded = make_padded_position(position);
     memset(&search, 0, sizeof(search));
     search.opponents = padded_opponents(&padded, side);
+    search.buffer = &buffer;
     search.ok = true;
     padded_search_all_captures(&padded, side, &search);
-    if (!search.ok)
+    if (!search.ok) {
+        free(buffer.allocated);
         return false;
+    }
     if (search.maximum != 0) {
-        search.emitting = true;
-        search.visitor = visitor;
-        search.visitor_context = context;
-        padded_search_all_captures(&padded, side, &search);
-        if (!search.ok)
+        if (!visit_captures(&buffer, visitor, context)) {
+            free(buffer.allocated);
             return false;
+        }
         if (move_count != NULL)
-            *move_count = search.emitted;
+            *move_count = buffer.count;
+        free(buffer.allocated);
         return true;
     }
+    free(buffer.allocated);
     if (!padded_generate_quiet_moves(&padded, side, visitor, context,
                                      &quiet_count))
         return false;
@@ -1064,8 +1216,15 @@ static bool padded_generate_piece_predecessors(
     }
 
     for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
-        uint64_t from = padded_step(to, direction);
-        while (from != 0 && (all_without_to & from) == 0) {
+        uint64_t blockers = padded_ray(to, direction) & all_without_to;
+        uint64_t sources = padded_ray(to, direction);
+        if (blockers != 0) {
+            uint64_t blocker = padded_nearest_bit(blockers, direction);
+            sources = padded_between_mask[first_square(to)]
+                                         [first_square(blocker)];
+        }
+        while (sources != 0) {
+            uint64_t from = padded_take_nearest_bit(&sources, direction);
             PaddedPosition predecessor = *padded;
             uint64_t *kings =
                 mover == EGTB_WHITE_TO_MOVE ? &predecessor.white_kings :
@@ -1076,7 +1235,6 @@ static bool padded_generate_piece_predecessors(
                                          true, from, to, visitor, context,
                                          count))
                 return false;
-            from = padded_step(from, direction);
         }
     }
     return true;

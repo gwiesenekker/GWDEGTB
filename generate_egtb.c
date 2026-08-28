@@ -14,11 +14,14 @@
 
 enum {
     GENERATION_PAGE_SIZE = 1024,
-    GENERATION_CACHE_BYTES = 256 * 1024 * 1024,
+    GENERATION_CACHE_BYTES = 1024 * 1024 * 1024,
     READONLY_CACHE_BYTES = 16 * 1024 * 1024,
-    FINAL_VERIFICATION_CACHE_BYTES = 256 * 1024 * 1024,
+    DEPENDENCY_CACHE_BYTES = 64 * 1024 * 1024,
+    FINAL_VERIFICATION_CACHE_BYTES = 1024 * 1024 * 1024,
     GENERATION_CACHE_PAGES = GENERATION_CACHE_BYTES / GENERATION_PAGE_SIZE,
     READONLY_CACHE_PAGES = READONLY_CACHE_BYTES / GENERATION_PAGE_SIZE,
+    DEPENDENCY_CACHE_PAGES =
+        DEPENDENCY_CACHE_BYTES / GENERATION_PAGE_SIZE,
     FINAL_VERIFICATION_CACHE_PAGES =
         FINAL_VERIFICATION_CACHE_BYTES / GENERATION_PAGE_SIZE
 };
@@ -357,7 +360,7 @@ int main(int argc, char **argv)
         goto done;
     }
     for (unsigned worker = 0; worker < thread_count; ++worker) {
-        initialize_catalog(&catalogs[worker], READONLY_CACHE_PAGES);
+        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_PAGES);
         probe_contexts[worker] = &catalogs[worker];
     }
     if (!egtb_create(&database, path, positions - 1,
@@ -366,9 +369,11 @@ int main(int argc, char **argv)
         goto done;
     }
     created = true;
-    printf("generating %s with %u thread%s, %zu writable-cache pages total\n",
+    printf("generating %s with %u thread%s, %u MiB writable cache total, "
+           "%u MiB dependency cache per worker/database\n",
            path, thread_count, thread_count == 1 ? "" : "s",
-           (size_t)GENERATION_CACHE_PAGES);
+           GENERATION_CACHE_BYTES / (1024 * 1024),
+           DEPENDENCY_CACHE_BYTES / (1024 * 1024));
     fflush(stdout);
     generation_started = wall_seconds();
     setup_seconds = generation_started - program_started;
@@ -419,7 +424,7 @@ int main(int argc, char **argv)
     compact_seconds = wall_seconds() - phase_started;
     phase_started = wall_seconds();
     for (unsigned worker = 0; worker < thread_count; ++worker) {
-        initialize_catalog(&catalogs[worker], READONLY_CACHE_PAGES);
+        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_PAGES);
         probe_contexts[worker] = &catalogs[worker];
     }
     {

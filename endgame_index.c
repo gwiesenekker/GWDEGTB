@@ -49,7 +49,7 @@ bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
                      unsigned wk, unsigned bk)
 {
     uint64_t states;
-    unsigned square, a, b, c, d;
+    unsigned square, a, b, c, d, piece_index;
 
     if (e == NULL)
         return false;
@@ -79,12 +79,14 @@ bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
     MULTIPLY_DIM(wk);
     MULTIPLY_DIM(bk);
 #undef MULTIPLY_DIM
-    if (states > SIZE_MAX / sizeof(*e->ways))
+    if (states > SIZE_MAX / sizeof(*e->ways) ||
+        states > SIZE_MAX / (4 * sizeof(*e->rank_add)))
         return false;
 
     e->ways = calloc((size_t)states, sizeof(*e->ways));
+    e->rank_add = calloc((size_t)states * 4, sizeof(*e->rank_add));
     e->overflow = calloc((size_t)states, sizeof(*e->overflow));
-    if (e->ways == NULL || e->overflow == NULL) {
+    if (e->ways == NULL || e->rank_add == NULL || e->overflow == NULL) {
         eg_indexer_destroy(e);
         return false;
     }
@@ -128,6 +130,34 @@ bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
         }
         e->position_count = e->ways[root];
     }
+
+    for (square = 0; square < 50; ++square) {
+        e->square_base[square] =
+            ((uint64_t)square + 1) * e->square_stride;
+        for (a = 0; a <= wm; ++a)
+        for (b = 0; b <= bm; ++b)
+        for (c = 0; c <= wk; ++c)
+        for (d = 0; d <= bk; ++d) {
+            uint64_t state = table_index(e, square + 1, a, b, c, d);
+            uint64_t rank = e->ways[state];
+
+            for (piece_index = 0; piece_index < 4; ++piece_index) {
+                if (piece_index == 1 && square >= 5 && a != 0) {
+                    uint64_t add = e->ways[state - e->piece_stride[0]];
+                    rank = UINT64_MAX - rank < add ? UINT64_MAX : rank + add;
+                }
+                if (piece_index == 2 && square <= 44 && b != 0) {
+                    uint64_t add = e->ways[state - e->piece_stride[1]];
+                    rank = UINT64_MAX - rank < add ? UINT64_MAX : rank + add;
+                }
+                if (piece_index == 3 && c != 0) {
+                    uint64_t add = e->ways[state - e->piece_stride[2]];
+                    rank = UINT64_MAX - rank < add ? UINT64_MAX : rank + add;
+                }
+                e->rank_add[state * 4 + piece_index] = rank;
+            }
+        }
+    }
     return true;
 }
 
@@ -136,6 +166,7 @@ void eg_indexer_destroy(EgIndexer *e)
     if (e == NULL)
         return;
     free(e->ways);
+    free(e->rank_add);
     free(e->overflow);
     memset(e, 0, sizeof(*e));
 }
@@ -148,15 +179,6 @@ uint64_t eg_position_count(const EgIndexer *e)
 uint64_t eg_max_index(const EgIndexer *e)
 {
     return e == NULL || e->position_count == 0 ? 0 : e->position_count - 1;
-}
-
-static inline enum Piece piece_at(const EgPosition *p, uint64_t bit)
-{
-    if (p->white_men & bit)   return WHITE_MAN;
-    if (p->black_men & bit)   return BLACK_MAN;
-    if (p->white_kings & bit) return WHITE_KING;
-    if (p->black_kings & bit) return BLACK_KING;
-    return EMPTY;
 }
 
 #ifndef NDEBUG
@@ -185,48 +207,37 @@ static bool valid_position(const EgIndexer *e, const EgPosition *p)
 bool eg_position_to_index(const EgIndexer *e, const EgPosition *position,
                           uint64_t *index)
 {
-    unsigned rem[4];
     uint64_t rank = 0;
-    uint64_t state;
+    uint64_t remaining_state;
     uint64_t occupied;
-    unsigned previous_square = 0;
+    uint64_t black;
+    uint64_t kings;
 
 #ifndef NDEBUG
-    if (e == NULL || e->ways == NULL || index == NULL || position == NULL ||
+    if (e == NULL || e->ways == NULL || e->rank_add == NULL ||
+        index == NULL || position == NULL ||
         !valid_position(e, position))
         return false;
 #endif
-    rem[0] = e->white_men;
-    rem[1] = e->black_men;
-    rem[2] = e->white_kings;
-    rem[3] = e->black_kings;
-    state = e->square_stride +
-            (uint64_t)rem[0] * e->piece_stride[0] +
-            (uint64_t)rem[1] * e->piece_stride[1] +
-            (uint64_t)rem[2] * e->piece_stride[2] + rem[3];
+    remaining_state =
+        (uint64_t)e->white_men * e->piece_stride[0] +
+        (uint64_t)e->black_men * e->piece_stride[1] +
+        (uint64_t)e->white_kings * e->piece_stride[2] + e->black_kings;
     occupied = position->white_men | position->black_men |
                position->white_kings | position->black_kings;
+    black = position->black_men | position->black_kings;
+    kings = position->white_kings | position->black_kings;
 
     while (occupied != 0) {
         uint64_t bit = occupied & (UINT64_C(0) - occupied);
         unsigned square = (unsigned)__builtin_ctzll(occupied);
-        enum Piece actual = piece_at(position, bit);
-        unsigned piece_index;
+        unsigned piece_index =
+            (unsigned)((black & bit) != 0) |
+            ((unsigned)((kings & bit) != 0) << 1);
+        uint64_t state = e->square_base[square] + remaining_state;
 
-        state += (uint64_t)(square - previous_square) * e->square_stride;
-        if (actual != EMPTY)
-            rank += e->ways[state];
-        if (actual > WHITE_MAN && square >= 5 && rem[0] != 0)
-            rank += e->ways[state - e->piece_stride[0]];
-        if (actual > BLACK_MAN && square <= 44 && rem[1] != 0)
-            rank += e->ways[state - e->piece_stride[1]];
-        if (actual > WHITE_KING && rem[2] != 0)
-            rank += e->ways[state - e->piece_stride[2]];
-
-        piece_index = (unsigned)actual - 1;
-        --rem[piece_index];
-        state -= e->piece_stride[piece_index];
-        previous_square = square;
+        rank += e->rank_add[state * 4 + piece_index];
+        remaining_state -= e->piece_stride[piece_index];
         occupied &= occupied - 1;
     }
     *index = rank;
