@@ -49,7 +49,7 @@ static bool test_material(const Material *material)
     for (sample = 0; sample < samples; ++sample) {
         uint64_t legacy_index =
             (uint64_t)(((__uint128_t)sample * positions) / samples);
-        uint64_t combinatorial_index, reranked;
+        uint64_t combinatorial_index = 0, reranked;
         EgPosition position, decoded;
         if (!eg_index_to_position(&legacy, legacy_index, &position) ||
             !comb_position_to_index(&combinatorial, &position,

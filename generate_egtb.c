@@ -338,7 +338,7 @@ int main(int argc, char **argv)
         printf("GWDEGTB revision %s\n", gwdegtb_revision);
         return EXIT_SUCCESS;
     }
-    printf("GWDEGTB revision %s\n", gwdegtb_revision);
+    printf("GWDEGTB revision %s starting\n", gwdegtb_revision);
     if (!configuration_bytes("EGTB_RESIDENT_LIMIT_GIB",
                              DEFAULT_RESIDENT_LIMIT_BYTES, true,
                              &resident_limit_bytes) ||
@@ -634,5 +634,7 @@ done:
     free(histogram);
     if (!ok && created)
         unlink(path);
+    printf("GWDEGTB revision %s %s\n", gwdegtb_revision,
+           ok ? "completed" : "failed");
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

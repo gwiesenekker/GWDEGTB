@@ -28,7 +28,8 @@ regression and performance tests.
 
 The code targets a POSIX system and requires a C11 compiler, POSIX threads, and
 the Zstandard development library. On Debian or Ubuntu the required package is
-`libzstd-dev`.
+`libzstd-dev`. The Makefile defaults to Clang when `CC` has not been selected;
+use `make CC=gcc ...` to override it.
 
 The default production build is optimized for the local processor:
 
@@ -60,6 +61,9 @@ Run the complete regression suite and verify all known seven-piece counts:
 make test
 make check-stats
 ```
+
+`make libgwdegtb.a` builds the static library used by GWD. Link it with Zstd
+and POSIX threads, for example `-L/path/to/GWDEGTB -lgwdegtb -lzstd -pthread`.
 
 The manually maintained `REVISION` file supplies the revision printed at
 startup. It is independent of Git tags and commit identifiers:
@@ -374,11 +378,12 @@ writes, storage ratios, and wall-clock time for each major phase.
 The following run used revision 2.101, 16 threads, and the optimized native
 build on the Ryzen 9 5950X described above. Individual correction records,
 repetitive cache tables, and the BTM frequency table are omitted here; WTM and
-BTM distributions were identical.
+BTM distributions were identical. The lifecycle labels below show the current
+revision 2.102 output format.
 
 ```text
 $ ./generate_egtb -j 16 1 1 1 1
-GWDEGTB revision 2.101
+GWDEGTB revision 2.102 starting
 generating 1wX-1wO-1bX-1bO.dtm with 16 threads, 1024 MiB writable cache total, 64 MiB dependency cache per worker/database
 generated 1wX-1wO-1bX-1bO.dtm: material=1 1 1 1 positions=4478160 maximum-index=4478159 passes=19 maximum-dtm=19 threads=16
 self-consistency: passes=2 updates=277/277
@@ -423,6 +428,7 @@ wall-clock timings:
   final verification                0.008 s
   statistics extraction             0.001 s
   total                             1.637 s
+GWDEGTB revision 2.102 completed
 ```
 
 The `positions-checked` and `positions-skipped` totals count WTM and BTM
@@ -439,6 +445,59 @@ corresponding `.dtm`, compiles the complete WDL bitmap in memory, collects WTM
 and BTM statistics, compresses and checksums the pages, atomically installs the
 file, and opens it read-only. Its deliberately simple cache maps page N to
 `N % cache_pages` and stores only the page number and uncompressed bytes.
+
+### Resident WDL API for GWD
+
+`gwdegtb.h` provides a process-wide registry of fully decompressed WDL
+bitmaps. GWD first passes a basename directly from its configuration to obtain
+the dense maximum index and exact allocation size:
+
+```c
+uint64_t maximum_index;
+size_t bytes;
+
+if (!gwdegtb_wdl_info("1wX-0wO-0bX-1bO",
+                      &maximum_index, &bytes)) {
+    fprintf(stderr, "%s\n", gwdegtb_last_error());
+}
+```
+
+The number of positions is `maximum_index + 1`; packed WDL storage requires
+`(positions + 1) / 2` bytes. GWD allocates those bytes, then asks GWDEGTB to
+decompress directly into the allocation:
+
+```c
+void *bitmap = malloc(bytes);
+
+if (!gwdegtb_wdl_decompress(egtb_directory,
+                            "1wX-0wO-0bX-1bO",
+                            bitmap, bytes)) {
+    fprintf(stderr, "%s\n", gwdegtb_last_error());
+}
+
+if (!gwdegtb_wdl_attach("1wX-0wO-0bX-1bO", bitmap, bytes)) {
+    fprintf(stderr, "%s\n", gwdegtb_last_error());
+}
+```
+
+The optional `.wdl` suffix is accepted. GWD owns the allocation. A mirrored
+basename resolves to its canonical database automatically.
+
+For OpenMPI, GWD obtains `bytes`, calls its existing
+`my_mpi_allocate_shared()`, and the master calls
+`gwdegtb_wdl_decompress()` with the shared pointer. After synchronization,
+every rank, including the master, calls `gwdegtb_wdl_attach()` with its
+rank-local shared pointer and byte count.
+Call `gwdegtb_wdl_unload_all()` on every rank before freeing the MPI windows.
+
+`gwdegtb_wdl_lookup()` accepts GWD's four padded bitboards in WK/WM/BK/BM
+order plus side-to-move. It pop-counts the material, uses BMI2 PEXT (or a
+portable set-bit fallback) to map GWD fields to compact squares, applies board
+rotation/color and side-to-move mirroring when required, and performs a direct
+lookup in the packed resident bitmap. It returns `1` for win, `0` for loss,
+`-1` for draw, and `-32768` if the material has not been loaded or the input is
+invalid. Load all configured WDL databases before starting concurrent lookup;
+do not unload them until those lookups have stopped.
 
 ## Storage and move-generation benchmarks
 
@@ -475,8 +534,10 @@ make benchmark-movegen
 | `frontier.c/.h` | Compressed per-worker exact-DTM streams |
 | `egtb.c/.h` | Versioned compressed DTM storage and caches |
 | `wdl.c/.h` | Packed compressed WDL compilation and lookup |
+| `gwdegtb.c/.h` | GWD padded-board resident WDL registry and lookup |
 | `material.c/.h` | Canonical material ordering and mirroring |
 | `generator.c/.h` | Initialization, retrograde analysis, repair, verification |
 | `generate_egtb.c` | Command-line orchestration, dependencies, reporting |
+| `libgwdegtb.a` | Static library target for integration with GWD |
 | `test_*.c`, `check_stats.c` | Regression and reference-count validation |
 | `benchmark_*.c` | Index, cache/storage, and move-generation benchmarks |

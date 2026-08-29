@@ -16,23 +16,37 @@ static unsigned bit_count(uint64_t value)
 #endif
 }
 
+static uint64_t reverse_bits(uint64_t value)
+{
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_bitreverse64)
+    return __builtin_bitreverse64(value);
+#endif
+#endif
+    value = ((value >> 1) & UINT64_C(0x5555555555555555)) |
+            ((value & UINT64_C(0x5555555555555555)) << 1);
+    value = ((value >> 2) & UINT64_C(0x3333333333333333)) |
+            ((value & UINT64_C(0x3333333333333333)) << 2);
+    value = ((value >> 4) & UINT64_C(0x0f0f0f0f0f0f0f0f)) |
+            ((value & UINT64_C(0x0f0f0f0f0f0f0f0f)) << 4);
+#if defined(__GNUC__) || defined(__clang__)
+    return __builtin_bswap64(value);
+#else
+    return ((value & UINT64_C(0x00000000000000ff)) << 56) |
+           ((value & UINT64_C(0x000000000000ff00)) << 40) |
+           ((value & UINT64_C(0x0000000000ff0000)) << 24) |
+           ((value & UINT64_C(0x00000000ff000000)) << 8) |
+           ((value & UINT64_C(0x000000ff00000000)) >> 8) |
+           ((value & UINT64_C(0x0000ff0000000000)) >> 24) |
+           ((value & UINT64_C(0x00ff000000000000)) >> 40) |
+           ((value & UINT64_C(0xff00000000000000)) >> 56);
+#endif
+}
+
 static uint64_t rotate_180(uint64_t value)
 {
-    uint64_t result = 0;
-    while (value != 0) {
-        unsigned square;
-#if defined(__GNUC__) || defined(__clang__)
-        square = (unsigned)__builtin_ctzll(value);
-#else
-        uint64_t bit = value & (~value + 1);
-        square = 0;
-        while ((bit >> square) != 1)
-            ++square;
-#endif
-        result |= UINT64_C(1) << (49 - square);
-        value &= value - 1;
-    }
-    return result;
+    /* Compact squares occupy bits 0..49, so discard 14 reversed guard bits. */
+    return reverse_bits(value) >> 14;
 }
 
 EgtbMaterialKind egtb_material_resolve(const EgtbMaterial *requested,

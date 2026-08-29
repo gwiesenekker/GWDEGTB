@@ -685,6 +685,28 @@ bool wdl_get(Wdl *wdl, uint64_t index, EgtbSide side, WdlResult *result)
     return true;
 }
 
+bool wdl_decompress_into(Wdl *wdl, void *data, size_t size)
+{
+    unsigned char *bitmap = data;
+    WdlCacheEntry entry;
+    uint64_t page;
+
+    if (wdl == NULL || data == NULL || wdl->packed_bytes > SIZE_MAX ||
+        size != (size_t)wdl->packed_bytes)
+        return fail("invalid resident WDL destination");
+    for (page = 0; page < wdl->page_count; ++page) {
+        uint64_t offset = page * WDL_PAGE_SIZE;
+        size_t bytes = WDL_PAGE_SIZE;
+        if (bytes > wdl->packed_bytes - offset)
+            bytes = (size_t)(wdl->packed_bytes - offset);
+        if (!load_page(wdl, page, &entry)) {
+            return false;
+        }
+        memcpy(bitmap + offset, entry.data, bytes);
+    }
+    return true;
+}
+
 uint64_t wdl_maximum_index(const Wdl *wdl)
 {
     return wdl == NULL ? 0 : wdl->maximum_index;
