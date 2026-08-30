@@ -1022,6 +1022,33 @@ bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value)
     return true;
 }
 
+bool egtb_set_pair(Egtb *egtb, uint64_t index,
+                   int16_t white_to_move, int16_t black_to_move)
+{
+    uint64_t page;
+    uint32_t slot;
+    size_t cache_index;
+    CacheEntry *cache_entry;
+    EgtbEntry *entries;
+    EgtbEntry old, replacement;
+    if (egtb == NULL || egtb->readonly || egtb->writable_views != 0 ||
+        index > egtb->maximum_index ||
+        !egtb_encode_dtm(white_to_move, &replacement.white_to_move) ||
+        !egtb_encode_dtm(black_to_move, &replacement.black_to_move))
+        return fail("invalid paired EGTB update");
+    split_entry_index(egtb, index, &page, &slot);
+    if (!cached_page(egtb, page, &cache_index))
+        return false;
+    cache_entry = &egtb->cache.entries[cache_index];
+    entries = cache_data(egtb, cache_index);
+    old = entries[slot];
+    entries[slot] = replacement;
+    cache_entry->checksum ^= slot_checksum(slot, &old) ^
+                             slot_checksum(slot, &replacement);
+    cache_entry->dirty = true;
+    return true;
+}
+
 static EgtbEntry *view_cache_data(EgtbView *view, size_t slot)
 {
     return (EgtbEntry *)(void *)(view->data +

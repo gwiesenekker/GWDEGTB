@@ -123,6 +123,8 @@ static EgtbSide opposite_side(EgtbSide side)
 static unsigned generator_bit_count(uint64_t value);
 static bool has_indexer_material(const EgIndexer *indexer,
                                  const DraughtsPosition *position);
+static bool contains_position(const EgIndexer *indexer,
+                              const DraughtsPosition *position);
 static bool valid_dtm(int16_t value);
 
 static bool examine_successor(const DraughtsMove *move, void *opaque)
@@ -141,7 +143,7 @@ static bool examine_successor(const DraughtsMove *move, void *opaque)
                    : successor.black_men | successor.black_kings;
     if (friendly == 0) {
         value = 0;
-    } else if (has_indexer_material(context->indexer, &successor)) {
+    } else if (contains_position(context->indexer, &successor)) {
         context->has_internal = true;
         return true;
     } else if (context->external_probe == NULL ||
@@ -254,7 +256,20 @@ static bool position_index(const EgIndexer *indexer,
     indexed.black_men = position->black_men;
     indexed.white_kings = position->white_kings;
     indexed.black_kings = position->black_kings;
+    if (!eg_indexer_contains_position(indexer, &indexed))
+        return false;
     return eg_position_to_index(indexer, &indexed, index);
+}
+
+static bool contains_position(const EgIndexer *indexer,
+                              const DraughtsPosition *position)
+{
+    EgPosition indexed;
+    indexed.white_men = position->white_men;
+    indexed.black_men = position->black_men;
+    indexed.white_kings = position->white_kings;
+    indexed.black_kings = position->black_kings;
+    return eg_indexer_contains_position(indexer, &indexed);
 }
 
 static bool generator_get(Egtb *database, EgtbView *view, uint64_t index,
@@ -287,7 +302,7 @@ static bool check_forward_successor(const DraughtsMove *move, void *opaque)
                    : successor.black_men | successor.black_kings;
     if (friendly == 0) {
         value = 0;
-    } else if (has_indexer_material(context->indexer, &successor)) {
+    } else if (contains_position(context->indexer, &successor)) {
         if (!position_index(context->indexer, &successor, &index)) {
             context->failed = true;
             return false;
@@ -320,10 +335,8 @@ static bool check_predecessor(const DraughtsPosition *predecessor,
     size_t move_count;
     int16_t old_value;
     (void)forward_move;
-    if (!position_index(context->indexer, predecessor, &predecessor_index)) {
-        context->failed = true;
-        return false;
-    }
+    if (!position_index(context->indexer, predecessor, &predecessor_index))
+        return true;
     if (predecessor_index < context->first_index ||
         predecessor_index >= context->end_index)
         return true;
@@ -500,10 +513,8 @@ static bool check_winning_predecessor(
     uint64_t predecessor_index;
     int16_t old_value;
     (void)forward_move;
-    if (!position_index(context->indexer, predecessor, &predecessor_index)) {
-        context->failed = true;
-        return false;
-    }
+    if (!position_index(context->indexer, predecessor, &predecessor_index))
+        return true;
     if (predecessor_index < context->first_index ||
         predecessor_index >= context->end_index)
         return true;
@@ -932,7 +943,7 @@ static bool resolve_successor(ConsistencyMoveContext *context,
         *value = 0;
         return true;
     }
-    if (has_indexer_material(context->indexer, successor)) {
+    if (contains_position(context->indexer, successor)) {
         uint64_t index;
         if (!position_index(context->indexer, successor, &index) ||
             (context->resident != NULL
@@ -1021,11 +1032,8 @@ static bool mark_affected_position(ConsistencyAffectedContext *context,
                                    const DraughtsPosition *position)
 {
     uint64_t index;
-    if (!has_indexer_material(context->indexer, position) ||
-        !position_index(context->indexer, position, &index)) {
-        context->failed = true;
-        return false;
-    }
+    if (!position_index(context->indexer, position, &index))
+        return true;
     bitmap_set(context->affected, index);
     return true;
 }
@@ -1093,11 +1101,8 @@ static bool mark_unverified_predecessor(
     ConsistencyUnverifyContext *context = opaque;
     uint64_t index;
     (void)forward_move;
-    if (!has_indexer_material(context->indexer, predecessor) ||
-        !position_index(context->indexer, predecessor, &index)) {
-        context->failed = true;
-        return false;
-    }
+    if (!position_index(context->indexer, predecessor, &index))
+        return true;
     bitmap_unset(context->verified_positions, index);
     return true;
 }
@@ -2092,10 +2097,8 @@ static bool mark_frontier_candidate(const DraughtsPosition *predecessor,
     FrontierCandidateContext *context = opaque;
     uint64_t index;
     (void)forward_move;
-    if (!position_index(context->indexer, predecessor, &index)) {
-        context->failed = true;
-        return false;
-    }
+    if (!position_index(context->indexer, predecessor, &index))
+        return true;
     bitmap_set_atomic(context->candidates, index);
     return true;
 }
@@ -2175,7 +2178,7 @@ static bool check_frontier_successor(const DraughtsMove *move, void *opaque)
                    : successor.black_men | successor.black_kings;
     if (friendly == 0) {
         value = 0;
-    } else if (has_indexer_material(context->indexer, &successor)) {
+    } else if (contains_position(context->indexer, &successor)) {
         if (!position_index(context->indexer, &successor, &index)) {
             context->failed = true;
             return false;

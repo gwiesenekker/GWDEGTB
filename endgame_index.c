@@ -18,26 +18,48 @@ enum Piece {
 #define BLACK_MAN_MASK ((UINT64_C(1) << 45) - 1)
 #define WHITE_MAN_MASK (BOARD_MASK & ~((UINT64_C(1) << 5) - 1))
 
+enum {
+    REQUIRE_WHITE_FRONTIER = 1u,
+    REQUIRE_BLACK_FRONTIER = 2u
+};
+
 static uint64_t table_index(const EgIndexer *e, unsigned square,
                             unsigned wm, unsigned bm,
-                            unsigned wk, unsigned bk)
+                            unsigned wk, unsigned bk, unsigned requirements)
 {
     return (uint64_t)square * e->square_stride +
            (uint64_t)wm * e->piece_stride[0] +
            (uint64_t)bm * e->piece_stride[1] +
-           (uint64_t)wk * e->piece_stride[2] + bk;
+           (uint64_t)wk * e->piece_stride[2] +
+           (uint64_t)bk * e->piece_stride[3] + requirements;
 }
 
-static bool allowed(enum Piece piece, unsigned square)
+static bool allowed(const EgIndexer *e, enum Piece piece, unsigned square)
 {
     switch (piece) {
     case EMPTY:      return true;
-    case WHITE_MAN:  return square >= 5;
-    case BLACK_MAN:  return square <= 44;
+    case WHITE_MAN:
+        return square >= 5 &&
+               (!e->sliced || (int)(square / 5) >= e->white_man_row);
+    case BLACK_MAN:
+        return square <= 44 &&
+               (!e->sliced || (int)(square / 5) <= e->black_man_row);
     case WHITE_KING:
     case BLACK_KING: return true;
     default:         return false;
     }
+}
+
+static unsigned cleared_requirement(const EgIndexer *e, enum Piece piece,
+                                    unsigned square)
+{
+    if (!e->sliced)
+        return 0;
+    if (piece == WHITE_MAN && (int)(square / 5) == e->white_man_row)
+        return REQUIRE_WHITE_FRONTIER;
+    if (piece == BLACK_MAN && (int)(square / 5) == e->black_man_row)
+        return REQUIRE_BLACK_FRONTIER;
+    return 0;
 }
 
 static unsigned *remaining_for(enum Piece piece, unsigned remaining[4])
@@ -45,11 +67,13 @@ static unsigned *remaining_for(enum Piece piece, unsigned remaining[4])
     return piece == EMPTY ? NULL : &remaining[(unsigned)piece - 1];
 }
 
-bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
-                     unsigned wk, unsigned bk)
+static bool initialize_indexer(EgIndexer *e, unsigned wm, unsigned bm,
+                               unsigned wk, unsigned bk,
+                               int white_man_row, int black_man_row,
+                               bool sliced)
 {
     uint64_t states;
-    unsigned square, a, b, c, d, piece_index;
+    unsigned square, a, b, c, d, requirements, piece_index;
 
     if (e == NULL)
         return false;
@@ -62,14 +86,22 @@ bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
     e->black_men = bm;
     e->white_kings = wk;
     e->black_kings = bk;
+    e->white_man_row = white_man_row;
+    e->black_man_row = black_man_row;
+    e->sliced = sliced;
+    e->requirement_mask = sliced
+                              ? (wm != 0 ? REQUIRE_WHITE_FRONTIER : 0u) |
+                                    (bm != 0 ? REQUIRE_BLACK_FRONTIER : 0u)
+                              : 0u;
+    e->requirement_states = sliced ? 4u : 1u;
 
-    e->piece_stride[3] = 1;
-    e->piece_stride[2] = (uint64_t)bk + 1;
+    e->piece_stride[3] = e->requirement_states;
+    e->piece_stride[2] = ((uint64_t)bk + 1) * e->piece_stride[3];
     e->piece_stride[1] = ((uint64_t)wk + 1) * e->piece_stride[2];
     e->piece_stride[0] = ((uint64_t)bm + 1) * e->piece_stride[1];
     e->square_stride = ((uint64_t)wm + 1) * e->piece_stride[0];
 
-    states = 51;
+    states = 51 * (uint64_t)e->requirement_states;
 #define MULTIPLY_DIM(n) do {                                      \
         if (states > UINT64_MAX / ((uint64_t)(n) + 1)) return false; \
         states *= (uint64_t)(n) + 1;                              \
@@ -91,26 +123,32 @@ bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
         return false;
     }
     e->table_size = states;
-    e->ways[table_index(e, 50, 0, 0, 0, 0)] = 1;
+    e->ways[table_index(e, 50, 0, 0, 0, 0, 0)] = 1;
 
     for (square = 50; square-- > 0;) {
         for (a = 0; a <= wm; ++a)
         for (b = 0; b <= bm; ++b)
         for (c = 0; c <= wk; ++c)
-        for (d = 0; d <= bk; ++d) {
-            uint64_t out = table_index(e, square, a, b, c, d);
+        for (d = 0; d <= bk; ++d)
+        for (requirements = 0; requirements < e->requirement_states;
+             ++requirements) {
+            uint64_t out = table_index(e, square, a, b, c, d,
+                                       requirements);
             enum Piece p;
 
             for (p = EMPTY; p < PIECE_KIND_COUNT; ++p) {
                 unsigned next[4] = {a, b, c, d};
                 unsigned *count = remaining_for(p, next);
                 uint64_t in, add;
-                if (!allowed(p, square) || (count != NULL && *count == 0))
+                unsigned next_requirements =
+                    requirements & ~cleared_requirement(e, p, square);
+                if (!allowed(e, p, square) ||
+                    (count != NULL && *count == 0))
                     continue;
                 if (count != NULL)
                     --*count;
                 in = table_index(e, square + 1, next[0], next[1],
-                                 next[2], next[3]);
+                                 next[2], next[3], next_requirements);
                 add = e->ways[in];
                 if (e->overflow[in] || UINT64_MAX - e->ways[out] < add) {
                     e->ways[out] = UINT64_MAX;
@@ -123,7 +161,8 @@ bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
     }
 
     {
-        uint64_t root = table_index(e, 0, wm, bm, wk, bk);
+        uint64_t root = table_index(e, 0, wm, bm, wk, bk,
+                                    e->requirement_mask);
         if (e->overflow[root] || e->ways[root] == 0) {
             eg_indexer_destroy(e);
             return false;
@@ -137,17 +176,28 @@ bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
         for (a = 0; a <= wm; ++a)
         for (b = 0; b <= bm; ++b)
         for (c = 0; c <= wk; ++c)
-        for (d = 0; d <= bk; ++d) {
-            uint64_t state = table_index(e, square + 1, a, b, c, d);
+        for (d = 0; d <= bk; ++d)
+        for (requirements = 0; requirements < e->requirement_states;
+             ++requirements) {
+            uint64_t state = table_index(e, square + 1, a, b, c, d,
+                                         requirements);
             uint64_t rank = e->ways[state];
 
             for (piece_index = 0; piece_index < 4; ++piece_index) {
-                if (piece_index == 1 && square >= 5 && a != 0) {
-                    uint64_t add = e->ways[state - e->piece_stride[0]];
+                if (piece_index == 1 && a != 0 &&
+                    allowed(e, WHITE_MAN, square)) {
+                    uint64_t add = e->ways[
+                        state - e->piece_stride[0] -
+                        (requirements & cleared_requirement(
+                             e, WHITE_MAN, square))];
                     rank = UINT64_MAX - rank < add ? UINT64_MAX : rank + add;
                 }
-                if (piece_index == 2 && square <= 44 && b != 0) {
-                    uint64_t add = e->ways[state - e->piece_stride[1]];
+                if (piece_index == 2 && b != 0 &&
+                    allowed(e, BLACK_MAN, square)) {
+                    uint64_t add = e->ways[
+                        state - e->piece_stride[1] -
+                        (requirements & cleared_requirement(
+                             e, BLACK_MAN, square))];
                     rank = UINT64_MAX - rank < add ? UINT64_MAX : rank + add;
                 }
                 if (piece_index == 3 && c != 0) {
@@ -159,6 +209,25 @@ bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
         }
     }
     return true;
+}
+
+bool eg_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
+                     unsigned wk, unsigned bk)
+{
+    return initialize_indexer(e, wm, bm, wk, bk, -1, -1, false);
+}
+
+bool eg_slice_indexer_init(EgIndexer *e, unsigned wm, unsigned bm,
+                           unsigned wk, unsigned bk,
+                           int white_man_row, int black_man_row)
+{
+    if ((wm == 0 && white_man_row != -1) ||
+        (wm != 0 && (white_man_row < 1 || white_man_row > 9)) ||
+        (bm == 0 && black_man_row != -1) ||
+        (bm != 0 && (black_man_row < 0 || black_man_row > 8)))
+        return false;
+    return initialize_indexer(e, wm, bm, wk, bk, white_man_row,
+                              black_man_row, true);
 }
 
 void eg_indexer_destroy(EgIndexer *e)
@@ -181,11 +250,12 @@ uint64_t eg_max_index(const EgIndexer *e)
     return e == NULL || e->position_count == 0 ? 0 : e->position_count - 1;
 }
 
-#ifndef NDEBUG
-static bool valid_position(const EgIndexer *e, const EgPosition *p)
+bool eg_indexer_contains_position(const EgIndexer *e, const EgPosition *p)
 {
     uint64_t occupied;
-    if (p == NULL || ((p->white_men | p->black_men | p->white_kings |
+    int white_row = -1, black_row = -1;
+    if (e == NULL || p == NULL ||
+        ((p->white_men | p->black_men | p->white_kings |
                        p->black_kings) & ~BOARD_MASK) != 0)
         return false;
     occupied = p->white_men | p->black_men | p->white_kings | p->black_kings;
@@ -195,12 +265,37 @@ static bool valid_position(const EgIndexer *e, const EgPosition *p)
         __builtin_popcountll(p->white_kings) +
         __builtin_popcountll(p->black_kings))
         return false;
-    return (p->white_men & ~WHITE_MAN_MASK) == 0 &&
-           (p->black_men & ~BLACK_MAN_MASK) == 0 &&
-           (unsigned)__builtin_popcountll(p->white_men) == e->white_men &&
-           (unsigned)__builtin_popcountll(p->black_men) == e->black_men &&
-           (unsigned)__builtin_popcountll(p->white_kings) == e->white_kings &&
-           (unsigned)__builtin_popcountll(p->black_kings) == e->black_kings;
+    if ((p->white_men & ~WHITE_MAN_MASK) != 0 ||
+        (p->black_men & ~BLACK_MAN_MASK) != 0 ||
+        (unsigned)__builtin_popcountll(p->white_men) != e->white_men ||
+        (unsigned)__builtin_popcountll(p->black_men) != e->black_men ||
+        (unsigned)__builtin_popcountll(p->white_kings) != e->white_kings ||
+        (unsigned)__builtin_popcountll(p->black_kings) != e->black_kings)
+        return false;
+    if (!e->sliced)
+        return true;
+    eg_position_slice(p, &white_row, &black_row);
+    return white_row == e->white_man_row && black_row == e->black_man_row;
+}
+
+void eg_position_slice(const EgPosition *p, int *white_man_row,
+                       int *black_man_row)
+{
+    int white = -1, black = -1;
+    if (p != NULL && p->white_men != 0)
+        white = (int)(__builtin_ctzll(p->white_men) / 5);
+    if (p != NULL && p->black_men != 0)
+        black = (int)((63u - (unsigned)__builtin_clzll(p->black_men)) / 5);
+    if (white_man_row != NULL)
+        *white_man_row = white;
+    if (black_man_row != NULL)
+        *black_man_row = black;
+}
+
+#ifndef NDEBUG
+static bool valid_position(const EgIndexer *e, const EgPosition *p)
+{
+    return eg_indexer_contains_position(e, p);
 }
 #endif
 
@@ -219,10 +314,14 @@ bool eg_position_to_index(const EgIndexer *e, const EgPosition *position,
         !valid_position(e, position))
         return false;
 #endif
+    if (e->sliced && !eg_indexer_contains_position(e, position))
+        return false;
     remaining_state =
         (uint64_t)e->white_men * e->piece_stride[0] +
         (uint64_t)e->black_men * e->piece_stride[1] +
-        (uint64_t)e->white_kings * e->piece_stride[2] + e->black_kings;
+        (uint64_t)e->white_kings * e->piece_stride[2] +
+        (uint64_t)e->black_kings * e->piece_stride[3] +
+        e->requirement_mask;
     occupied = position->white_men | position->black_men |
                position->white_kings | position->black_kings;
     black = position->black_men | position->black_kings;
@@ -238,6 +337,9 @@ bool eg_position_to_index(const EgIndexer *e, const EgPosition *position,
 
         rank += e->rank_add[state * 4 + piece_index];
         remaining_state -= e->piece_stride[piece_index];
+        remaining_state -=
+            (remaining_state % e->requirement_states) &
+            cleared_requirement(e, (enum Piece)(piece_index + 1), square);
         occupied &= occupied - 1;
     }
     *index = rank;
@@ -268,7 +370,8 @@ bool eg_index_to_position(const EgIndexer *e, uint64_t index,
     state = e->square_stride +
             (uint64_t)rem[0] * e->piece_stride[0] +
             (uint64_t)rem[1] * e->piece_stride[1] +
-            (uint64_t)rem[2] * e->piece_stride[2] + rem[3];
+            (uint64_t)rem[2] * e->piece_stride[2] +
+            (uint64_t)rem[3] * e->piece_stride[3] + e->requirement_mask;
 
     for (square = 0; square < 50; ++square, bit <<= 1) {
         uint64_t block = e->ways[state];
@@ -277,16 +380,20 @@ bool eg_index_to_position(const EgIndexer *e, uint64_t index,
         if (index < block)
             goto selected;
         index -= block;
-        if (square >= 5 && rem[0] != 0) {
-            block = e->ways[state - e->piece_stride[0]];
+        if (rem[0] != 0 && allowed(e, WHITE_MAN, square)) {
+            block = e->ways[state - e->piece_stride[0] -
+                            ((state % e->requirement_states) &
+                             cleared_requirement(e, WHITE_MAN, square))];
             if (index < block) {
                 piece = WHITE_MAN;
                 goto selected;
             }
             index -= block;
         }
-        if (square <= 44 && rem[1] != 0) {
-            block = e->ways[state - e->piece_stride[1]];
+        if (rem[1] != 0 && allowed(e, BLACK_MAN, square)) {
+            block = e->ways[state - e->piece_stride[1] -
+                            ((state % e->requirement_states) &
+                             cleared_requirement(e, BLACK_MAN, square))];
             if (index < block) {
                 piece = BLACK_MAN;
                 goto selected;
@@ -318,6 +425,8 @@ selected:
             unsigned piece_index = (unsigned)piece - 1;
             --rem[piece_index];
             state -= e->piece_stride[piece_index];
+            state -= (state % e->requirement_states) &
+                     cleared_requirement(e, piece, square);
             switch (piece) {
             case WHITE_MAN:  white_men |= bit; break;
             case BLACK_MAN:  black_men |= bit; break;
@@ -379,7 +488,8 @@ static void enumerate(TestState *test, unsigned square, unsigned rem[4],
 
     for (piece = EMPTY; piece < PIECE_KIND_COUNT; ++piece) {
         unsigned *count = remaining_for(piece, rem);
-        if (!allowed(piece, square) || (count != NULL && *count == 0))
+        if (!allowed(test->indexer, piece, square) ||
+            (count != NULL && *count == 0))
             continue;
         if (count != NULL) {
             --*count;

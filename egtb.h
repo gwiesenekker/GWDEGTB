@@ -87,6 +87,8 @@ bool egtb_flush(Egtb *egtb);
 
 bool egtb_get(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value);
 bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value);
+bool egtb_set_pair(Egtb *egtb, uint64_t index,
+                   int16_t white_to_move, int16_t black_to_move);
 
 /*
  * Create a direct-mapped cache view over an open EGTB backing. Read-only

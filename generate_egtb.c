@@ -3,6 +3,7 @@
 #include "generator.h"
 #include "material.h"
 #include "revision.h"
+#include "sliced.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -325,6 +326,7 @@ int main(int argc, char **argv)
     size_t verification_cache_pages;
     bool indexer_initialized = false;
     bool created = false;
+    bool sliced = false;
     bool ok = false;
     unsigned thread_count = 1;
     int material_argument = 1;
@@ -351,20 +353,30 @@ int main(int argc, char **argv)
     }
     verification_cache_pages =
         (size_t)(verification_cache_bytes / GENERATION_PAGE_SIZE);
-    if (argc == 7 && strcmp(argv[1], "-j") == 0) {
-        if (!parse_thread_count(argv[2], &thread_count)) {
-            fprintf(stderr, "thread count must be 1..%u\n",
-                    EGTB_MAX_THREADS);
-            return EXIT_FAILURE;
+    while (material_argument < argc) {
+        if (strcmp(argv[material_argument], "--sliced") == 0) {
+            sliced = true;
+            ++material_argument;
+        } else if (strcmp(argv[material_argument], "-j") == 0 &&
+                   material_argument + 1 < argc) {
+            if (!parse_thread_count(argv[material_argument + 1],
+                                    &thread_count)) {
+                fprintf(stderr, "thread count must be 1..%u\n",
+                        EGTB_MAX_THREADS);
+                return EXIT_FAILURE;
+            }
+            material_argument += 2;
+        } else {
+            break;
         }
-        material_argument = 3;
     }
     if (argc != material_argument + 4 ||
         !parse_count(argv[material_argument], &requested.white_kings) ||
         !parse_count(argv[material_argument + 1], &requested.white_men) ||
         !parse_count(argv[material_argument + 2], &requested.black_kings) ||
         !parse_count(argv[material_argument + 3], &requested.black_men)) {
-        fprintf(stderr, "usage: %s [-j THREADS] NWHITE_KINGS NWHITE_MEN "
+        fprintf(stderr, "usage: %s [--sliced] [-j THREADS] "
+                        "NWHITE_KINGS NWHITE_MEN "
                         "NBLACK_KINGS NBLACK_MEN\n", argv[0]);
         return EXIT_FAILURE;
     }
@@ -399,21 +411,50 @@ int main(int argc, char **argv)
         initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_PAGES);
         probe_contexts[worker] = &catalogs[worker];
     }
-    if (!egtb_create(&database, path, positions - 1,
-                     GENERATION_PAGE_SIZE, &options)) {
-        fprintf(stderr, "cannot create %s: %s\n", path, egtb_last_error());
+    if (sliced && material.white_men == 0 && material.black_men == 0) {
+        fprintf(stderr, "--sliced requires at least one man\n");
         goto done;
     }
-    created = true;
-    printf("generating %s with %u thread%s, %u MiB writable cache total, "
+    printf("generating %s%s with %u thread%s, %u MiB writable cache total, "
            "%u MiB dependency cache per worker/database\n",
-           path, thread_count, thread_count == 1 ? "" : "s",
+           path, sliced ? " by man-row slices" : "", thread_count,
+           thread_count == 1 ? "" : "s",
            GENERATION_CACHE_BYTES / (1024 * 1024),
            DEPENDENCY_CACHE_BYTES / (1024 * 1024));
     fflush(stdout);
     generation_started = wall_seconds();
     setup_seconds = generation_started - program_started;
-    {
+    if (sliced) {
+        EgtbSlicedOptions sliced_options = {
+            thread_count,
+            GENERATION_PAGE_SIZE,
+            GENERATION_CACHE_PAGES,
+            READONLY_CACHE_PAGES,
+            GENERATION_CACHE_PAGES,
+            20,
+            9,
+            catalog_probe,
+            &catalogs[0],
+            probe_contexts,
+            report_correction,
+            NULL,
+            false
+        };
+        if (!egtb_generate_sliced(&database, path, &material, &indexer,
+                                  &sliced_options, &generation)) {
+            fprintf(stderr, "cannot generate sliced %s: %s\n", path,
+                    egtb_sliced_last_error());
+            goto done;
+        }
+        created = true;
+    } else {
+        if (!egtb_create(&database, path, positions - 1,
+                         GENERATION_PAGE_SIZE, &options)) {
+            fprintf(stderr, "cannot create %s: %s\n", path,
+                    egtb_last_error());
+            goto done;
+        }
+        created = true;
         EgtbThreadOptions thread_options = {
             thread_count, GENERATION_CACHE_PAGES, probe_contexts,
             &verified_positions
@@ -618,6 +659,11 @@ int main(int argc, char **argv)
            statistics_seconds);
     printf("  %-28s %10.3f s\n", "total", total_seconds);
     ok = true;
+    if (sliced && getenv("EGTB_KEEP_SLICES") == NULL &&
+        !egtb_sliced_cleanup(path, &material))
+        fprintf(stderr, "warning: generated database is valid, but the slice "
+                        "workspace was retained: %s\n",
+                egtb_sliced_last_error());
 done:
     egtb_resident_destroy(resident);
     if (database != NULL && !egtb_close(database))

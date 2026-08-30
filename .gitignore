@@ -14,6 +14,8 @@
 /test_generator_padded
 /test_material
 /test_bitmap
+/test_slice_index
+/test_sliced
 /generate_egtb
 /generate_egtb_padded
 /generate_egtb_table

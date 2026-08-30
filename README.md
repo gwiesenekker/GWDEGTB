@@ -238,7 +238,7 @@ dirty slot before replacement.
 Generate a canonical database with:
 
 ```sh
-./generate_egtb [-j THREADS] NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
+./generate_egtb [--sliced] [-j THREADS] NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN
 ```
 
 For example:
@@ -265,6 +265,39 @@ Logs are written below `logs/<family>/`. Generation order sorts by total piece
 count, larger White side first, then White kings descending and Black kings
 descending. This matches the historical GWD order and ensures promotion
 targets are available.
+
+### Man-row sliced generation
+
+`--sliced` reduces the peak working set for material containing men while
+producing the same ordinary full-index `.dtm` file:
+
+```sh
+./generate_egtb --sliced -j 16 0 4 0 3
+```
+
+The most-forward man identifies a slice. One colour with men gives nine
+slices; men of both colours give 81. White rows are generated from 2 through
+10 and, within each White row, Black rows from 9 through 1. A forward man move
+therefore either remains in the current slice or enters a completed read-only
+slice. Captures and promotions continue to use normal material dependencies.
+Each slice retains the full multithreaded frontier, consistency-repair, and
+read-only verification pipeline.
+
+Slice indices are independently dense. Their position counts sum exactly to
+the normal full-index count. After every slice is verified, a 9- or 81-way
+monotonic merge reranks its positions with the unchanged full index and writes
+the standard DTM. Missing, duplicate, or out-of-order full indices are fatal.
+The completed full database then undergoes the normal compaction and exhaustive
+read-only consistency verification, so GWD and WDL compilation require no
+special handling.
+
+Temporary state is stored under `<database>.work`. A completed slice is first
+verified under an `.incomplete` name, atomically renamed, and recorded in an
+atomically replaced manifest. Restarting the same command validates every
+completed slice header and page checksum, restores its generation statistics,
+and resumes at the first missing slice. The workspace is deleted only after
+the final full database passes verification. Set `EGTB_KEEP_SLICES=1` to retain
+it deliberately, for example when testing restart behavior.
 
 ## Generation pipeline
 
@@ -537,6 +570,7 @@ make benchmark-movegen
 | `gwdegtb.c/.h` | GWD padded-board resident WDL registry and lookup |
 | `material.c/.h` | Canonical material ordering and mirroring |
 | `generator.c/.h` | Initialization, retrograde analysis, repair, verification |
+| `sliced.c/.h` | Resumable man-row sliced generation and full-index merge |
 | `generate_egtb.c` | Command-line orchestration, dependencies, reporting |
 | `libgwdegtb.a` | Static library target for integration with GWD |
 | `test_*.c`, `check_stats.c` | Regression and reference-count validation |
