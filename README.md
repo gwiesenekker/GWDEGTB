@@ -209,15 +209,21 @@ are exact signed ply counts:
 - `-1` means draw or not yet known during generation;
 - a side with no pieces or no legal move is lost in zero.
 
-Version-2 DTM storage uses two signed bytes per position. Wins `1,3,...,253`
-are stored as `1,2,...,127`; losses `0,-2,...,-254` as `0,-1,...,-127`; stored
+DTM storage uses one signed byte for each side to move. Wins `1,3,...,253` are
+stored as `1,2,...,127`; losses `0,-2,...,-254` as `0,-1,...,-127`; stored
 `-128` represents draw/unknown. The API converts these bytes to public
 `int16_t` values.
 
-Entries are grouped in 1,024-byte pages, normally 512 positions per page.
-Pages are independently Zstd compressed. Every stored block carries a CRC32C
-of the uncompressed data. An implicit directory entry `(offset=0,length=0)`
-represents an all-draw page and consumes no block storage.
+Version 3 stores the complete white-to-move plane first, followed by the
+complete black-to-move plane. With 1,024-byte pages, one page represents 1,024
+positions for one side. Corresponding WTM and BTM pages are independently Zstd
+compressed and cached, while paired and resident APIs still present the same
+two values per position. Version-2 files, which stored 512 interleaved WTM/BTM
+pairs per page, remain readable and are compacted without changing format.
+
+Every stored block carries a CRC32C of the uncompressed data. An implicit
+directory entry `(offset=0,length=0)` represents an all-draw page and consumes
+no block storage.
 
 The file begins with a versioned header containing the page size and maximum
 index, followed by an in-memory directory with a 64-bit block offset and
@@ -348,8 +354,9 @@ compressed database for every mate distance.
    transposition result. Only this phase needs the large writable page cache.
 
 9. **Repair exact-DTM consistency.** The first snapshot pass recomputes both
-   side-to-move values for every legal position. Workers use a one-page paired
-   sequential cursor for the scan and a separate random-access successor view.
+   side-to-move values for every legal position. Workers use a paired
+   sequential cursor over corresponding WTM and BTM pages for the scan and a
+   separate random-access successor view.
    Corrections are merged and applied by one thread. Corrected positions and
    their quiet predecessors/successors form the next sparse worklist; passes
    continue until no correction remains. This handles initialization
@@ -515,6 +522,13 @@ if (!gwdegtb_wdl_attach("1wX-0wO-0bX-1bO", bitmap, bytes)) {
 
 The optional `.wdl` suffix is accepted. GWD owns the allocation. A mirrored
 basename resolves to its canonical database automatically.
+
+`gwdegtb_wdl_decompress()` is also the GWD open-or-generate boundary. If the
+canonical `.wdl` is absent, the process calling this function compiles it from
+the corresponding `.dtm`, atomically installs the compressed WDL file, and
+then decompresses it into the supplied allocation. With OpenMPI, only the
+master calls this function, so the other ranks never open or generate files;
+they attach the synchronized shared bitmap as usual.
 
 For OpenMPI, GWD obtains `bytes`, calls its existing
 `my_mpi_allocate_shared()`, and the master calls

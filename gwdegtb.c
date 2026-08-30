@@ -221,7 +221,7 @@ bool gwdegtb_wdl_decompress(const char *directory,
         return fail("cannot allocate resident WDL path");
     if (!wdl_open(&wdl, path, 1, DEFAULT_WDL_COMPRESSION_LEVEL,
                   DEFAULT_DTM_CACHE_PAGES)) {
-        fail("cannot open %s: %s", path, wdl_last_error());
+        fail("cannot open or generate %s: %s", path, wdl_last_error());
         goto done;
     }
     if (wdl_maximum_index(wdl) != maximum_index) {

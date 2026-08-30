@@ -26,10 +26,11 @@ bool gwdegtb_wdl_info(const char *database_name, uint64_t *maximum_index,
                       size_t *size);
 
 /*
- * Decompress into exactly size bytes of caller-owned memory. This does not
- * register the bitmap; call gwdegtb_wdl_attach() after synchronization.
- * directory may be NULL or empty. A mirrored basename resolves to the
- * corresponding canonical WDL file.
+ * Decompress into exactly size bytes of caller-owned memory. If the canonical
+ * .wdl file does not exist, it is generated atomically from the corresponding
+ * .dtm file before decompression. This does not register the bitmap; call
+ * gwdegtb_wdl_attach() after synchronization. directory may be NULL or empty.
+ * A mirrored basename resolves to the corresponding canonical WDL file.
  */
 bool gwdegtb_wdl_decompress(const char *directory,
                             const char *database_name,

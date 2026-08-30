@@ -1502,7 +1502,7 @@ bool egtb_make_consistent_threaded(
          verified_positions->bit_count != position_count))
         return fail("verified-position bitmap has the wrong size");
     if (verified_positions != NULL &&
-        (egtb_page_size(database) / sizeof(EgtbEntry)) % 64 != 0)
+        egtb_positions_per_page(database) % 64 != 0)
         return fail("verified-position bitmap requires a multiple of 64 "
                     "entries per page");
     if (verified_positions != NULL)
@@ -1518,7 +1518,7 @@ bool egtb_make_consistent_threaded(
         fail("cannot allocate threaded consistency workspace");
         goto done;
     }
-    entries_per_page = egtb_page_size(database) / sizeof(EgtbEntry);
+    entries_per_page = egtb_positions_per_page(database);
     pages_per_worker = page_count / thread_count;
     extra_pages = page_count % thread_count;
     for (i = 0; i < thread_count; ++i) {
@@ -1775,7 +1775,7 @@ bool egtb_verify_consistent_threaded(
         fail("cannot allocate consistency verification workers");
         goto done;
     }
-    entries_per_page = egtb_page_size(database) / sizeof(EgtbEntry);
+    entries_per_page = egtb_positions_per_page(database);
     pages_per_worker = page_count / thread_count;
     extra_pages = page_count % thread_count;
     for (i = 0; i < thread_count; ++i) {
@@ -2511,7 +2511,7 @@ static bool egtb_generate_threaded_legacy(
     if (position_count == 0 || page_count == 0 ||
         egtb_maximum_index(database) != position_count - 1)
         return fail("database and indexer sizes do not match");
-    if ((egtb_page_size(database) / sizeof(EgtbEntry)) % 64 != 0)
+    if (egtb_positions_per_page(database) % 64 != 0)
         return fail("threaded generation requires a multiple of 64 entries per page");
     thread_count = options->thread_count;
     if (page_count < thread_count)
@@ -2555,9 +2555,9 @@ static bool egtb_generate_threaded_legacy(
         workers[i].exact = &exact;
         workers[i].at_most = &at_most;
         workers[i].first_index =
-            first_page * (egtb_page_size(database) / sizeof(EgtbEntry));
+            first_page * egtb_positions_per_page(database);
         workers[i].end_index =
-            end_page * (egtb_page_size(database) / sizeof(EgtbEntry));
+            end_page * egtb_positions_per_page(database);
         if (workers[i].end_index > position_count)
             workers[i].end_index = position_count;
         workers[i].external_probe = external_probe;
@@ -2720,7 +2720,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     if (position_count == 0 || page_count == 0 ||
         egtb_maximum_index(database) != position_count - 1)
         return fail("database and indexer sizes do not match");
-    if ((egtb_page_size(database) / sizeof(EgtbEntry)) % 64 != 0)
+    if (egtb_positions_per_page(database) % 64 != 0)
         return fail("threaded generation requires a multiple of 64 entries per page");
     thread_count = options->thread_count;
     if (page_count < thread_count)
@@ -2762,9 +2762,9 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         workers[i].lost[1] = &lost[1];
         workers[i].candidates = &candidates;
         workers[i].first_index =
-            first_page * (egtb_page_size(database) / sizeof(EgtbEntry));
+            first_page * egtb_positions_per_page(database);
         workers[i].end_index =
-            end_page * (egtb_page_size(database) / sizeof(EgtbEntry));
+            end_page * egtb_positions_per_page(database);
         if (workers[i].end_index > position_count)
             workers[i].end_index = position_count;
         workers[i].external_probe = external_probe;
@@ -2853,11 +2853,11 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     cache_shrunk = true;
     for (i = 0; i < thread_count; ++i) {
         uint64_t first_page = workers[i].first_index /
-                              (egtb_page_size(database) / sizeof(EgtbEntry));
+                              egtb_positions_per_page(database);
         uint64_t end_page =
             (workers[i].end_index +
-             (egtb_page_size(database) / sizeof(EgtbEntry)) - 1) /
-            (egtb_page_size(database) / sizeof(EgtbEntry));
+             egtb_positions_per_page(database) - 1) /
+            egtb_positions_per_page(database);
         size_t cache_pages = options->writable_cache_pages / thread_count +
                              (i < options->writable_cache_pages % thread_count);
         if (!egtb_view_create_range(&workers[i].view, database, cache_pages,

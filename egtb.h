@@ -5,7 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define EGTB_FORMAT_VERSION 2
+#define EGTB_LEGACY_FORMAT_VERSION 2
+#define EGTB_FORMAT_VERSION 3
 #define EGTB_DRAW INT16_C(-1)
 #define EGTB_MAX_WIN_DTM INT16_C(253)
 #define EGTB_MAX_LOSS_DTM INT16_C(254)
@@ -36,6 +37,9 @@ typedef struct {
     uint64_t end_index;
     const EgtbEntry *next_entry;
     const EgtbEntry *page_end;
+    const int8_t *next_white;
+    const int8_t *next_black;
+    const int8_t *plane_end;
 } EgtbSequentialReader;
 
 typedef struct {
@@ -63,7 +67,7 @@ typedef struct {
 
 const char *egtb_last_error(void);
 
-/* Convert between exact public ply values and the version-2 signed byte. */
+/* Convert between exact public ply values and the signed-byte representation. */
 bool egtb_encode_dtm(int16_t value, int8_t *stored);
 int16_t egtb_decode_dtm(int8_t stored);
 
@@ -137,6 +141,8 @@ bool egtb_resident_dtm_histogram(const EgtbResident *resident,
 uint64_t egtb_maximum_index(const Egtb *egtb);
 uint64_t egtb_page_count(const Egtb *egtb);
 uint32_t egtb_page_size(const Egtb *egtb);
+/* Number of position indices represented by one page of one side. */
+uint32_t egtb_positions_per_page(const Egtb *egtb);
 bool egtb_is_readonly(const Egtb *egtb);
 unsigned egtb_reserve_percent(const Egtb *egtb);
 size_t egtb_cache_pages(const Egtb *egtb);

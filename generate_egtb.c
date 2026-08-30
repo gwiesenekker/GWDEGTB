@@ -503,7 +503,7 @@ int main(int argc, char **argv)
     phase_started = wall_seconds();
     {
         uint64_t resident_bytes =
-            egtb_page_count(database) * (uint64_t)egtb_page_size(database);
+            (egtb_maximum_index(database) + 1) * sizeof(EgtbEntry);
         if (resident_limit_bytes != 0 &&
             resident_bytes <= resident_limit_bytes) {
             if (!egtb_resident_load(&resident, database, thread_count)) {

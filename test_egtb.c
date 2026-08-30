@@ -357,7 +357,7 @@ static bool test_concurrent_ranged_views(void)
     EgtbView *views[2] = {NULL, NULL};
     RangedWriter writers[2] = {0};
     pthread_t threads[2];
-    const uint64_t positions = 64 * (1024 / sizeof(EgtbEntry));
+    const uint64_t positions = 64 * 1024;
     int descriptor = mkstemp(path);
     unsigned created = 0;
     bool ok = false;
@@ -714,7 +714,7 @@ int main(void)
     {
         unsigned char directory_entry[10];
         unsigned char original_checksum_byte;
-        uint64_t page = last_index / (1024 / sizeof(EgtbEntry));
+        uint64_t page = last_index / 1024;
         uint64_t block_offset;
         int16_t ignored;
         FILE *file = fopen(path, "r+b");
@@ -760,7 +760,7 @@ int main(void)
     {
         FILE *file = fopen(path, "r+b");
         bool prepared = file != NULL && fseek(file, 8, SEEK_SET) == 0 &&
-                        fputc(EGTB_FORMAT_VERSION - 1, file) != EOF;
+                        fputc(1, file) != EOF;
         if (file != NULL) {
             prepared = fclose(file) == 0 && prepared;
             file = NULL;
@@ -771,7 +771,7 @@ int main(void)
             return EXIT_FAILURE;
         }
         if (egtb_open_readonly(&egtb, path, 1)) {
-            fprintf(stderr, "legacy EGTB version was accepted\n");
+            fprintf(stderr, "unsupported EGTB version was accepted\n");
             egtb_close(egtb);
             unlink(path);
             return EXIT_FAILURE;
@@ -781,8 +781,7 @@ int main(void)
     printf("EGTB regression: PASS\n");
     printf("positions=%" PRIu64 " randomized writes=%" PRIu64
            " pages=%" PRIu64 "\n", count, writes,
-           (count + (1024 / sizeof(EgtbEntry)) - 1) /
-               (1024 / sizeof(EgtbEntry)));
+           (count + 1024 - 1) / 1024);
     print_statistics(&after);
     print_storage_statistics("before compaction", &before_storage);
     print_storage_statistics("after compaction", &after_storage);

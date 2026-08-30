@@ -46,8 +46,6 @@ int main(void)
     Egtb *dtm = NULL;
     EgIndexer indexer;
     bool indexer_ready = false;
-    WdlStatistics wdl_statistics;
-    WdlStorageStatistics storage_statistics;
     unsigned char *bitmap = NULL;
     unsigned char *shared_bitmap = NULL;
     size_t bitmap_bytes = 0, mirror_bytes = 0;
@@ -77,8 +75,7 @@ int main(void)
     if (!egtb_close(dtm))
         goto done;
     dtm = NULL;
-    if (!wdl_compile(dtm_path, wdl_path, 3, 8, &wdl_statistics,
-                     &storage_statistics))
+    if (access(wdl_path, F_OK) == 0)
         goto done;
 
     if (gwdegtb_wdl_is_loaded(1, 0, 0, 1) ||
@@ -96,8 +93,10 @@ int main(void)
     if (bitmap == NULL ||
         gwdegtb_wdl_decompress(directory, "1wX-0wO-0bX-1bO",
                                bitmap, bitmap_bytes - 1) ||
-        !gwdegtb_wdl_decompress(directory, "1wX-0wO-0bX-1bO",
+        access(wdl_path, F_OK) == 0 ||
+        !gwdegtb_wdl_decompress(directory, "0wX-1wO-1bX-0bO.wdl",
                                 bitmap, bitmap_bytes) ||
+        access(wdl_path, R_OK) != 0 ||
         gwdegtb_wdl_is_loaded(1, 0, 0, 1) ||
         !gwdegtb_wdl_attach("1wX-0wO-0bX-1bO", bitmap, bitmap_bytes) ||
         !gwdegtb_wdl_is_loaded(1, 0, 0, 1) ||
