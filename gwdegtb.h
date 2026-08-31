@@ -21,7 +21,8 @@ typedef enum {
 /* Convert GWD fields 6..59, including row guards, to squares 0..49. */
 uint64_t gwdegtb_gwd_to_compact(uint64_t gwd_bitboard);
 
-/* Calculate the dense maximum index and packed resident allocation size. */
+/* Calculate the dense maximum index and packed resident allocation size.
+ * Supports 2..8 pieces, with at least one piece of each colour. */
 bool gwdegtb_wdl_info(const char *database_name, uint64_t *maximum_index,
                       size_t *size);
 

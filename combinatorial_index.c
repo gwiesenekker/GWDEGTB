@@ -17,7 +17,7 @@ enum {
     COMB_BLACK_MAN,
     COMB_WHITE_KING,
     COMB_BLACK_KING,
-    COMB_MAX_PIECES = 7
+    COMB_MAX_PIECES = 8
 };
 
 #define TOP_MASK UINT64_C(0x1f)
@@ -28,7 +28,7 @@ enum {
 static uint64_t choose_table[51][COMB_MAX_PIECES + 1];
 static atomic_uint choose_state;
 static const uint64_t factorial[COMB_MAX_PIECES + 1] = {
-    1, 1, 2, 6, 24, 120, 720, 5040
+    1, 1, 2, 6, 24, 120, 720, 5040, 40320
 };
 
 static void initialize_choose(void)
@@ -286,7 +286,9 @@ bool comb_indexer_init(CombinatorialIndexer *indexer,
     if (indexer == NULL)
         return false;
     memset(indexer, 0, sizeof(*indexer));
-    if (wm + bm + wk + bk > COMB_MAX_PIECES)
+    if (wm > COMB_MAX_PIECES || bm > COMB_MAX_PIECES ||
+        wk > COMB_MAX_PIECES || bk > COMB_MAX_PIECES ||
+        wm + bm + wk + bk > COMB_MAX_PIECES)
         return false;
     initialize_choose();
     indexer->white_men = wm;

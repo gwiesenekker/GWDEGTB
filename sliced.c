@@ -371,6 +371,22 @@ static bool completed_slice_valid(const char *directory,
     return valid;
 }
 
+/* Frontier rows must leave room for all men behind them. With six or
+ * more men the last one-row slice is empty; never create, probe or merge
+ * a database for such a slice. The two man regions together have at least
+ * ten squares, so these per-colour bounds suffice through eight pieces. */
+static int last_white_slice_row(const EgtbMaterial *material)
+{
+    return material->white_men == 0 ? -1
+        : 10 - (int)((material->white_men + 4) / 5);
+}
+
+static int last_black_slice_row(const EgtbMaterial *material)
+{
+    return material->black_men == 0 ? -1
+        : (int)((material->black_men + 4) / 5) - 1;
+}
+
 static bool prepare_workspace(char *directory, size_t directory_size,
                               const char *path, const EgtbMaterial *material,
                               uint64_t full_positions, uint32_t page_size,
@@ -379,9 +395,9 @@ static bool prepare_workspace(char *directory, size_t directory_size,
                                   slice_statistics[SLICE_ROWS][SLICE_ROWS])
 {
     int white_first = material->white_men == 0 ? -1 : 1;
-    int white_last = material->white_men == 0 ? -1 : 9;
+    int white_last = last_white_slice_row(material);
     int black_first = material->black_men == 0 ? -1 : 8;
-    int black_last = material->black_men == 0 ? -1 : 0;
+    int black_last = last_black_slice_row(material);
     struct stat status;
     memset(completed, 0, sizeof(bool) * SLICE_ROWS * SLICE_ROWS);
     memset(slice_statistics, 0,
@@ -633,9 +649,9 @@ static bool compile_slices(Egtb **out, const char *path,
     EgtbCreateOptions create_options = {64, 0, options->compression_level};
     uint64_t expected = 0, progress_pending = 0;
     int white_first = material->white_men == 0 ? -1 : 1;
-    int white_last = material->white_men == 0 ? -1 : 9;
+    int white_last = last_white_slice_row(material);
     int black_first = material->black_men == 0 ? -1 : 8;
-    int black_last = material->black_men == 0 ? -1 : 0;
+    int black_last = last_black_slice_row(material);
     bool ok = false;
     memset(slices, 0, sizeof(slices));
     snprintf(temporary, sizeof(temporary), "%s.incomplete", path);
@@ -762,9 +778,9 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
         goto done;
     }
     white_first = material->white_men == 0 ? -1 : 1;
-    white_last = material->white_men == 0 ? -1 : 9;
+    white_last = last_white_slice_row(material);
     black_first = material->black_men == 0 ? -1 : 8;
-    black_last = material->black_men == 0 ? -1 : 0;
+    black_last = last_black_slice_row(material);
     for (int white = white_first;; ++white) {
         for (int black = black_first;; --black) {
             int ws = white < 0 ? 0 : white;
@@ -821,9 +837,9 @@ bool egtb_sliced_cleanup(const char *path, const EgtbMaterial *material)
         !make_work_directory(directory, sizeof(directory), path))
         return sliced_fail("invalid sliced cleanup request");
     white_first = material->white_men == 0 ? -1 : 1;
-    white_last = material->white_men == 0 ? -1 : 9;
+    white_last = last_white_slice_row(material);
     black_first = material->black_men == 0 ? -1 : 8;
-    black_last = material->black_men == 0 ? -1 : 0;
+    black_last = last_black_slice_row(material);
     for (int white = white_first;; ++white) {
         for (int black = black_first;; --black) {
             if (make_slice_path(slice_path, sizeof(slice_path), directory,

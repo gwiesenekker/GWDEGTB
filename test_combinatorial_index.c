@@ -15,7 +15,10 @@ static const Material materials[] = {
     {1, 1, 1, 1},
     {1, 1, 2, 1},
     {1, 1, 2, 2},
-    {1, 2, 2, 2}
+    {1, 2, 2, 2},
+    {2, 2, 2, 2},
+    {0, 0, 4, 4},
+    {0, 0, 0, 8}
 };
 
 static bool same_position(const EgPosition *left, const EgPosition *right)

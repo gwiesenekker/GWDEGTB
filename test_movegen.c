@@ -332,13 +332,14 @@ static bool test_inverse_king_same_material(void)
            table.predecessors == 9;
 }
 
-static bool test_random_positions(void)
+static bool test_random_positions(unsigned wm, unsigned bm,
+                                  unsigned wk, unsigned bk)
 {
     EgIndexer indexer;
     uint64_t state = UINT64_C(0x9e3779b97f4a7c15);
     uint64_t count;
     unsigned sample;
-    if (!eg_indexer_init(&indexer, 1, 2, 2, 2))
+    if (!eg_indexer_init(&indexer, wm, bm, wk, bk))
         return false;
     count = eg_position_count(&indexer);
     for (sample = 0; sample < 100000; ++sample) {
@@ -427,12 +428,14 @@ int main(void)
         fprintf(stderr, "inverse king/material-preservation test failed\n");
         return EXIT_FAILURE;
     }
-    if (!test_random_positions()) {
+    if (!test_random_positions(1, 2, 2, 2) ||
+        !test_random_positions(2, 2, 2, 2) ||
+        !test_random_positions(0, 7, 1, 0)) {
         fprintf(stderr, "randomized move-generation test failed: %s\n",
                 draughts_movegen_last_error());
         return EXIT_FAILURE;
     }
-    printf("move-generation tests: PASS (table/padded differential, 100000 "
-           "random seven-piece positions, both sides)\n");
+    printf("move-generation tests: PASS (table/padded differential, 300000 "
+           "random seven/eight-piece positions, both sides)\n");
     return EXIT_SUCCESS;
 }

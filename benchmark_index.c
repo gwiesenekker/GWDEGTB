@@ -32,7 +32,8 @@ static const Material largest[] = {
     {4, 1, 1, 1, 1},
     {5, 1, 1, 2, 1},
     {6, 1, 1, 2, 2},
-    {7, 1, 2, 2, 2}
+    {7, 1, 2, 2, 2},
+    {8, 2, 2, 2, 2}
 };
 
 static double now_seconds(void)

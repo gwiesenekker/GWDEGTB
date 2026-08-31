@@ -2,7 +2,7 @@
 
 This C library can calculate Distance-To-Mate (DTM) EGTBs for International Polish Draughts.
 
-GWDEGTB generates exact two-through-seven-piece endgame databases on the 50
+GWDEGTB supports exact two-through-eight-piece endgame databases on the 50
 playable squares of a 10x10 board. It includes a dense reversible position
 index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
@@ -23,6 +23,8 @@ regression and performance tests.
 - A repair pass for exact-DTM transpositions and otherwise unreachable setup
   positions, followed by fatal read-only verification.
 - Tested position counts for all 120 seven-piece material distributions.
+- Independent counts and sampled index/slice round trips for all 165
+  eight-piece material distributions; eight-piece move-generation tests.
 
 ## Requirements and build
 
@@ -164,8 +166,8 @@ make benchmark
 
 The benchmark separately times index inversion and inversion followed by
 ranking. Ranking time is the delta between those measurements. Small
-databases are repeated to exceed 100 million operations; the six- and
-seven-piece cases sample 110 million indices in 1,024 evenly spaced blocks.
+databases are repeated to exceed 100 million operations; the six-, seven- and
+eight-piece cases sample 110 million indices in 1,024 evenly spaced blocks.
 Use `./benchmark_index --full` for a complete traversal or
 `./benchmark_index --samples COUNT` to change the sample count.
 
@@ -225,7 +227,7 @@ previous mover would have had a compulsory capture. Thus every inverse move is
 a legal quiet forward move that preserves the material signature.
 
 The tests compare the compact table and padded implementations on focused rule
-cases and 100,000 random seven-piece positions for both sides:
+cases and 300,000 random seven/eight-piece positions for both sides:
 
 ```sh
 make test
@@ -270,8 +272,9 @@ and writable within their original -254..253-ply limits. Compaction preserves
 their format. Their pages expand to twice the header page size in cache;
 `egtb_cache_page_size()` reports this allocation size, and the generator adjusts
 dependency cache page counts to retain its configured byte budget. Existing
-WDL files and the GWD WDL API are unchanged. This change widens DTM values;
-the indexer/material limit remains seven pieces.
+WDL files and the GWD WDL API are unchanged. Material selection and the GWD
+registry support up to eight pieces; existing two-through-seven-piece indices
+and database formats are unchanged.
 
 Every v4 block carries CRC32C of the expanded 16-bit codes serialized in
 little-endian order; legacy blocks retain their original byte CRC. An implicit
@@ -306,6 +309,7 @@ For example:
 ./generate_egtb -j 16 1 1 1 1
 ```
 
+The accepted material range is 2..8 pieces, with at least one piece per side.
 The accepted thread count is 1..256. The target file must not already exist.
 Captures and promotions enter smaller or earlier material databases, so all
 dependencies must be present in the working directory. The supplied family
@@ -334,16 +338,19 @@ producing the same ordinary full-index `.dtm` file:
 ./generate_egtb --sliced -j 16 0 4 0 3
 ```
 
-The most-forward man identifies a slice. One colour with men gives nine
-slices; men of both colours give 81. White rows are generated from 2 through
-10 and, within each White row, Black rows from 9 through 1. A forward man move
+The most-forward man identifies a slice. One colour with men gives up to nine
+slices; men of both colours give up to 81. White rows are generated from 2
+toward 10 and, within each White row, Black rows from 9 toward 1, omitting
+empty frontier rows. A forward man move
 therefore either remains in the current slice or enters a completed read-only
 slice. Captures and promotions continue to use normal material dependencies.
 Each slice retains the full multithreaded frontier, consistency-repair, and
 read-only verification pipeline.
 
 Slice indices are independently dense. Their position counts sum exactly to
-the normal full-index count. After every slice is verified, a 9- or 81-way
+the normal full-index count. Empty slices are omitted: six or more men cannot
+fit behind a frontier on their final single row. After every nonempty slice
+is verified, an up-to-9- or up-to-81-way
 monotonic merge reranks its positions with the unchanged full index and writes
 the standard DTM. Missing, duplicate, or out-of-order full indices are fatal.
 The completed full database then undergoes the normal compaction and exhaustive
@@ -357,6 +364,33 @@ completed slice header and page checksum, restores its generation statistics,
 and resumes at the first missing slice. The workspace is deleted only after
 the final full database passes verification. Set `EGTB_KEEP_SLICES=1` to retain
 it deliberately, for example when testing restart behavior.
+
+### Eight-piece generation
+
+Eight-piece material uses the existing 16-bit DTM format and configurable
+2,048-byte pages. Generate all required capture and promotion dependencies
+first, in the same kings-first order as smaller databases. For example:
+
+```sh
+./generate_egtb -j 16 4 0 4 0
+./generate_egtb --sliced -j 16 0 4 0 4
+```
+
+The tests check all 165 eight-piece material counts, sampled full/slice index
+round trips, table/padded move generation, large frontier indices, GWD lookup
+and mirroring, and a small exhaustive slice with synthetic external DTMs.
+They do **not** constitute verification of a fully generated eight-piece EGTB.
+
+Memory and disk requirements remain substantial. Four kings against four
+kings has 37,581,505,500 positions (150,326,022,000 uncompressed DTM bytes for
+both sides). The largest eight-piece material has 884,567,138,400 positions.
+Five backtracking bitmaps alone need approximately `5 * positions / 8` bytes;
+use the current slice's count when estimating sliced generation memory.
+Add the page directory, caches, dependency views, assembly buffers and frontier
+storage. Men-row slices are unequal in size. The resident-memory limit selects
+cached verification when the full database will not fit; it does not cap all
+generator memory. Full eight-piece WDL loading also needs half a byte per
+position, so GWD should only attach databases that fit its memory budget.
 
 ## Generation pipeline
 

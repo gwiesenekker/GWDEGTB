@@ -5,7 +5,7 @@
 
 #include <stdbool.h>
 
-#define EGTB_MAX_PIECES 7
+#define EGTB_MAX_PIECES 8
 
 typedef struct {
     unsigned white_kings;

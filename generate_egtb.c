@@ -43,7 +43,8 @@ typedef struct {
 } CatalogEntry;
 
 typedef struct {
-    CatalogEntry entry[8][8][8][8];
+    CatalogEntry entry[EGTB_MAX_PIECES + 1][EGTB_MAX_PIECES + 1]
+                      [EGTB_MAX_PIECES + 1][EGTB_MAX_PIECES + 1];
     size_t cache_bytes;
     char error[256];
 } DatabaseCatalog;
@@ -416,8 +417,8 @@ int main(int argc, char **argv)
     }
     kind = egtb_material_resolve(&requested, &material);
     if (kind == EGTB_MATERIAL_INVALID || kind == EGTB_MATERIAL_TERMINAL) {
-        fprintf(stderr, "material must contain 2..7 pieces and at least one "
-                        "piece for each side\n");
+        fprintf(stderr, "material must contain 2..%u pieces and at least one "
+                        "piece for each side\n", EGTB_MAX_PIECES);
         return EXIT_FAILURE;
     }
     if (kind == EGTB_MATERIAL_MIRROR)

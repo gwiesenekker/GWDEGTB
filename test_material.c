@@ -52,7 +52,7 @@ int main(void)
                     else
                         return EXIT_FAILURE;
                 }
-    if (canonical_count != 134 || mirror_count != 125) {
+    if (canonical_count != 210 || mirror_count != 196) {
         fprintf(stderr, "unexpected material catalog counts\n");
         return EXIT_FAILURE;
     }
@@ -81,6 +81,6 @@ int main(void)
             return EXIT_FAILURE;
         }
     }
-    printf("material catalog tests: PASS (134 canonical, 125 mirrors)\n");
+    printf("material catalog tests: PASS (210 canonical, 196 mirrors)\n");
     return EXIT_SUCCESS;
 }

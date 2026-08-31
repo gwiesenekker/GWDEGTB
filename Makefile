@@ -11,7 +11,10 @@ BUILD_REVISION := $(strip $(shell cat REVISION))
 
 all: libgwdegtb.a test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap generate_egtb check_stats benchmark_index benchmark_combinatorial_index benchmark_egtb \
 	benchmark_movegen
-all: test_dtm16 test_progress
+all: test_dtm16 test_progress test_8piece
+
+test_8piece: test_8piece.o generator_padded.o frontier.o bitmap.o movegen.o libgwdegtb.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_progress: test_progress.o progress.o
 	$(CC) $(CFLAGS) -o $@ $^
@@ -93,6 +96,7 @@ benchmark_movegen: benchmark_movegen.c movegen.c movegen.h endgame_index.c \
 
 test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_dtm16 test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap
 	./test_progress
+	./test_8piece
 	./test_index
 	./test_slice_index
 	./test_sliced
@@ -124,9 +128,10 @@ benchmark-movegen: benchmark_movegen
 benchmark-combinatorial-index: benchmark_combinatorial_index
 	./benchmark_combinatorial_index
 
-test: test_progress
+test: test_progress test_8piece
 
 clean:
+	$(RM) test_8piece test_8piece.o
 	$(RM) test_progress test_progress.o
 	$(RM) test_dtm16 test_dtm16.o
 	$(RM) libgwdegtb.a test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap check_stats benchmark_index benchmark_combinatorial_index \
