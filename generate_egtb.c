@@ -18,14 +18,10 @@
 #define DEFAULT_VERIFICATION_CACHE_BYTES (UINT64_C(32) * GIBIBYTE)
 
 enum {
-    GENERATION_PAGE_SIZE = 1024,
+    DEFAULT_GENERATION_PAGE_SIZE = 2048,
     GENERATION_CACHE_BYTES = 1024 * 1024 * 1024,
     READONLY_CACHE_BYTES = 16 * 1024 * 1024,
-    DEPENDENCY_CACHE_BYTES = 64 * 1024 * 1024,
-    GENERATION_CACHE_PAGES = GENERATION_CACHE_BYTES / GENERATION_PAGE_SIZE,
-    READONLY_CACHE_PAGES = READONLY_CACHE_BYTES / GENERATION_PAGE_SIZE,
-    DEPENDENCY_CACHE_PAGES =
-        DEPENDENCY_CACHE_BYTES / GENERATION_PAGE_SIZE
+    DEPENDENCY_CACHE_BYTES = 64 * 1024 * 1024
 };
 
 static double wall_seconds(void)
@@ -47,7 +43,7 @@ typedef struct {
 
 typedef struct {
     CatalogEntry entry[8][8][8][8];
-    size_t cache_pages;
+    size_t cache_bytes;
     char error[256];
 } DatabaseCatalog;
 
@@ -58,11 +54,11 @@ static CatalogEntry *catalog_entry(DatabaseCatalog *catalog,
                           [material->black_kings][material->black_men];
 }
 
-static void initialize_catalog(DatabaseCatalog *catalog, size_t cache_pages)
+static void initialize_catalog(DatabaseCatalog *catalog, size_t cache_bytes)
 {
     unsigned wk, wm, bk, bm;
     memset(catalog, 0, sizeof(*catalog));
-    catalog->cache_pages = cache_pages;
+    catalog->cache_bytes = cache_bytes;
     for (wk = 0; wk <= EGTB_MAX_PIECES; ++wk)
         for (wm = 0; wm <= EGTB_MAX_PIECES; ++wm)
             for (bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
@@ -175,8 +171,10 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
                  egtb_last_error());
         return false;
     }
+    size_t pages = catalog->cache_bytes /
+                   egtb_cache_page_size(entry->database);
     if (!egtb_view_create(&entry->view, entry->database,
-                          catalog->cache_pages, false)) {
+                          pages == 0 ? 1 : pages, false)) {
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot create dependency view for %.100s: %.100s", path,
                  egtb_last_error());
@@ -285,6 +283,28 @@ static bool parse_thread_count(const char *text, unsigned *count)
     return true;
 }
 
+static bool configuration_page_size(uint32_t *page_size)
+{
+    const char *text = getenv("EGTB_PAGE_SIZE");
+    char *end;
+    unsigned long value;
+    if (text == NULL || *text == '\0') {
+        *page_size = DEFAULT_GENERATION_PAGE_SIZE;
+        return true;
+    }
+    if (*text < '0' || *text > '9')
+        return false;
+    errno = 0;
+    value = strtoul(text, &end, 10);
+    /* At least 64 int16_t values per page for bitmap ownership; the maximum
+     * bounds the worst-case escaped stream and its uint16_t Zstd length. */
+    if (errno != 0 || *end != '\0' || value < 128 || value > 32768 ||
+        (value & (value - 1)) != 0)
+        return false;
+    *page_size = (uint32_t)value;
+    return true;
+}
+
 static bool configuration_bytes(const char *name, uint64_t default_bytes,
                                 bool allow_zero, uint64_t *bytes)
 {
@@ -309,7 +329,7 @@ int main(int argc, char **argv)
     EgtbMaterial requested, material;
     EgtbMaterialKind kind;
     char path[128];
-    EgtbCreateOptions options = {GENERATION_CACHE_PAGES, 20, 9};
+    EgtbCreateOptions options = {0, 20, 9};
     EgtbGenerationStatistics generation;
     EgtbConsistencyStatistics final_verification = {0};
     EgtbStorageStatistics storage;
@@ -324,7 +344,8 @@ int main(int argc, char **argv)
     uint64_t *histogram = NULL;
     uint64_t positions, resident_limit_bytes, verification_cache_bytes;
     uint64_t compilation_buffer_bytes;
-    size_t verification_cache_pages;
+    size_t verification_cache_pages, generation_cache_pages, readonly_cache_pages;
+    uint32_t page_size;
     bool indexer_initialized = false;
     bool created = false;
     bool sliced = false;
@@ -342,6 +363,13 @@ int main(int argc, char **argv)
         return EXIT_SUCCESS;
     }
     printf("GWDEGTB revision %s starting\n", gwdegtb_revision);
+    if (!configuration_page_size(&page_size)) {
+        fprintf(stderr, "invalid EGTB_PAGE_SIZE: expected a power of two from 128 to 32768 bytes\n");
+        return EXIT_FAILURE;
+    }
+    generation_cache_pages = GENERATION_CACHE_BYTES / page_size;
+    readonly_cache_pages = READONLY_CACHE_BYTES / page_size;
+    options.cache_pages = generation_cache_pages;
     if (!configuration_bytes("EGTB_RESIDENT_LIMIT_GIB",
                              DEFAULT_RESIDENT_LIMIT_BYTES, true,
                              &resident_limit_bytes) ||
@@ -351,12 +379,12 @@ int main(int argc, char **argv)
         !configuration_bytes("EGTB_COMPILATION_BUFFER_GIB",
                              GIBIBYTE, false, &compilation_buffer_bytes) ||
         compilation_buffer_bytes > SIZE_MAX ||
-        verification_cache_bytes / GENERATION_PAGE_SIZE > SIZE_MAX) {
+        verification_cache_bytes / page_size > SIZE_MAX) {
         fprintf(stderr, "invalid resident/cache/compilation GiB configuration\n");
         return EXIT_FAILURE;
     }
     verification_cache_pages =
-        (size_t)(verification_cache_bytes / GENERATION_PAGE_SIZE);
+        (size_t)(verification_cache_bytes / page_size);
     while (material_argument < argc) {
         if (strcmp(argv[material_argument], "--sliced") == 0) {
             sliced = true;
@@ -412,7 +440,7 @@ int main(int argc, char **argv)
         goto done;
     }
     for (unsigned worker = 0; worker < thread_count; ++worker) {
-        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_PAGES);
+        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES);
         probe_contexts[worker] = &catalogs[worker];
     }
     if (sliced && material.white_men == 0 && material.black_men == 0) {
@@ -425,6 +453,8 @@ int main(int argc, char **argv)
            thread_count == 1 ? "" : "s",
            GENERATION_CACHE_BYTES / (1024 * 1024),
            DEPENDENCY_CACHE_BYTES / (1024 * 1024));
+    printf("DTM pages: %u bytes (%u positions per side)\n",
+           page_size, page_size / (unsigned)sizeof(int16_t));
     printf("frontier compilation: %" PRIu64 " MiB assembly buffer total\n",
            compilation_buffer_bytes / (1024 * 1024));
     fflush(stdout);
@@ -433,10 +463,10 @@ int main(int argc, char **argv)
     if (sliced) {
         EgtbSlicedOptions sliced_options = {
             thread_count,
-            GENERATION_PAGE_SIZE,
-            GENERATION_CACHE_PAGES,
-            READONLY_CACHE_PAGES,
-            GENERATION_CACHE_PAGES,
+            page_size,
+            generation_cache_pages,
+            readonly_cache_pages,
+            generation_cache_pages,
             20,
             9,
             catalog_probe,
@@ -456,14 +486,14 @@ int main(int argc, char **argv)
         created = true;
     } else {
         if (!egtb_create(&database, path, positions - 1,
-                         GENERATION_PAGE_SIZE, &options)) {
+                         page_size, &options)) {
             fprintf(stderr, "cannot create %s: %s\n", path,
                     egtb_last_error());
             goto done;
         }
         created = true;
         EgtbThreadOptions thread_options = {
-            thread_count, GENERATION_CACHE_PAGES, probe_contexts,
+            thread_count, generation_cache_pages, probe_contexts,
             &verified_positions, (size_t)compilation_buffer_bytes
         };
         if (!egtb_generate_threaded(database, &indexer, catalog_probe,
@@ -500,8 +530,8 @@ int main(int argc, char **argv)
         close_catalog(&catalogs[worker]);
     finalize_seconds = wall_seconds() - phase_started;
     phase_started = wall_seconds();
-    if (!egtb_compact(path, 9, READONLY_CACHE_PAGES) ||
-        !egtb_open_readonly(&database, path, READONLY_CACHE_PAGES)) {
+    if (!egtb_compact(path, 9, readonly_cache_pages) ||
+        !egtb_open_readonly(&database, path, readonly_cache_pages)) {
         fprintf(stderr, "cannot compact/reopen %s: %s\n", path,
                 egtb_last_error());
         goto done;
@@ -523,7 +553,7 @@ int main(int argc, char **argv)
     }
     phase_started = wall_seconds();
     for (unsigned worker = 0; worker < thread_count; ++worker) {
-        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_PAGES);
+        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES);
         probe_contexts[worker] = &catalogs[worker];
     }
     {

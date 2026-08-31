@@ -209,19 +209,39 @@ are exact signed ply counts:
 - `-1` means draw or not yet known during generation;
 - a side with no pieces or no legal move is lost in zero.
 
-DTM storage uses one signed byte for each side to move. Wins `1,3,...,253` are
-stored as `1,2,...,127`; losses `0,-2,...,-254` as `0,-1,...,-127`; stored
-`-128` represents draw/unknown. The API converts these bytes to public
-`int16_t` values.
+DTM caches, compilation buffers, and resident arrays use signed 16-bit codes
+for each side. Wins `1,3,...,32765` are stored as `(dtm+1)/2`; losses
+`0,-2,...,-32766` as `dtm/2`; `INT16_MIN` represents draw/unknown. Public
+retrieval still returns exact `int16_t` ply counts. `EgtbEntry` is now four bytes
+per position, so applications must rebuild against the updated library/header.
 
-Version 3 stores the complete white-to-move plane first, followed by the
-complete black-to-move plane. With 1,024-byte pages, one page represents 1,024
-positions for one side. Corresponding WTM and BTM pages are independently Zstd
-compressed and cached, while paired and resident APIs still present the same
-two values per position. Version-2 files, which stored 512 interleaved WTM/BTM
-pairs per page, remain readable and are compacted without changing format.
+New version-4 files keep separate WTM and BTM planes. The default 2,048-byte
+uncompressed page contains **1,024 values for one side**. Before Zstd compression, the
+16-bit codes are encoded into a variable-length stream:
 
-Every stored block carries a CRC32C of the uncompressed data. An implicit
+- `0x80` represents draw;
+- codes from -127 through 126 use their signed one-byte representation;
+- `0x7f` introduces a two-byte little-endian signed code for all other values
+  (including code 127, i.e. won in 253).
+
+Thus a default page's intermediate stream is `1024 + 2 * extended_value_count`
+bytes: 1,024 bytes in the common case, at most 3,072 bytes. Decompression validates
+the stream and reconstructs the fixed 2,048-byte page. A 1,024-byte page can still
+be selected; it holds 512 values with a 512–1,536-byte intermediate stream.
+This improves compact
+representation of common values, but smaller position counts per page can
+reduce Zstd's compression ratio compared with the old 8-bit format.
+
+Version-2 (paired byte) and version-3 (planar byte) databases remain readable
+and writable within their original -254..253-ply limits. Compaction preserves
+their format. Their pages expand to twice the header page size in cache;
+`egtb_cache_page_size()` reports this allocation size, and the generator adjusts
+dependency cache page counts to retain its configured byte budget. Existing
+WDL files and the GWD WDL API are unchanged. This change widens DTM values;
+the indexer/material limit remains seven pieces.
+
+Every v4 block carries CRC32C of the expanded 16-bit codes serialized in
+little-endian order; legacy blocks retain their original byte CRC. An implicit
 directory entry `(offset=0,length=0)` represents an all-draw page and consumes
 no block storage.
 
@@ -312,7 +332,7 @@ random-access DTM file. This avoids repeatedly scanning and rewriting the
 compressed database for every mate distance.
 
 1. **Create the index and empty database.** The legal position count and
-   maximum index are calculated for the fixed material. A version-2 DTM is
+   maximum index are calculated for the fixed material. A version-4 DTM is
    created logically as all draws.
 
 2. **Partition work at page boundaries.** Each worker owns a contiguous range
@@ -393,17 +413,32 @@ compressed database for every mate distance.
 
 ## Memory, caches, and configuration
 
-The default 1,024-byte v3 DTM page gives 1,024 positions for one side and exactly
+The default 2,048-byte v4 DTM page gives 1,024 positions for one side and exactly
 sixteen 64-bit bitmap words. Current production defaults are:
 
 | Purpose | Default |
 |---|---:|
+| DTM page size (`EGTB_PAGE_SIZE`) | 2,048 bytes |
 | Target writable cache | 1 GiB total |
 | Frontier compilation assembly buffer | 1 GiB total, divided among workers |
 | Dependency cache | 64 MiB per worker per opened dependency |
 | Ordinary read-only handle cache | 16 MiB |
 | Resident final-database limit | 32 GiB |
 | Nonresident final-verification cache | 32 GiB total |
+
+Override the DTM page size in bytes without recompiling:
+
+```sh
+EGTB_PAGE_SIZE=1024 ./generate_egtb -j 16 1 1 1 1
+EGTB_PAGE_SIZE=2048 EGTB_THREADS=16 ./4x3.sh
+```
+
+Accepted sizes are powers of two from 128 through 32,768 bytes. The generator
+prints the selected size at startup. The setting applies to normal and sliced
+generation; existing databases retain the page size recorded in their headers.
+A sliced workspace must be resumed with its original page size. Cache budgets
+remain byte-based, so larger pages reduce the number of cached pages, not the
+configured cache memory. WDL pages remain fixed at 1,024 bytes.
 
 The dependency-cache figure is potentially multiplied by both the worker
 count and the number of dependency databases actually opened. Cache metadata
@@ -425,7 +460,7 @@ paired logical pages, with a minimum of one such page per worker, and capped
 at each worker's position count. Sliced generation uses the same mechanism.
 
 Setting `EGTB_RESIDENT_LIMIT_GIB=0` disables the resident path. Resident
-loading is parallel. It is normally fastest when the complete two-byte-per-
+loading is parallel. It is normally fastest when the complete four-byte-per-
 position database fits comfortably in physical RAM. The generator reports
 cache lookups, hits, misses, decompressions, dirty evictions, compressed
 writes, storage ratios, and wall-clock time for each major phase.

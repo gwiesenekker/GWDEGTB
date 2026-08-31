@@ -214,7 +214,7 @@ bool egtb_initialize_terminal_positions_with_probe(
                 ++local.lost_in_zero[side];
             } else if (context.has_loss) {
                 if (context.shortest_loss >= EGTB_MAX_WIN_DTM)
-                    return fail("initialized winning DTM exceeds byte storage");
+                    return fail("initialized winning DTM exceeds 16-bit storage");
                 value = (int16_t)(context.shortest_loss + 1);
                 if (value == 1)
                     ++local.won_in_one[side];
@@ -222,7 +222,7 @@ bool egtb_initialize_terminal_positions_with_probe(
                     ++local.external_wins[side];
             } else if (!context.has_internal && !context.has_draw) {
                 if (context.longest_win >= EGTB_MAX_LOSS_DTM)
-                    return fail("initialized losing DTM exceeds byte storage");
+                    return fail("initialized losing DTM exceeds 16-bit storage");
                 value = (int16_t)-(context.longest_win + 1);
                 ++local.external_losses[side];
             } else {
@@ -1900,7 +1900,7 @@ bool egtb_generate(Egtb *database, const EgIndexer *indexer,
         uint64_t win_updates = 0;
         int16_t loss_distance;
         if (won_distance > EGTB_MAX_WIN_DTM)
-            return fail("DTM exceeds the byte storage representation");
+            return fail("DTM exceeds the 16-bit storage representation");
         loss_distance = (int16_t)(won_distance + 1);
         if (!egtb_backtrack_wins_to_losses_with_probe(
                 database, indexer, won_distance, external_probe,
@@ -1917,7 +1917,7 @@ bool egtb_generate(Egtb *database, const EgIndexer *indexer,
             break;
         local.maximum_dtm = (uint16_t)loss_distance;
         if (loss_distance >= EGTB_MAX_WIN_DTM)
-            return fail("DTM exceeds the byte storage representation");
+            return fail("DTM exceeds the 16-bit storage representation");
         if (!egtb_backtrack_losses_to_wins_with_probe(
                 database, indexer, loss_distance, external_probe,
                 external_context, &wins))
@@ -1933,7 +1933,7 @@ bool egtb_generate(Egtb *database, const EgIndexer *indexer,
             break;
         local.maximum_dtm = (uint16_t)(loss_distance + 1);
         if (won_distance > EGTB_MAX_WIN_DTM - 2)
-            return fail("DTM exceeds the byte storage representation");
+            return fail("DTM exceeds the 16-bit storage representation");
         won_distance = (int16_t)(won_distance + 2);
     }
     if (!egtb_make_consistent(database, indexer, external_probe,
@@ -1995,7 +1995,7 @@ typedef struct {
     EgtbEntry *compilation_buffer;
     uint64_t compilation_first;
     uint64_t compilation_end;
-    int8_t compilation_value;
+    int16_t compilation_value;
     EgtbInitializationStatistics initialization;
     bool failed;
     char error[256];
@@ -2056,7 +2056,7 @@ static bool initialize_frontier_range(FrontierWorker *worker)
             } else if (context.has_loss) {
                 if (context.shortest_loss >= EGTB_MAX_WIN_DTM) {
                     frontier_worker_error(
-                        worker, "initialized winning DTM exceeds byte storage");
+                        worker, "initialized winning DTM exceeds 16-bit storage");
                     return false;
                 }
                 value = (int16_t)(context.shortest_loss + 1);
@@ -2067,7 +2067,7 @@ static bool initialize_frontier_range(FrontierWorker *worker)
             } else if (!context.has_internal && !context.has_draw) {
                 if (context.longest_win >= EGTB_MAX_LOSS_DTM) {
                     frontier_worker_error(
-                        worker, "initialized losing DTM exceeds byte storage");
+                        worker, "initialized losing DTM exceeds 16-bit storage");
                     return false;
                 }
                 value = (int16_t)-(context.longest_win + 1);
@@ -2236,8 +2236,8 @@ static void compile_frontier_range(FrontierWorker *worker)
             count = worker->compilation_entries;
         worker->compilation_first = first;
         worker->compilation_end = first + count;
-        memset(buffer, (unsigned char)EGTB_STORED_DRAW,
-               (size_t)count * sizeof(*buffer));
+        for (size_t i = 0; i < (size_t)count; ++i)
+            buffer[i] = (EgtbEntry){EGTB_STORED_DRAW, EGTB_STORED_DRAW};
         /* Replay only this owner's streams, retaining the old longest-to-
          * shortest overwrite order for stale transposition records. */
         for (int distance = frontier_store_maximum_distance(worker->frontiers);
@@ -2627,7 +2627,7 @@ static bool egtb_generate_threaded_legacy(
         uint64_t loss_updates = 0, win_updates = 0;
         int16_t loss_distance;
         if (won_distance > EGTB_MAX_WIN_DTM) {
-            fail("DTM exceeds the byte storage representation");
+            fail("DTM exceeds the 16-bit storage representation");
             goto done;
         }
         loss_distance = (int16_t)(won_distance + 1);
@@ -2646,7 +2646,7 @@ static bool egtb_generate_threaded_legacy(
             break;
         local.maximum_dtm = (uint16_t)loss_distance;
         if (loss_distance >= EGTB_MAX_WIN_DTM) {
-            fail("DTM exceeds the byte storage representation");
+            fail("DTM exceeds the 16-bit storage representation");
             goto done;
         }
         if (!parallel_backtrack_losses(workers, threads, thread_count,
@@ -2663,7 +2663,7 @@ static bool egtb_generate_threaded_legacy(
             break;
         local.maximum_dtm = (uint16_t)(loss_distance + 1);
         if (won_distance > EGTB_MAX_WIN_DTM - 2) {
-            fail("DTM exceeds the byte storage representation");
+            fail("DTM exceeds the 16-bit storage representation");
             goto done;
         }
         won_distance = (int16_t)(won_distance + 2);
@@ -2837,7 +2837,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         int16_t loss_distance = (int16_t)(won_distance + 1);
         uint64_t loss_updates = 0, win_updates = 0;
         if (won_distance > EGTB_MAX_WIN_DTM) {
-            fail("DTM exceeds the byte storage representation");
+            fail("DTM exceeds the 16-bit storage representation");
             goto done;
         }
         for (side = 0; side < 2; ++side) {
@@ -2857,7 +2857,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         if (frontier_store_maximum_distance(frontiers) >=
             (uint16_t)loss_distance) {
             if (loss_distance >= EGTB_MAX_WIN_DTM) {
-                fail("DTM exceeds the byte storage representation");
+                fail("DTM exceeds the 16-bit storage representation");
                 goto done;
             }
             for (side = 0; side < 2; ++side) {
@@ -2880,7 +2880,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
             loss_updates == 0 && win_updates == 0)
             break;
         if (won_distance > EGTB_MAX_WIN_DTM - 2) {
-            fail("DTM exceeds the byte storage representation");
+            fail("DTM exceeds the 16-bit storage representation");
             goto done;
         }
         won_distance = (int16_t)(won_distance + 2);

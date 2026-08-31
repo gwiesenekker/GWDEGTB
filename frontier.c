@@ -235,16 +235,18 @@ bool frontier_store_create(FrontierStore **out, unsigned owner_count,
 
 void frontier_store_destroy(FrontierStore *store)
 {
-    size_t stream_count, i;
     unsigned owner;
     if (store == NULL)
         return;
-    stream_count = (size_t)2 * FRONTIER_DISTANCE_COUNT * store->owner_count;
     if (store->streams != NULL)
-        for (i = 0; i < stream_count; ++i) {
-            free(store->streams[i].pending);
-            free(store->streams[i].blocks);
-        }
+        for (unsigned side = 0; side < 2; ++side)
+            for (unsigned distance = 0; distance <= store->maximum_distance; ++distance)
+                for (owner = 0; owner < store->owner_count; ++owner) {
+                    FrontierStream *stream = get_stream(store, owner,
+                                                        (EgtbSide)side, distance);
+                    free(stream->pending);
+                    free(stream->blocks);
+                }
     if (store->owners != NULL)
         for (owner = 0; owner < store->owner_count; ++owner) {
             if (store->owners[owner].descriptor >= 0)
@@ -296,7 +298,7 @@ bool frontier_store_finish(FrontierStore *store)
     if (store == NULL)
         return frontier_fail("invalid frontier store");
     for (side = 0; side < 2; ++side)
-        for (distance = 0; distance < FRONTIER_DISTANCE_COUNT; ++distance)
+        for (distance = 0; distance <= store->maximum_distance; ++distance)
             for (owner = 0; owner < store->owner_count; ++owner) {
                 FrontierStream *stream = get_stream(
                     store, owner, (EgtbSide)side, distance);

@@ -372,7 +372,18 @@ done:
     return ok;
 }
 
-static bool test_threaded_wk_bk_generation(unsigned threads, size_t buffer_bytes)
+static bool probe_long_loss(const DraughtsPosition *position, EgtbSide side,
+                            void *context, int16_t *value)
+{
+    (void)position;
+    (void)side;
+    (void)context;
+    *value = -300;
+    return true;
+}
+
+static bool test_threaded_wk_bk_generation(unsigned threads, size_t buffer_bytes,
+                                          bool long_dtm)
 {
     char serial_path[] = "/tmp/ipd-generator-serial-XXXXXX";
     char threaded_path[] = "/tmp/ipd-generator-threaded-XXXXXX";
@@ -381,6 +392,7 @@ static bool test_threaded_wk_bk_generation(unsigned threads, size_t buffer_bytes
     EgtbGenerationStatistics serial_statistics, threaded_statistics;
     EgIndexer indexer;
     Egtb *serial = NULL, *threaded = NULL;
+    EgtbExternalProbe probe = long_dtm ? probe_long_loss : NULL;
     int serial_descriptor = mkstemp(serial_path);
     int threaded_descriptor = mkstemp(threaded_path);
     bool ok = false;
@@ -391,16 +403,18 @@ static bool test_threaded_wk_bk_generation(unsigned threads, size_t buffer_bytes
     serial_descriptor = threaded_descriptor = -1;
     unlink(serial_path);
     unlink(threaded_path);
-    if (!eg_indexer_init(&indexer, 0, 0, 1, 1))
+    if (!eg_indexer_init(&indexer, long_dtm ? 1 : 0, 0, long_dtm ? 0 : 1, 1))
         goto done;
     if (!egtb_create(&serial, serial_path, eg_max_index(&indexer), 1024,
                      &create_options) ||
         !egtb_create(&threaded, threaded_path, eg_max_index(&indexer), 1024,
                      &create_options) ||
-        !egtb_generate(serial, &indexer, NULL, NULL, NULL, NULL,
+        !egtb_generate(serial, &indexer, probe, NULL, NULL, NULL,
                        &serial_statistics) ||
-        !egtb_generate_threaded(threaded, &indexer, NULL, NULL, NULL, NULL,
+        !egtb_generate_threaded(threaded, &indexer, probe, NULL, NULL, NULL,
                                 &thread_options, &threaded_statistics))
+        goto destroy_indexer;
+    if (long_dtm && threaded_statistics.maximum_dtm <= 254)
         goto destroy_indexer;
     serial_statistics.initialization_seconds = 0.0;
     serial_statistics.backpropagation_seconds = 0.0;
@@ -418,7 +432,7 @@ static bool test_threaded_wk_bk_generation(unsigned threads, size_t buffer_bytes
     threaded_statistics.total_seconds = 0.0;
     memset(&threaded_statistics.consistency_cache, 0,
            sizeof(threaded_statistics.consistency_cache));
-    if (memcmp(&serial_statistics, &threaded_statistics,
+    if (!long_dtm && memcmp(&serial_statistics, &threaded_statistics,
                sizeof(serial_statistics)) != 0)
         goto destroy_indexer;
     for (uint64_t index = 0; index < eg_position_count(&indexer); ++index) {
@@ -430,6 +444,21 @@ static bool test_threaded_wk_bk_generation(unsigned threads, size_t buffer_bytes
                 serial_value != threaded_value)
                 goto destroy_indexer;
         }
+    }
+    if (long_dtm) {
+        EgtbVerificationOptions verification = {threads, 16, NULL, NULL};
+        if (!egtb_close(threaded)) {
+            threaded = NULL;
+            goto destroy_indexer;
+        }
+        threaded = NULL;
+        if (!egtb_compact(threaded_path, 3, 2) ||
+            !egtb_open_readonly(&threaded, threaded_path, 2) ||
+            !egtb_verify_consistent_threaded(threaded, &indexer, probe, NULL,
+                                             &verification, NULL, NULL))
+            goto destroy_indexer;
+        printf("wide frontier generation: maximum DTM=%u, serial/threaded values match\n",
+               threaded_statistics.maximum_dtm);
     }
     ok = true;
 destroy_indexer:
@@ -583,9 +612,10 @@ int main(void)
     }
     /* One-page buffers force replay across batches, including the partial
      * last page. Also exercise the default budget and excess worker count. */
-    if (!test_threaded_wk_bk_generation(1, 2048) ||
-        !test_threaded_wk_bk_generation(2, 4096) ||
-        !test_threaded_wk_bk_generation(4, 0)) {
+    if (!test_threaded_wk_bk_generation(1, 2048, false) ||
+        !test_threaded_wk_bk_generation(2, 4096, false) ||
+        !test_threaded_wk_bk_generation(4, 0, false) ||
+        !test_threaded_wk_bk_generation(2, 4096, true)) {
         fprintf(stderr, "threaded WK-BK equivalence test failed: %s / %s\n",
                 egtb_generator_last_error(), egtb_last_error());
         return EXIT_FAILURE;

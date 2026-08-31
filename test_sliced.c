@@ -17,7 +17,7 @@ static bool draw_probe(const DraughtsPosition *position, EgtbSide side,
     return true;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     char directory[] = "/tmp/gwdegtb-sliced-test-XXXXXX";
     char unsliced_path[256] = "", sliced_path[256] = "";
@@ -35,6 +35,12 @@ int main(void)
         draw_probe, NULL, NULL, NULL, NULL, true, 4096
     };
     bool ok = false;
+    uint32_t page_size = 1024;
+    if (argc == 2 && strcmp(argv[1], "2048") == 0)
+        page_size = 2048;
+    else if (argc != 1)
+        return EXIT_FAILURE;
+    sliced_options.page_size = page_size;
     if (mkdtemp(directory) == NULL)
         goto done;
     snprintf(unsliced_path, sizeof(unsliced_path), "%s/unsliced.dtm",
@@ -42,7 +48,7 @@ int main(void)
     snprintf(sliced_path, sizeof(sliced_path), "%s/sliced.dtm", directory);
     if (!eg_indexer_init(&indexer, 1, 1, 0, 0) ||
         !egtb_create(&unsliced, unsliced_path,
-                     eg_position_count(&indexer) - 1, 1024,
+                     eg_position_count(&indexer) - 1, page_size,
                      &create_options) ||
         !egtb_generate_threaded(unsliced, &indexer, draw_probe, NULL,
                                 NULL, NULL, &thread_options,

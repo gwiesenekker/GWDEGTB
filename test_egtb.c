@@ -71,8 +71,8 @@ static bool test_dtm_byte_encoding(void)
         -EGTB_MAX_LOSS_DTM, -252, -2, 0, EGTB_DRAW, 1, 3,
         EGTB_MAX_WIN_DTM
     };
-    static const int8_t stored_values[] = {
-        -127, -126, -1, 0, EGTB_STORED_DRAW, 1, 2, 127
+    static const int16_t stored_values[] = {
+        -16383, -126, -1, 0, EGTB_STORED_DRAW, 1, 2, 16383
     };
     char path[] = "/tmp/ipd-egtb-byte-encoding-XXXXXX";
     EgtbCreateOptions options = {1, 20, 3};
@@ -85,7 +85,7 @@ static bool test_dtm_byte_encoding(void)
     unlink(path);
     for (uint64_t index = 0;
          index < sizeof(values) / sizeof(values[0]); ++index) {
-        int8_t stored;
+        int16_t stored;
         if (!egtb_encode_dtm(values[index], &stored) ||
             stored != stored_values[index] ||
             egtb_decode_dtm(stored) != values[index])
@@ -103,8 +103,8 @@ static bool test_dtm_byte_encoding(void)
             read_back != values[index])
             goto done;
     }
-    if (egtb_set(database, 0, EGTB_WHITE_TO_MOVE, 255) ||
-        egtb_set(database, 0, EGTB_WHITE_TO_MOVE, -256) ||
+    if (egtb_set(database, 0, EGTB_WHITE_TO_MOVE, 32767) ||
+        egtb_set(database, 0, EGTB_WHITE_TO_MOVE, INT16_MIN) ||
         egtb_set(database, 0, EGTB_WHITE_TO_MOVE, 2) ||
         egtb_set(database, 0, EGTB_WHITE_TO_MOVE, -3))
         goto done;
@@ -357,7 +357,7 @@ static bool test_concurrent_ranged_views(void)
     EgtbView *views[2] = {NULL, NULL};
     RangedWriter writers[2] = {0};
     pthread_t threads[2];
-    const uint64_t positions = 64 * 1024;
+    const uint64_t positions = 64 * 512;
     int descriptor = mkstemp(path);
     unsigned created = 0;
     bool ok = false;
@@ -478,10 +478,10 @@ static bool test_complete_page_writes(void)
     EgtbCreateOptions options = {2, 20, 3};
     Egtb *database = NULL;
     EgtbView *view = NULL;
-    EgtbEntry entries[1024];
+    EgtbEntry entries[512];
     EgtbCacheStatistics cache;
     EgtbStorageStatistics empty, written;
-    const uint64_t positions = 4 * 1024 + 13;
+    const uint64_t positions = 4 * 512 + 13;
     int descriptor = mkstemp(path);
     bool ok = false;
     if (descriptor < 0)
@@ -493,12 +493,12 @@ static bool test_complete_page_writes(void)
         !egtb_view_create(&view, database, 2, true))
         goto done;
     for (uint64_t page = 0; page < 5; ++page) {
-        size_t count = page == 4 ? 13 : 1024;
+        size_t count = page == 4 ? 13 : 512;
         for (size_t i = 0; i < count; ++i) {
             entries[i].white_to_move = page == 1 ? EGTB_STORED_DRAW
-                : (int8_t)((int)(i % 256) - 128);
+                : (int16_t)((int)(i % 256) - 128);
             entries[i].black_to_move = page == 1 ? EGTB_STORED_DRAW
-                : (int8_t)(127 - (int)(i % 256));
+                : (int16_t)(127 - (int)(i % 256));
         }
         if (egtb_view_write_page(view, page, entries, count - 1) ||
             !egtb_view_write_page(view, page, entries, count))
@@ -529,10 +529,10 @@ static bool test_complete_page_writes(void)
         goto done;
     for (uint64_t index = 0; index < positions; ++index) {
         int16_t white, black;
-        int8_t expected_white = index / 1024 == 1 ? EGTB_STORED_DRAW
-            : (int8_t)((int)(index % 256) - 128);
-        int8_t expected_black = index / 1024 == 1 ? EGTB_STORED_DRAW
-            : (int8_t)(127 - (int)(index % 256));
+        int16_t expected_white = index / 512 == 1 ? EGTB_STORED_DRAW
+            : (int16_t)((int)(index % 256) - 128);
+        int16_t expected_black = index / 512 == 1 ? EGTB_STORED_DRAW
+            : (int16_t)(127 - (int)(index % 256));
         if (!egtb_get(database, index, EGTB_WHITE_TO_MOVE, &white) ||
             !egtb_get(database, index, EGTB_BLACK_TO_MOVE, &black) ||
             white != egtb_decode_dtm(expected_white) ||
@@ -796,7 +796,7 @@ int main(void)
     {
         unsigned char directory_entry[10];
         unsigned char original_checksum_byte;
-        uint64_t page = last_index / 1024;
+        uint64_t page = last_index / 512;
         uint64_t block_offset;
         int16_t ignored;
         FILE *file = fopen(path, "r+b");

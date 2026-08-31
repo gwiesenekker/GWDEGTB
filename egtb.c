@@ -61,6 +61,8 @@ struct Egtb {
     uint64_t *offsets;
     uint16_t *lengths;
     uint32_t page_size;
+    uint32_t memory_page_size;
+    uint32_t codec_capacity;
     uint32_t entries_per_page;
     uint32_t entry_index_mask;
     unsigned entry_index_shift;
@@ -82,6 +84,7 @@ struct Egtb {
     ZSTD_CCtx *compressor;
     ZSTD_DCtx *decompressor;
     unsigned char *compressed;
+    unsigned char *codec;
     size_t compressed_capacity;
     struct Egtb *registry_next;
 };
@@ -95,6 +98,7 @@ struct EgtbView {
     ZSTD_CCtx *compressor;
     ZSTD_DCtx *decompressor;
     unsigned char *compressed;
+    unsigned char *codec;
     size_t compressed_capacity;
     uint64_t first_page;
     uint64_t end_page;
@@ -109,7 +113,7 @@ struct EgtbResident {
     Egtb *backing;
     EgtbEntry *entries;
     uint64_t allocated_bytes;
-    uint64_t stored_histogram[2][256];
+    uint64_t stored_histogram[2][65536];
 };
 
 static const unsigned char egtb_magic[8] = {'I','P','D','E','G','T','B','\0'};
@@ -119,7 +123,7 @@ static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
 static uint32_t crc32c_table[256];
 
-_Static_assert(sizeof(EgtbEntry) == 2, "EgtbEntry must occupy two bytes");
+_Static_assert(sizeof(EgtbEntry) == 4, "EgtbEntry must occupy four bytes");
 
 static unsigned power_of_two_shift(size_t value)
 {
@@ -184,7 +188,7 @@ const char *egtb_last_error(void)
     return last_error;
 }
 
-bool egtb_encode_dtm(int16_t value, int8_t *stored)
+bool egtb_encode_dtm(int16_t value, int16_t *stored)
 {
     if (stored == NULL)
         return false;
@@ -193,17 +197,17 @@ bool egtb_encode_dtm(int16_t value, int8_t *stored)
         return true;
     }
     if (value > 0 && value <= EGTB_MAX_WIN_DTM && value % 2 != 0) {
-        *stored = (int8_t)((value + 1) / 2);
+        *stored = (int16_t)((value + 1) / 2);
         return true;
     }
     if (value <= 0 && value >= -EGTB_MAX_LOSS_DTM && value % 2 == 0) {
-        *stored = (int8_t)(value / 2);
+        *stored = (int16_t)(value / 2);
         return true;
     }
     return false;
 }
 
-int16_t egtb_decode_dtm(int8_t stored)
+int16_t egtb_decode_dtm(int16_t stored)
 {
     if (stored == EGTB_STORED_DRAW)
         return EGTB_DRAW;
@@ -344,6 +348,26 @@ static bool write_header(Egtb *egtb)
     return write_at(egtb->file, 0, header, sizeof(header));
 }
 
+static bool configure_page_layout(Egtb *egtb)
+{
+    bool wide = egtb->format_version == EGTB_FORMAT_VERSION;
+    if (egtb->format_version != EGTB_LEGACY_FORMAT_VERSION &&
+        egtb->format_version != EGTB_BYTE_PLANAR_FORMAT_VERSION && !wide)
+        return fail("unsupported EGTB version %u", egtb->format_version);
+    egtb->planar = egtb->format_version >= EGTB_BYTE_PLANAR_FORMAT_VERSION;
+    if (egtb->page_size == 0 || egtb->page_size > UINT16_MAX ||
+        ((wide || !egtb->planar) && egtb->page_size % 2 != 0))
+        return fail("invalid EGTB page size");
+    egtb->memory_page_size = wide ? egtb->page_size : 2 * egtb->page_size;
+    egtb->codec_capacity = wide ? 3 * (egtb->page_size / 2) : egtb->page_size;
+    if (ZSTD_compressBound(egtb->codec_capacity) > UINT16_MAX)
+        return fail("page codec is too large for 16-bit compressed lengths");
+    egtb->entries_per_page = (wide || !egtb->planar)
+                                ? egtb->page_size / 2 : egtb->page_size;
+    configure_entry_indexing(egtb);
+    return true;
+}
+
 static bool read_header(Egtb *egtb)
 {
     unsigned char header[EGTB_HEADER_SIZE];
@@ -352,13 +376,9 @@ static bool read_header(Egtb *egtb)
         return false;
     if (memcmp(header, egtb_magic, sizeof(egtb_magic)) != 0)
         return fail("not an International Polish Draughts EGTB");
-    if (header[8] != EGTB_LEGACY_FORMAT_VERSION &&
-        header[8] != EGTB_FORMAT_VERSION)
-        return fail("unsupported EGTB version %u", (unsigned)header[8]);
     if (get_u16(header + 10) != EGTB_HEADER_SIZE)
         return fail("unsupported EGTB header size");
     egtb->format_version = header[8];
-    egtb->planar = egtb->format_version >= EGTB_FORMAT_VERSION;
     egtb->exact_layout = (header[9] & EGTB_FLAG_EXACT_LAYOUT) != 0;
     egtb->page_size = get_u32(header + 12);
     egtb->maximum_index = get_u64(header + 16);
@@ -367,13 +387,8 @@ static bool read_header(Egtb *egtb)
     egtb->data_offset = get_u64(header + 40);
     egtb->reserve_percent = get_u16(header + 48);
     egtb->compression_level = (int16_t)get_u16(header + 50);
-    if (egtb->page_size == 0 ||
-        (!egtb->planar && egtb->page_size % sizeof(EgtbEntry) != 0))
-        return fail("invalid EGTB page size");
-    egtb->entries_per_page = egtb->planar
-                                 ? egtb->page_size
-                                 : egtb->page_size / sizeof(EgtbEntry);
-    configure_entry_indexing(egtb);
+    if (!configure_page_layout(egtb))
+        return false;
     if (egtb->maximum_index == UINT64_MAX)
         return fail("invalid EGTB maximum index");
     entry_count = egtb->maximum_index + 1;
@@ -428,16 +443,119 @@ static uint32_t crc32c(const void *data, size_t size)
     return ~crc;
 }
 
+
+/* v4: 0x80 = draw, 0x7f = escape + little-endian signed 16-bit
+ * half-distance. Other bytes are signed compact half-distances.
+ * CRC32C covers the expanded little-endian 16-bit codes, not the stream.
+ * v2/v3 retain their original byte payload and byte CRC. */
+static int16_t page_code(const Egtb *egtb, const EgtbEntry *entries, size_t i)
+{
+    if (egtb->planar)
+        return ((const int16_t *)(const void *)entries)[i];
+    return i % 2 == 0 ? entries[i / 2].white_to_move
+                       : entries[i / 2].black_to_move;
+}
+
+static void set_page_code(const Egtb *egtb, EgtbEntry *entries,
+                          size_t i, int16_t code)
+{
+    if (egtb->planar)
+        ((int16_t *)(void *)entries)[i] = code;
+    else if (i % 2 == 0)
+        entries[i / 2].white_to_move = code;
+    else
+        entries[i / 2].black_to_move = code;
+}
+
+static bool valid_code(const Egtb *egtb, int16_t code)
+{
+    int limit = egtb->format_version == EGTB_FORMAT_VERSION ? 16383 : 127;
+    return code == EGTB_STORED_DRAW || (code >= -limit && code <= limit);
+}
+
+static bool encode_page(const Egtb *egtb, const EgtbEntry *entries,
+                         unsigned char *codec, size_t *size, uint32_t *checksum)
+{
+    bool wide = egtb->format_version == EGTB_FORMAT_VERSION;
+    unsigned char *canonical = codec + egtb->codec_capacity;
+    size_t used = 0, count = egtb->memory_page_size / 2;
+    for (size_t i = 0; i < count; ++i) {
+        int16_t code = page_code(egtb, entries, i);
+        if (!valid_code(egtb, code))
+            return fail("DTM cannot be represented in this file version");
+        if (wide)
+            put_u16(canonical + 2 * i, (uint16_t)code);
+        if (code == EGTB_STORED_DRAW)
+            codec[used++] = 0x80;
+        else if (!wide || (code >= -127 && code <= 126))
+            codec[used++] = (unsigned char)code;
+        else {
+            codec[used++] = 0x7f;
+            put_u16(codec + used, (uint16_t)code);
+            used += 2;
+        }
+    }
+    *size = used;
+    *checksum = wide ? crc32c(canonical, egtb->memory_page_size)
+                     : crc32c(codec, used);
+    return true;
+}
+
+static bool decode_page(const Egtb *egtb, ZSTD_DCtx *decompressor,
+                         const void *compressed, size_t length,
+                         unsigned char *codec, EgtbEntry *entries,
+                         uint32_t expected_checksum)
+{
+    bool wide = egtb->format_version == EGTB_FORMAT_VERSION;
+    unsigned char *canonical = codec + egtb->codec_capacity;
+    size_t size = ZSTD_decompressDCtx(decompressor, codec,
+                                      egtb->codec_capacity, compressed, length);
+    size_t used = 0, count = egtb->memory_page_size / 2;
+    if (ZSTD_isError(size))
+        return fail("Zstd decompression failed: %s", ZSTD_getErrorName(size));
+    for (size_t i = 0; i < count; ++i) {
+        int16_t code;
+        unsigned byte;
+        if (used == size)
+            return fail("truncated DTM byte stream");
+        byte = codec[used++];
+        if (byte == 0x80)
+            code = EGTB_STORED_DRAW;
+        else if (wide && byte == 0x7f) {
+            uint16_t raw;
+            if (size - used < 2)
+                return fail("truncated DTM escape");
+            raw = get_u16(codec + used);
+            code = (int16_t)(raw <= INT16_MAX ? (int)raw : (int)raw - 65536);
+            used += 2;
+            if (code == EGTB_STORED_DRAW || (code >= -127 && code <= 126))
+                return fail("noncanonical DTM escape");
+        } else
+            code = (int16_t)(byte < 128 ? (int)byte : (int)byte - 256);
+        if (!valid_code(egtb, code))
+            return fail("invalid DTM code");
+        set_page_code(egtb, entries, i, code);
+        if (wide)
+            put_u16(canonical + 2 * i, (uint16_t)code);
+    }
+    if (used != size)
+        return fail("trailing bytes in DTM page");
+    if ((wide ? crc32c(canonical, egtb->memory_page_size) : crc32c(codec, size))
+        != expected_checksum)
+        return fail("CRC32C mismatch for uncompressed page");
+    return true;
+}
+
 static uint32_t slot_checksum(uint32_t slot, const EgtbEntry *entry)
 {
-    uint32_t values = (uint8_t)entry->white_to_move |
-                      (uint32_t)(uint8_t)entry->black_to_move << 8;
+    uint32_t values = (uint16_t)entry->white_to_move |
+                      (uint32_t)(uint16_t)entry->black_to_move << 16;
     return mix32(values ^ mix32(slot + UINT32_C(0x9e3779b9)));
 }
 
-static uint32_t value_checksum(uint32_t slot, int8_t value)
+static uint32_t value_checksum(uint32_t slot, int16_t value)
 {
-    return mix32((uint8_t)value ^ mix32(slot + UINT32_C(0x9e3779b9)));
+    return mix32((uint16_t)value ^ mix32(slot + UINT32_C(0x9e3779b9)));
 }
 
 static uint32_t page_checksum(const Egtb *egtb, const EgtbEntry *entries)
@@ -445,7 +563,7 @@ static uint32_t page_checksum(const Egtb *egtb, const EgtbEntry *entries)
     uint32_t checksum = 0;
     uint32_t i;
     if (egtb->planar) {
-        const int8_t *values = (const int8_t *)(const void *)entries;
+        const int16_t *values = (const int16_t *)(const void *)entries;
         for (i = 0; i < egtb->entries_per_page; ++i)
             checksum ^= value_checksum(i, values[i]);
         return checksum;
@@ -481,10 +599,10 @@ static bool cache_init(Egtb *egtb, size_t capacity)
         --capacity;
     if (capacity == 0)
         capacity = 1;
-    if (capacity > SIZE_MAX / egtb->page_size)
+    if (capacity > SIZE_MAX / egtb->memory_page_size)
         return fail("page cache byte size overflows size_t");
     cache->entries = calloc(capacity, sizeof(*cache->entries));
-    cache->data = malloc(capacity * egtb->page_size);
+    cache->data = malloc(capacity * egtb->memory_page_size);
     if (cache->entries == NULL || cache->data == NULL)
         return fail("cannot allocate page cache");
     cache->capacity = capacity;
@@ -505,23 +623,23 @@ static void cache_invalidate(PageCache *cache)
 
 static EgtbEntry *cache_data(Egtb *egtb, size_t index)
 {
-    return (EgtbEntry *)(void *)(egtb->cache.data + index * egtb->page_size);
+    return (EgtbEntry *)(void *)(egtb->cache.data + index * egtb->memory_page_size);
 }
 
-static int8_t stored_value(const Egtb *egtb, const EgtbEntry *entries,
+static int16_t stored_value(const Egtb *egtb, const EgtbEntry *entries,
                            uint32_t slot, EgtbSide side)
 {
     if (egtb->planar)
-        return ((const int8_t *)(const void *)entries)[slot];
+        return ((const int16_t *)(const void *)entries)[slot];
     return side == EGTB_WHITE_TO_MOVE ? entries[slot].white_to_move :
                                         entries[slot].black_to_move;
 }
 
 static void replace_stored_value(const Egtb *egtb, EgtbEntry *entries,
-                                 uint32_t slot, EgtbSide side, int8_t value)
+                                 uint32_t slot, EgtbSide side, int16_t value)
 {
     if (egtb->planar)
-        ((int8_t *)(void *)entries)[slot] = value;
+        ((int16_t *)(void *)entries)[slot] = value;
     else if (side == EGTB_WHITE_TO_MOVE)
         entries[slot].white_to_move = value;
     else
@@ -540,7 +658,7 @@ static bool all_draws(const Egtb *egtb, const EgtbEntry *entries)
 {
     uint32_t i;
     if (egtb->planar) {
-        const int8_t *values = (const int8_t *)(const void *)entries;
+        const int16_t *values = (const int16_t *)(const void *)entries;
         for (i = 0; i < egtb->entries_per_page; ++i)
             if (values[i] != EGTB_STORED_DRAW)
                 return false;
@@ -583,13 +701,13 @@ static bool append_block(Egtb *egtb, uint32_t checksum,
 static bool store_page_with_runtime(Egtb *egtb, ZSTD_CCtx *compressor,
                                     unsigned char *compressed,
                                     size_t compressed_capacity,
-                                    uint64_t page,
+                                    unsigned char *codec, uint64_t page,
                                     const EgtbEntry *entries, bool exact,
                                     bool synchronize_append)
 {
     uint64_t old_offset = egtb->offsets[page];
     uint16_t old_length = egtb->lengths[page];
-    size_t compressed_size;
+    size_t compressed_size, encoded_size;
     uint16_t length, minimum, available;
     uint32_t checksum;
     unsigned char checksum_bytes[EGTB_BLOCK_HEADER_SIZE];
@@ -599,9 +717,11 @@ static bool store_page_with_runtime(Egtb *egtb, ZSTD_CCtx *compressor,
         egtb->lengths[page] = 0;
         return true;
     }
+    if (!encode_page(egtb, entries, codec, &encoded_size, &checksum))
+        return false;
     compressed_size = ZSTD_compressCCtx(compressor, compressed,
-                                        compressed_capacity, entries,
-                                        egtb->page_size,
+                                        compressed_capacity, codec,
+                                        encoded_size,
                                         egtb->compression_level);
     if (ZSTD_isError(compressed_size))
         return fail("Zstd compression failed: %s",
@@ -609,7 +729,6 @@ static bool store_page_with_runtime(Egtb *egtb, ZSTD_CCtx *compressor,
     if (compressed_size == 0 || compressed_size > UINT16_MAX)
         return fail("compressed page does not fit in 16-bit length");
     length = (uint16_t)compressed_size;
-    checksum = crc32c(entries, egtb->page_size);
     put_u32(checksum_bytes, checksum);
     minimum = exact ? length :
         (uint16_t)(((uint64_t)egtb->page_size * egtb->reserve_percent + 99) / 100);
@@ -653,7 +772,7 @@ static bool store_page(Egtb *egtb, uint64_t page, const EgtbEntry *entries,
 {
     return store_page_with_runtime(
         egtb, egtb->compressor, egtb->compressed,
-        egtb->compressed_capacity, page, entries, exact, false);
+        egtb->compressed_capacity, egtb->codec, page, entries, exact, false);
 }
 
 static bool flush_cache_entry(Egtb *egtb, size_t index)
@@ -678,7 +797,9 @@ static void fill_draw_page(Egtb *egtb, EgtbEntry *entries)
 {
     uint32_t i;
     if (egtb->planar) {
-        memset(entries, (unsigned char)EGTB_STORED_DRAW, egtb->page_size);
+        int16_t *values = (int16_t *)(void *)entries;
+        for (i = 0; i < egtb->entries_per_page; ++i)
+            values[i] = EGTB_STORED_DRAW;
         return;
     }
     for (i = 0; i < egtb->entries_per_page; ++i) {
@@ -691,9 +812,8 @@ static bool load_page(Egtb *egtb, uint64_t page, EgtbEntry *entries)
 {
     uint64_t offset;
     uint16_t length;
-    size_t decompressed;
     unsigned char checksum_bytes[EGTB_BLOCK_HEADER_SIZE];
-    uint32_t expected_checksum, actual_checksum;
+    uint32_t expected_checksum;
     if (!directory_entry(egtb, page, &offset, &length))
         return false;
     if (offset == 0) {
@@ -707,18 +827,8 @@ static bool load_page(Egtb *egtb, uint64_t page, EgtbEntry *entries)
                  egtb->compressed, length))
         return false;
     expected_checksum = get_u32(checksum_bytes);
-    decompressed = ZSTD_decompressDCtx(egtb->decompressor, entries,
-                                       egtb->page_size, egtb->compressed,
-                                       length);
-    if (ZSTD_isError(decompressed))
-        return fail("Zstd decompression failed for page %" PRIu64 ": %s",
-                    page, ZSTD_getErrorName(decompressed));
-    if (decompressed != egtb->page_size)
-        return fail("decompressed page has an invalid size");
-    actual_checksum = crc32c(entries, egtb->page_size);
-    if (actual_checksum != expected_checksum)
-        return fail("CRC32C mismatch for uncompressed page %" PRIu64, page);
-    return true;
+    return decode_page(egtb, egtb->decompressor, egtb->compressed, length,
+                       egtb->codec, entries, expected_checksum);
 }
 
 static bool cached_page(Egtb *egtb, uint64_t page, size_t *result)
@@ -783,6 +893,7 @@ static void destroy_egtb(Egtb *egtb)
     cache_destroy(&egtb->cache);
     ZSTD_freeCCtx(egtb->compressor);
     ZSTD_freeDCtx(egtb->decompressor);
+    free(egtb->codec);
     free(egtb->compressed);
     free(egtb->offsets);
     free(egtb->lengths);
@@ -805,13 +916,14 @@ static bool allocate_runtime(Egtb *egtb, size_t cache_pages)
 {
     if (crc32c("123456789", 9) != UINT32_C(0xe3069283))
         return fail("internal CRC32C self-test failed");
-    egtb->compressed_capacity = ZSTD_compressBound(egtb->page_size);
+    egtb->compressed_capacity = ZSTD_compressBound(egtb->codec_capacity);
     if (egtb->compressed_capacity > UINT16_MAX)
         return fail("page size is too large for 16-bit compressed lengths");
     egtb->compressed = malloc(egtb->compressed_capacity);
+    egtb->codec = malloc(egtb->codec_capacity + egtb->memory_page_size);
     egtb->compressor = ZSTD_createCCtx();
     egtb->decompressor = ZSTD_createDCtx();
-    if (egtb->compressed == NULL || egtb->compressor == NULL ||
+    if (egtb->codec == NULL || egtb->compressed == NULL || egtb->compressor == NULL ||
         egtb->decompressor == NULL)
         return fail("cannot allocate Zstd context or buffer");
     return cache_init(egtb, cache_pages);
@@ -905,10 +1017,7 @@ static bool create_with_version(Egtb **out, const char *path,
     if (options == NULL)
         options = &defaults;
     if (path == NULL || page_size == 0 ||
-        (format_version == EGTB_LEGACY_FORMAT_VERSION &&
-         page_size % sizeof(EgtbEntry) != 0) ||
-        (format_version != EGTB_LEGACY_FORMAT_VERSION &&
-         format_version != EGTB_FORMAT_VERSION) || options->cache_pages == 0 ||
+        options->cache_pages == 0 ||
         options->reserve_percent > 100 || maximum_index == UINT64_MAX)
         return fail("invalid EGTB creation argument");
     if (ZSTD_compressBound(page_size) > UINT16_MAX)
@@ -922,12 +1031,11 @@ static bool create_with_version(Egtb **out, const char *path,
         return false;
     }
     egtb->format_version = format_version;
-    egtb->planar = format_version >= EGTB_FORMAT_VERSION;
     egtb->page_size = page_size;
-    egtb->entries_per_page = egtb->planar
-                                 ? page_size
-                                 : page_size / sizeof(EgtbEntry);
-    configure_entry_indexing(egtb);
+    if (!configure_page_layout(egtb)) {
+        destroy_egtb(egtb);
+        return false;
+    }
     egtb->maximum_index = maximum_index;
     entries = maximum_index + 1;
     egtb->side_page_count = entries / egtb->entries_per_page +
@@ -1108,11 +1216,12 @@ bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value)
     CacheEntry *cache_entry;
     EgtbEntry *entries;
     EgtbEntry old;
-    int8_t old_value;
-    int8_t stored;
+    int16_t old_value;
+    int16_t stored;
     if (egtb == NULL || egtb->readonly || egtb->writable_views != 0 ||
         index > egtb->maximum_index ||
         !egtb_encode_dtm(value, &stored) ||
+        !valid_code(egtb, stored) ||
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid EGTB update");
     split_storage_index(egtb, index, side, &page, &slot);
@@ -1147,7 +1256,9 @@ bool egtb_set_pair(Egtb *egtb, uint64_t index,
     if (egtb == NULL || egtb->readonly || egtb->writable_views != 0 ||
         index > egtb->maximum_index ||
         !egtb_encode_dtm(white_to_move, &replacement.white_to_move) ||
-        !egtb_encode_dtm(black_to_move, &replacement.black_to_move))
+        !egtb_encode_dtm(black_to_move, &replacement.black_to_move) ||
+        !valid_code(egtb, replacement.white_to_move) ||
+        !valid_code(egtb, replacement.black_to_move))
         return fail("invalid paired EGTB update");
     if (egtb->planar)
         return egtb_set(egtb, index, EGTB_WHITE_TO_MOVE, white_to_move) &&
@@ -1168,7 +1279,7 @@ bool egtb_set_pair(Egtb *egtb, uint64_t index,
 static EgtbEntry *view_cache_data(EgtbView *view, size_t slot)
 {
     return (EgtbEntry *)(void *)(view->data +
-                                 slot * view->backing->page_size);
+                                 slot * view->backing->memory_page_size);
 }
 
 static bool view_load_page(EgtbView *view, uint64_t page, EgtbEntry *entries)
@@ -1176,9 +1287,8 @@ static bool view_load_page(EgtbView *view, uint64_t page, EgtbEntry *entries)
     Egtb *egtb = view->backing;
     uint64_t offset = egtb->offsets[page];
     uint16_t length = egtb->lengths[page];
-    size_t decompressed;
     unsigned char checksum_bytes[EGTB_BLOCK_HEADER_SIZE];
-    uint32_t expected_checksum, actual_checksum;
+    uint32_t expected_checksum;
     int descriptor = fileno(egtb->file);
     if (offset == 0) {
         fill_draw_page(egtb, entries);
@@ -1192,17 +1302,9 @@ static bool view_load_page(EgtbView *view, uint64_t page, EgtbEntry *entries)
                   view->compressed, length))
         return false;
     expected_checksum = get_u32(checksum_bytes);
-    decompressed = ZSTD_decompressDCtx(
-        view->decompressor, entries, egtb->page_size,
-        view->compressed, length);
-    if (ZSTD_isError(decompressed))
-        return fail("Zstd decompression failed for page %" PRIu64 ": %s",
-                    page, ZSTD_getErrorName(decompressed));
-    if (decompressed != egtb->page_size)
-        return fail("decompressed page has an invalid size");
-    actual_checksum = crc32c(entries, egtb->page_size);
-    if (actual_checksum != expected_checksum)
-        return fail("CRC32C mismatch for uncompressed page %" PRIu64, page);
+    if (!decode_page(egtb, view->decompressor, view->compressed, length,
+                      view->codec, entries, expected_checksum))
+        return false;
     ++view->statistics.decompressions;
     return true;
 }
@@ -1223,7 +1325,7 @@ static bool view_flush_slot(EgtbView *view, size_t slot)
     compressed_write = !all_draws(view->backing, data);
     if (!store_page_with_runtime(
             view->backing, view->compressor, view->compressed,
-            view->compressed_capacity, entry->page_index, data, false,
+            view->compressed_capacity, view->codec, entry->page_index, data, false,
             true)) {
         return false;
     }
@@ -1340,7 +1442,7 @@ bool egtb_view_create_range(EgtbView **out, Egtb *backing,
     }
     if (cache_pages == 0)
         cache_pages = 1;
-    if (cache_pages > SIZE_MAX / backing->page_size)
+    if (cache_pages > SIZE_MAX / backing->memory_page_size)
         return fail("cache-view byte size overflows size_t");
     view = calloc(1, sizeof(*view));
     if (view == NULL)
@@ -1357,18 +1459,20 @@ bool egtb_view_create_range(EgtbView **out, Egtb *backing,
         (cache_pages & (cache_pages - 1)) == 0;
     if (view->power_of_two_slots)
         view->slot_mask = cache_pages - 1;
-    view->compressed_capacity = ZSTD_compressBound(backing->page_size);
+    view->compressed_capacity = ZSTD_compressBound(backing->codec_capacity);
     view->entries = calloc(cache_pages, sizeof(*view->entries));
-    view->data = malloc(cache_pages * backing->page_size);
+    view->data = malloc(cache_pages * backing->memory_page_size);
     view->compressed = malloc(view->compressed_capacity);
+    view->codec = malloc(backing->codec_capacity + backing->memory_page_size);
     view->decompressor = ZSTD_createDCtx();
     if (writable)
         view->compressor = ZSTD_createCCtx();
     if (view->entries == NULL || view->data == NULL ||
-        view->compressed == NULL || view->decompressor == NULL ||
+        view->codec == NULL || view->compressed == NULL || view->decompressor == NULL ||
         (writable && view->compressor == NULL)) {
         ZSTD_freeCCtx(view->compressor);
         ZSTD_freeDCtx(view->decompressor);
+        free(view->codec);
         free(view->compressed);
         free(view->data);
         free(view->entries);
@@ -1436,6 +1540,7 @@ bool egtb_view_close(EgtbView *view)
     }
     ZSTD_freeCCtx(view->compressor);
     ZSTD_freeDCtx(view->decompressor);
+    free(view->codec);
     free(view->compressed);
     free(view->data);
     free(view->entries);
@@ -1560,11 +1665,11 @@ bool egtb_sequential_reader_next(EgtbSequentialReader *reader,
             if (white_page == NULL || black_page == NULL)
                 return false;
             reader->next_white =
-                (const int8_t *)(const void *)white_page + entry_index;
+                (const int16_t *)(const void *)white_page + entry_index;
             reader->next_black =
-                (const int8_t *)(const void *)black_page + entry_index;
+                (const int16_t *)(const void *)black_page + entry_index;
             reader->plane_end =
-                (const int8_t *)(const void *)white_page +
+                (const int16_t *)(const void *)white_page +
                 egtb->entries_per_page;
         }
         *white_to_move = egtb_decode_dtm(*reader->next_white++);
@@ -1607,13 +1712,13 @@ bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
     DirectCacheEntry *cache_entry;
     EgtbEntry *entries;
     EgtbEntry old;
-    int8_t old_value;
-    int8_t stored;
+    int16_t old_value;
+    int16_t stored;
 #ifndef NDEBUG
     if (view == NULL || !view->writable)
         return fail("invalid cache-view update");
 #endif
-    if (!egtb_encode_dtm(value, &stored))
+    if (!egtb_encode_dtm(value, &stored) || !valid_code(view->backing, stored))
         return fail("invalid cache-view update");
     egtb = view->backing;
 #ifndef NDEBUG
@@ -1670,7 +1775,7 @@ bool egtb_view_write_page(EgtbView *view, uint64_t page,
             return false;
         fill_draw_page(egtb, data);
         if (egtb->planar) {
-            int8_t *plane = (int8_t *)data;
+            int16_t *plane = (int16_t *)data;
             for (size_t i = 0; i < count; ++i)
                 plane[i] = side == 0 ? entries[i].white_to_move
                                      : entries[i].black_to_move;
@@ -1703,7 +1808,7 @@ typedef struct {
     EgtbEntry *entries;
     uint64_t first_page;
     uint64_t end_page;
-    uint64_t stored_histogram[2][256];
+    uint64_t stored_histogram[2][65536];
     bool failed;
     char error[256];
 } ResidentLoadWorker;
@@ -1713,11 +1818,12 @@ static void *load_resident_pages(void *opaque)
     ResidentLoadWorker *worker = opaque;
     Egtb *egtb = worker->backing;
     ZSTD_DCtx *decompressor = ZSTD_createDCtx();
-    size_t compressed_capacity = ZSTD_compressBound(egtb->page_size);
+    size_t compressed_capacity = ZSTD_compressBound(egtb->codec_capacity);
     unsigned char *compressed = malloc(compressed_capacity);
-    unsigned char *decoded = malloc(egtb->page_size);
+    unsigned char *decoded = malloc(egtb->memory_page_size);
+    unsigned char *codec = malloc(egtb->codec_capacity + egtb->memory_page_size);
     uint64_t page;
-    if (decompressor == NULL || compressed == NULL || decoded == NULL) {
+    if (decompressor == NULL || compressed == NULL || decoded == NULL || codec == NULL) {
         snprintf(worker->error, sizeof(worker->error),
                  "cannot allocate resident decompression workspace");
         worker->failed = true;
@@ -1738,12 +1844,11 @@ static void *load_resident_pages(void *opaque)
                                      : egtb->entries_per_page;
         unsigned char checksum_bytes[EGTB_BLOCK_HEADER_SIZE];
         uint32_t expected_checksum;
-        size_t decompressed;
-        if (offset == 0) {
+            if (offset == 0) {
             fill_draw_page(egtb, destination);
             if (egtb->planar) {
                 worker->stored_histogram[planar_side]
-                                        [(uint8_t)EGTB_STORED_DRAW] +=
+                                        [(uint16_t)EGTB_STORED_DRAW] +=
                     valid_entries;
                 for (uint32_t entry = 0; entry < valid_entries; ++entry)
                     if (planar_side == EGTB_WHITE_TO_MOVE)
@@ -1756,10 +1861,10 @@ static void *load_resident_pages(void *opaque)
                 memcpy(&worker->entries[first_index], destination,
                        valid_entries * sizeof(EgtbEntry));
                 worker->stored_histogram[EGTB_WHITE_TO_MOVE]
-                                        [(uint8_t)EGTB_STORED_DRAW] +=
+                                        [(uint16_t)EGTB_STORED_DRAW] +=
                     valid_entries;
                 worker->stored_histogram[EGTB_BLACK_TO_MOVE]
-                                        [(uint8_t)EGTB_STORED_DRAW] +=
+                                        [(uint16_t)EGTB_STORED_DRAW] +=
                     valid_entries;
             }
             continue;
@@ -1776,38 +1881,27 @@ static void *load_resident_pages(void *opaque)
             break;
         }
         expected_checksum = get_u32(checksum_bytes);
-        decompressed = ZSTD_decompressDCtx(
-            decompressor, destination, egtb->page_size, compressed, length);
-        if (ZSTD_isError(decompressed) || decompressed != egtb->page_size) {
+        if (!decode_page(egtb, decompressor, compressed, length, codec,
+                          destination, expected_checksum)) {
             snprintf(worker->error, sizeof(worker->error),
-                     "Zstd decompression failed for page %" PRIu64 ": %s",
-                     page, ZSTD_isError(decompressed)
-                               ? ZSTD_getErrorName(decompressed)
-                               : "invalid decompressed size");
-            worker->failed = true;
-            break;
-        }
-        if (crc32c(destination, egtb->page_size) != expected_checksum) {
-            snprintf(worker->error, sizeof(worker->error),
-                     "CRC32C mismatch for uncompressed page %" PRIu64,
-                     page);
+                     "page %" PRIu64 ": %s", page, egtb_last_error());
             worker->failed = true;
             break;
         }
         for (uint32_t entry = 0; entry < valid_entries; ++entry) {
             if (egtb->planar) {
-                int8_t value = ((int8_t *)(void *)destination)[entry];
+                int16_t value = ((int16_t *)(void *)destination)[entry];
                 if (planar_side == EGTB_WHITE_TO_MOVE)
                     worker->entries[first_index + entry].white_to_move = value;
                 else
                     worker->entries[first_index + entry].black_to_move = value;
-                ++worker->stored_histogram[planar_side][(uint8_t)value];
+                ++worker->stored_histogram[planar_side][(uint16_t)value];
             } else {
                 ++worker->stored_histogram[EGTB_WHITE_TO_MOVE]
-                                          [(uint8_t)destination[entry]
+                                          [(uint16_t)destination[entry]
                                                .white_to_move];
                 ++worker->stored_histogram[EGTB_BLACK_TO_MOVE]
-                                          [(uint8_t)destination[entry]
+                                          [(uint16_t)destination[entry]
                                                .black_to_move];
             }
         }
@@ -1816,6 +1910,7 @@ static void *load_resident_pages(void *opaque)
                    valid_entries * sizeof(EgtbEntry));
     }
 done:
+    free(codec);
     free(decoded);
     free(compressed);
     ZSTD_freeDCtx(decompressor);
@@ -1890,7 +1985,7 @@ bool egtb_resident_load(EgtbResident **out, Egtb *backing,
         }
     for (i = 0; i < thread_count; ++i)
         for (unsigned side = 0; side < 2; ++side)
-            for (unsigned stored = 0; stored < 256; ++stored)
+            for (unsigned stored = 0; stored < 65536; ++stored)
                 resident->stored_histogram[side][stored] +=
                     workers[i].stored_histogram[side][stored];
     *out = resident;
@@ -1965,12 +2060,15 @@ bool egtb_resident_dtm_histogram(const EgtbResident *resident,
         return fail("invalid resident DTM histogram output");
     memset(histogram, 0, 2 * bins_per_side * sizeof(*histogram));
     for (unsigned side = 0; side < 2; ++side)
-        for (int stored = INT8_MIN; stored <= INT8_MAX; ++stored) {
-            uint8_t bucket = (uint8_t)stored;
-            int16_t dtm = egtb_decode_dtm((int8_t)stored);
+        for (int stored = -16383; stored <= 16383; ++stored) {
+            uint16_t bucket = (uint16_t)stored;
+            int16_t dtm = egtb_decode_dtm((int16_t)stored);
             histogram[(size_t)side * bins_per_side + (uint16_t)dtm] +=
                 resident->stored_histogram[side][bucket];
         }
+    for (unsigned side = 0; side < 2; ++side)
+        histogram[(size_t)side * bins_per_side + (uint16_t)EGTB_DRAW] +=
+            resident->stored_histogram[side][(uint16_t)EGTB_STORED_DRAW];
     return true;
 }
 
@@ -1987,6 +2085,11 @@ uint64_t egtb_page_count(const Egtb *egtb)
 uint32_t egtb_page_size(const Egtb *egtb)
 {
     return egtb == NULL ? 0 : egtb->page_size;
+}
+
+uint32_t egtb_cache_page_size(const Egtb *egtb)
+{
+    return egtb == NULL ? 0 : egtb->memory_page_size;
 }
 
 uint32_t egtb_positions_per_page(const Egtb *egtb)
@@ -2032,7 +2135,8 @@ bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics)
     if (egtb->maximum_index + 1 > UINT64_MAX / sizeof(EgtbEntry))
         return fail("logical EGTB size overflows uint64_t");
     statistics->logical_uncompressed_bytes =
-        (egtb->maximum_index + 1) * sizeof(EgtbEntry);
+        (egtb->maximum_index + 1) *
+        (egtb->format_version == EGTB_FORMAT_VERSION ? 4u : 2u);
 
     if (!egtb->readonly) {
         for (page = 0; page < egtb->page_count; ++page) {
