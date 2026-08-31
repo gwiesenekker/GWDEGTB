@@ -29,10 +29,10 @@ int main(void)
     uint64_t first_sliced_passes;
     EgtbMaterial material = {0, 1, 0, 1};
     EgtbCreateOptions create_options = {64, 20, 3};
-    EgtbThreadOptions thread_options = {2, 64, NULL, &verified};
+    EgtbThreadOptions thread_options = {2, 64, NULL, &verified, 4096};
     EgtbSlicedOptions sliced_options = {
         2, 1024, 64, 4, 64, 20, 3,
-        draw_probe, NULL, NULL, NULL, NULL, true
+        draw_probe, NULL, NULL, NULL, NULL, true, 4096
     };
     bool ok = false;
     if (mkdtemp(directory) == NULL)

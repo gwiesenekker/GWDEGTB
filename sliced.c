@@ -460,7 +460,7 @@ static bool generate_one_slice(const char *directory,
     {
         EgtbThreadOptions thread_options = {
             options->thread_count, options->writable_cache_pages,
-            probe_contexts, &verified
+            probe_contexts, &verified, options->compilation_buffer_bytes
         };
         if (!egtb_generate_threaded(
                 database, &indexer, slice_probe, &contexts[0],

@@ -1991,6 +1991,11 @@ typedef struct {
     uint64_t source_count;
     uint64_t candidate_count;
     uint64_t update_count;
+    size_t compilation_entries;
+    EgtbEntry *compilation_buffer;
+    uint64_t compilation_first;
+    uint64_t compilation_end;
+    int8_t compilation_value;
     EgtbInitializationStatistics initialization;
     bool failed;
     char error[256];
@@ -2201,14 +2206,76 @@ static bool check_frontier_successor(const DraughtsMove *move, void *opaque)
 static bool compile_frontier_entry(uint64_t index, void *opaque)
 {
     FrontierWorker *worker = opaque;
-    if (index < worker->first_index || index >= worker->end_index ||
-        !egtb_view_set(worker->view, index, worker->successor_side,
-                       worker->distance)) {
-        frontier_worker_error(worker, "cannot compile frontier entry: %s",
-                              egtb_last_error());
+    if (index < worker->first_index || index >= worker->end_index) {
+        frontier_worker_error(worker, "frontier index outside worker range");
         return false;
     }
+    if (index >= worker->compilation_first && index < worker->compilation_end) {
+        EgtbEntry *entry = worker->compilation_buffer +
+                           (size_t)(index - worker->compilation_first);
+        if (worker->successor_side == EGTB_WHITE_TO_MOVE)
+            entry->white_to_move = worker->compilation_value;
+        else
+            entry->black_to_move = worker->compilation_value;
+    }
     return true;
+}
+
+static void compile_frontier_range(FrontierWorker *worker)
+{
+    uint32_t per_page = egtb_positions_per_page(worker->database);
+    EgtbEntry *buffer = malloc(worker->compilation_entries * sizeof(*buffer));
+    if (buffer == NULL) {
+        frontier_worker_error(worker, "cannot allocate frontier assembly buffer");
+        return;
+    }
+    worker->compilation_buffer = buffer;
+    for (uint64_t first = worker->first_index; first < worker->end_index;) {
+        uint64_t count = worker->end_index - first;
+        if (count > worker->compilation_entries)
+            count = worker->compilation_entries;
+        worker->compilation_first = first;
+        worker->compilation_end = first + count;
+        memset(buffer, (unsigned char)EGTB_STORED_DRAW,
+               (size_t)count * sizeof(*buffer));
+        /* Replay only this owner's streams, retaining the old longest-to-
+         * shortest overwrite order for stale transposition records. */
+        for (int distance = frontier_store_maximum_distance(worker->frontiers);
+             distance >= 0; --distance) {
+            int16_t value = (distance & 1) != 0 ? (int16_t)distance
+                                               : (int16_t)-distance;
+            if (!egtb_encode_dtm(value, &worker->compilation_value)) {
+                frontier_worker_error(worker, "invalid compilation DTM");
+                goto done;
+            }
+            for (unsigned side = 0; side < 2; ++side) {
+                worker->successor_side = (EgtbSide)side;
+                if (!frontier_store_visit(worker->frontiers, worker->owner,
+                                          (EgtbSide)side, value,
+                                          compile_frontier_entry, worker)) {
+                    if (!worker->failed)
+                        frontier_worker_error(worker,
+                            "cannot read compile frontier: %s",
+                            frontier_last_error());
+                    goto done;
+                }
+            }
+        }
+        for (uint64_t offset = 0; offset < count; offset += per_page) {
+            size_t page_count = count - offset < per_page
+                                    ? (size_t)(count - offset) : per_page;
+            if (!egtb_view_write_page(worker->view, (first + offset) / per_page,
+                                      buffer + (size_t)offset, page_count)) {
+                frontier_worker_error(worker, "cannot write compiled page: %s",
+                                      egtb_last_error());
+                goto done;
+            }
+        }
+        first += count;
+    }
+done:
+    free(buffer);
+    worker->compilation_buffer = NULL;
 }
 
 static void *run_frontier_worker(void *opaque)
@@ -2311,26 +2378,7 @@ static void *run_frontier_worker(void *opaque)
         return NULL;
     }
     if (worker->work == FRONTIER_WORK_COMPILE) {
-        int distance;
-        for (distance = frontier_store_maximum_distance(worker->frontiers);
-             distance >= 0; --distance) {
-            unsigned side;
-            int16_t value = (distance & 1) != 0
-                                ? (int16_t)distance : (int16_t)-distance;
-            for (side = 0; side < 2; ++side) {
-                worker->successor_side = (EgtbSide)side;
-                worker->distance = value;
-                if (!frontier_store_visit(
-                        worker->frontiers, worker->owner, (EgtbSide)side,
-                        value, compile_frontier_entry, worker)) {
-                    if (!worker->failed)
-                        frontier_worker_error(worker,
-                                              "cannot read compile frontier: %s",
-                                              frontier_last_error());
-                    return NULL;
-                }
-            }
-        }
+        compile_frontier_range(worker);
     }
     return NULL;
 }
@@ -2858,9 +2906,27 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
             (workers[i].end_index +
              egtb_positions_per_page(database) - 1) /
             egtb_positions_per_page(database);
-        size_t cache_pages = options->writable_cache_pages / thread_count +
-                             (i < options->writable_cache_pages % thread_count);
-        if (!egtb_view_create_range(&workers[i].view, database, cache_pages,
+        size_t total_bytes = options->compilation_buffer_bytes;
+        size_t page_entries = egtb_positions_per_page(database);
+        size_t buffer_entries;
+        if (total_bytes == 0) {
+            if (options->writable_cache_pages >
+                SIZE_MAX / egtb_page_size(database)) {
+                fail("compilation buffer size overflows size_t");
+                goto done;
+            }
+            total_bytes = options->writable_cache_pages * egtb_page_size(database);
+        }
+        buffer_entries = (total_bytes / thread_count / sizeof(EgtbEntry) /
+                          page_entries) * page_entries;
+        if (buffer_entries < page_entries)
+            buffer_entries = page_entries;
+        if (workers[i].end_index - workers[i].first_index < buffer_entries)
+            buffer_entries = (size_t)(workers[i].end_index - workers[i].first_index);
+        workers[i].compilation_entries = buffer_entries;
+        /* Only the output page(s) are cached; assembly has its own bounded
+         * paired-entry buffer instead of a large random-write cache. */
+        if (!egtb_view_create_range(&workers[i].view, database, 2,
                                     true, first_page, end_page)) {
             fail("cannot create compilation view %u: %s", i,
                  egtb_last_error());

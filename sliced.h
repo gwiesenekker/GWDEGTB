@@ -18,6 +18,7 @@ typedef struct {
     EgtbConsistencyReporter reporter;
     void *reporter_context;
     bool quiet;
+    size_t compilation_buffer_bytes;
 } EgtbSlicedOptions;
 
 const char *egtb_sliced_last_error(void);

@@ -78,6 +78,10 @@ typedef struct {
     void *const *external_contexts;
     /* Optional output, allocated and populated by threaded generation. */
     Bitmap *verified_positions;
+    /* Total paired-entry assembly bytes, shared across workers. Zero uses
+     * writable_cache_pages * page_size. Rounded to whole logical pages,
+     * with a minimum of one paired logical page per active worker. */
+    size_t compilation_buffer_bytes;
 } EgtbThreadOptions;
 
 typedef struct {

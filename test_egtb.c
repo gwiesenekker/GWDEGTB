@@ -472,6 +472,83 @@ static int report_failure(const char *operation, const char *path)
     return EXIT_FAILURE;
 }
 
+static bool test_complete_page_writes(void)
+{
+    char path[] = "/tmp/ipd-complete-pages-XXXXXX";
+    EgtbCreateOptions options = {2, 20, 3};
+    Egtb *database = NULL;
+    EgtbView *view = NULL;
+    EgtbEntry entries[1024];
+    EgtbCacheStatistics cache;
+    EgtbStorageStatistics empty, written;
+    const uint64_t positions = 4 * 1024 + 13;
+    int descriptor = mkstemp(path);
+    bool ok = false;
+    if (descriptor < 0)
+        return false;
+    close(descriptor);
+    unlink(path);
+    if (!egtb_create(&database, path, positions - 1, 1024, &options) ||
+        !egtb_storage_statistics(database, &empty) ||
+        !egtb_view_create(&view, database, 2, true))
+        goto done;
+    for (uint64_t page = 0; page < 5; ++page) {
+        size_t count = page == 4 ? 13 : 1024;
+        for (size_t i = 0; i < count; ++i) {
+            entries[i].white_to_move = page == 1 ? EGTB_STORED_DRAW
+                : (int8_t)((int)(i % 256) - 128);
+            entries[i].black_to_move = page == 1 ? EGTB_STORED_DRAW
+                : (int8_t)(127 - (int)(i % 256));
+        }
+        if (egtb_view_write_page(view, page, entries, count - 1) ||
+            !egtb_view_write_page(view, page, entries, count))
+            goto done;
+    }
+    if (egtb_view_write_page(view, 5, entries, 13))
+        goto done;
+    egtb_view_cache_statistics(view, &cache);
+    if (cache.lookups != 0 || cache.decompressions != 0 ||
+        cache.dirty_evictions != 0 || cache.compressed_writes != 8)
+        goto done;
+    if (!egtb_view_close(view)) {
+        view = NULL;
+        goto done;
+    }
+    view = NULL;
+    if (!egtb_storage_statistics(database, &written) ||
+        written.live_pages != 8 ||
+        written.file_bytes > empty.file_bytes + written.live_block_bytes +
+                             205 * written.live_pages)
+        goto done;
+    if (!egtb_close(database)) {
+        database = NULL;
+        goto done;
+    }
+    database = NULL;
+    if (!egtb_open_readonly(&database, path, 2))
+        goto done;
+    for (uint64_t index = 0; index < positions; ++index) {
+        int16_t white, black;
+        int8_t expected_white = index / 1024 == 1 ? EGTB_STORED_DRAW
+            : (int8_t)((int)(index % 256) - 128);
+        int8_t expected_black = index / 1024 == 1 ? EGTB_STORED_DRAW
+            : (int8_t)(127 - (int)(index % 256));
+        if (!egtb_get(database, index, EGTB_WHITE_TO_MOVE, &white) ||
+            !egtb_get(database, index, EGTB_BLACK_TO_MOVE, &black) ||
+            white != egtb_decode_dtm(expected_white) ||
+            black != egtb_decode_dtm(expected_black))
+            goto done;
+    }
+    ok = true;
+done:
+    if (view != NULL && !egtb_view_close(view))
+        ok = false;
+    if (database != NULL && !egtb_close(database))
+        ok = false;
+    unlink(path);
+    return ok;
+}
+
 int main(void)
 {
     char stem[] = "/tmp/ipd-egtb-regression-XXXXXX";
@@ -490,6 +567,11 @@ int main(void)
     struct stat before_compaction, after_compaction;
     int descriptor;
 
+    if (!test_complete_page_writes()) {
+        fprintf(stderr, "complete-page write regression failed: %s\n",
+                egtb_last_error());
+        return EXIT_FAILURE;
+    }
     if (!test_dtm_byte_encoding()) {
         fprintf(stderr, "byte DTM encoding regression failed: %s\n",
                 egtb_last_error());

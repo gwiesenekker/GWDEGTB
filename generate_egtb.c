@@ -323,6 +323,7 @@ int main(int argc, char **argv)
     EgtbResident *resident = NULL;
     uint64_t *histogram = NULL;
     uint64_t positions, resident_limit_bytes, verification_cache_bytes;
+    uint64_t compilation_buffer_bytes;
     size_t verification_cache_pages;
     bool indexer_initialized = false;
     bool created = false;
@@ -347,8 +348,11 @@ int main(int argc, char **argv)
         !configuration_bytes("EGTB_VERIFICATION_CACHE_GIB",
                              DEFAULT_VERIFICATION_CACHE_BYTES, false,
                              &verification_cache_bytes) ||
+        !configuration_bytes("EGTB_COMPILATION_BUFFER_GIB",
+                             GIBIBYTE, false, &compilation_buffer_bytes) ||
+        compilation_buffer_bytes > SIZE_MAX ||
         verification_cache_bytes / GENERATION_PAGE_SIZE > SIZE_MAX) {
-        fprintf(stderr, "invalid resident/cache GiB configuration\n");
+        fprintf(stderr, "invalid resident/cache/compilation GiB configuration\n");
         return EXIT_FAILURE;
     }
     verification_cache_pages =
@@ -421,6 +425,8 @@ int main(int argc, char **argv)
            thread_count == 1 ? "" : "s",
            GENERATION_CACHE_BYTES / (1024 * 1024),
            DEPENDENCY_CACHE_BYTES / (1024 * 1024));
+    printf("frontier compilation: %" PRIu64 " MiB assembly buffer total\n",
+           compilation_buffer_bytes / (1024 * 1024));
     fflush(stdout);
     generation_started = wall_seconds();
     setup_seconds = generation_started - program_started;
@@ -438,7 +444,8 @@ int main(int argc, char **argv)
             probe_contexts,
             report_correction,
             NULL,
-            false
+            false,
+            (size_t)compilation_buffer_bytes
         };
         if (!egtb_generate_sliced(&database, path, &material, &indexer,
                                   &sliced_options, &generation)) {
@@ -457,7 +464,7 @@ int main(int argc, char **argv)
         created = true;
         EgtbThreadOptions thread_options = {
             thread_count, GENERATION_CACHE_PAGES, probe_contexts,
-            &verified_positions
+            &verified_positions, (size_t)compilation_buffer_bytes
         };
         if (!egtb_generate_threaded(database, &indexer, catalog_probe,
                                     &catalogs[0], report_correction, NULL,

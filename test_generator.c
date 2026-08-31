@@ -372,12 +372,12 @@ done:
     return ok;
 }
 
-static bool test_threaded_wk_bk_generation(void)
+static bool test_threaded_wk_bk_generation(unsigned threads, size_t buffer_bytes)
 {
     char serial_path[] = "/tmp/ipd-generator-serial-XXXXXX";
     char threaded_path[] = "/tmp/ipd-generator-threaded-XXXXXX";
     EgtbCreateOptions create_options = {16, 20, 3};
-    EgtbThreadOptions thread_options = {4, 16, NULL, NULL};
+    EgtbThreadOptions thread_options = {threads, 16, NULL, NULL, buffer_bytes};
     EgtbGenerationStatistics serial_statistics, threaded_statistics;
     EgIndexer indexer;
     Egtb *serial = NULL, *threaded = NULL;
@@ -581,7 +581,11 @@ int main(void)
                 egtb_generator_last_error());
         return EXIT_FAILURE;
     }
-    if (!test_threaded_wk_bk_generation()) {
+    /* One-page buffers force replay across batches, including the partial
+     * last page. Also exercise the default budget and excess worker count. */
+    if (!test_threaded_wk_bk_generation(1, 2048) ||
+        !test_threaded_wk_bk_generation(2, 4096) ||
+        !test_threaded_wk_bk_generation(4, 0)) {
         fprintf(stderr, "threaded WK-BK equivalence test failed: %s / %s\n",
                 egtb_generator_last_error(), egtb_last_error());
         return EXIT_FAILURE;

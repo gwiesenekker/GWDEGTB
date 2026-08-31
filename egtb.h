@@ -112,6 +112,12 @@ bool egtb_view_get_pair(EgtbView *view, uint64_t index,
                         int16_t *white_to_move, int16_t *black_to_move);
 bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
                    int16_t value);
+/* Replace a complete logical page from paired, encoded entries and flush it.
+ * count must cover the full page (or all remaining entries on the last page).
+ * No old page is read. The view must own the page exclusively.
+ */
+bool egtb_view_write_page(EgtbView *view, uint64_t page,
+                          const EgtbEntry *entries, size_t count);
 bool egtb_sequential_reader_init(EgtbSequentialReader *reader,
                                  EgtbView *view, uint64_t first_index,
                                  uint64_t end_index);

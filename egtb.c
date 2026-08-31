@@ -1646,6 +1646,47 @@ bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
     return true;
 }
 
+bool egtb_view_write_page(EgtbView *view, uint64_t page,
+                          const EgtbEntry *entries, size_t count)
+{
+    Egtb *egtb;
+    uint64_t remaining;
+    size_t expected;
+    if (view == NULL || !view->writable || entries == NULL ||
+        page < view->first_page || page >= view->end_page)
+        return fail("invalid complete-page update");
+    egtb = view->backing;
+    remaining = egtb->maximum_index + 1 - page * egtb->entries_per_page;
+    expected = remaining < egtb->entries_per_page
+                   ? (size_t)remaining : egtb->entries_per_page;
+    if (count != expected)
+        return fail("complete-page update has incorrect entry count");
+    for (unsigned side = 0; side < (egtb->planar ? 2u : 1u); ++side) {
+        uint64_t physical = page + side * egtb->side_page_count;
+        size_t slot = view_cache_slot(view, physical);
+        DirectCacheEntry *entry = &view->entries[slot];
+        EgtbEntry *data = view_cache_data(view, slot);
+        if (!view_flush_slot(view, slot))
+            return false;
+        fill_draw_page(egtb, data);
+        if (egtb->planar) {
+            int8_t *plane = (int8_t *)data;
+            for (size_t i = 0; i < count; ++i)
+                plane[i] = side == 0 ? entries[i].white_to_move
+                                     : entries[i].black_to_move;
+        } else {
+            memcpy(data, entries, count * sizeof(*entries));
+        }
+        entry->page_index = physical;
+        entry->checksum = page_checksum(egtb, data);
+        entry->valid = true;
+        entry->dirty = true;
+        if (!view_flush_slot(view, slot))
+            return false;
+    }
+    return true;
+}
+
 void egtb_view_cache_statistics(const EgtbView *view,
                                 EgtbCacheStatistics *statistics)
 {

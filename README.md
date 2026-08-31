@@ -348,10 +348,17 @@ compressed database for every mate distance.
    the process exits. No global stream lock or collection of per-distance files
    is required.
 
-8. **Compile the final DTM.** After no new frontier exists, workers apply their
-   streams to disjoint page ranges of the all-draw DTM. Distances are applied
-   from longest to shortest, allowing a later shorter result to replace a stale
-   transposition result. Only this phase needs the large writable page cache.
+8. **Compile the final DTM.** Each worker assembles a page-aligned batch of its
+   index range in a bounded, uncompressed paired-entry buffer initialized to
+   draws. It replays its existing compressed frontier streams from longest to
+   shortest distance, retaining shorter replacements for stale transpositions.
+   Completed WTM and BTM pages are compressed and written once, in index order
+   within each worker, without reading old pages. All-draw pages need no payload.
+   If a worker's range exceeds its buffer, it rereads its streams for each batch.
+   No extra partition files are created. This avoids random dirty-page evictions
+   and abandoned blocks during compilation; the normal reserved block slack
+   remains available for subsequent consistency repairs and is removed by final
+   compaction. Frontier files and the output DTM coexist until compilation ends.
 
 9. **Repair exact-DTM consistency.** The first snapshot pass recomputes both
    side-to-move values for every legal position. Workers use a paired
@@ -386,12 +393,13 @@ compressed database for every mate distance.
 
 ## Memory, caches, and configuration
 
-The default 1,024-byte DTM page gives 512 positions and exactly eight 64-bit
-bitmap words. Current production defaults are:
+The default 1,024-byte v3 DTM page gives 1,024 positions for one side and exactly
+sixteen 64-bit bitmap words. Current production defaults are:
 
 | Purpose | Default |
 |---|---:|
 | Target writable cache | 1 GiB total |
+| Frontier compilation assembly buffer | 1 GiB total, divided among workers |
 | Dependency cache | 64 MiB per worker per opened dependency |
 | Ordinary read-only handle cache | 16 MiB |
 | Resident final-database limit | 32 GiB |
@@ -405,7 +413,16 @@ and page directories are additional. Configure final handling with:
 EGTB_RESIDENT_LIMIT_GIB=0 ./generate_egtb -j 16 3 0 3 0
 EGTB_RESIDENT_LIMIT_GIB=64 ./generate_egtb -j 16 3 0 3 0
 EGTB_VERIFICATION_CACHE_GIB=64 ./generate_egtb -j 16 4 0 3 0
+EGTB_COMPILATION_BUFFER_GIB=16 ./generate_egtb -j 16 2 2 1 2
 ```
+
+`EGTB_COMPILATION_BUFFER_GIB` must be a positive integer. Larger buffers reduce
+frontier rereads; they replace the large writable cache during compilation,
+but do not include outcome bitmaps, dependencies, dictionaries, or metadata.
+The library's `EgtbThreadOptions.compilation_buffer_bytes` accepts a byte budget;
+zero reuses the writable-cache byte budget. Buffers are rounded down to complete
+paired logical pages, with a minimum of one such page per worker, and capped
+at each worker's position count. Sliced generation uses the same mechanism.
 
 Setting `EGTB_RESIDENT_LIMIT_GIB=0` disables the resident path. Resident
 loading is parallel. It is normally fastest when the complete two-byte-per-
