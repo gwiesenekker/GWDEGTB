@@ -3,6 +3,7 @@
 #include "sliced.h"
 
 #include "revision.h"
+#include "progress.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -439,6 +440,11 @@ static bool generate_one_slice(const char *directory,
         !initialize_slice_indexer(&indexer, material,
                                   white_row, black_row))
         return sliced_fail("cannot initialize generation slice");
+    if (!options->quiet)
+        egtb_progress_log("starting slice white-row=%d black-row=%d positions=%" PRIu64 "\n",
+                          white_row < 0 ? 0 : white_row + 1,
+                          black_row < 0 ? 0 : black_row + 1,
+                          eg_position_count(&indexer));
     unlink(incomplete_path);
     for (unsigned i = 0; i < options->thread_count; ++i) {
         contexts[i].error[0] = '\0';
@@ -523,7 +529,7 @@ static bool generate_one_slice(const char *directory,
     }
     *statistics = generated;
     if (!options->quiet) {
-        printf("completed slice white-row=%d black-row=%d positions=%" PRIu64
+        egtb_progress_log("completed slice white-row=%d black-row=%d positions=%" PRIu64
                " passes=%" PRIu64 "\n",
                white_row < 0 ? 0 : white_row + 1,
                black_row < 0 ? 0 : black_row + 1,
@@ -625,7 +631,7 @@ static bool compile_slices(Egtb **out, const char *path,
     char temporary[512];
     Egtb *output = NULL;
     EgtbCreateOptions create_options = {64, 0, options->compression_level};
-    uint64_t expected = 0;
+    uint64_t expected = 0, progress_pending = 0;
     int white_first = material->white_men == 0 ? -1 : 1;
     int white_last = material->white_men == 0 ? -1 : 9;
     int black_first = material->black_men == 0 ? -1 : 8;
@@ -672,6 +678,7 @@ static bool compile_slices(Egtb **out, const char *path,
                     egtb_last_error());
         goto done;
     }
+    egtb_progress_begin("slice merge", eg_position_count(full_indexer), "positions");
     while (heap_count != 0) {
         unsigned selected = heap_pop(heap, &heap_count, slices);
         MergeSlice *slice = &slices[selected];
@@ -682,6 +689,7 @@ static bool compile_slices(Egtb **out, const char *path,
             goto done;
         }
         ++expected;
+        egtb_progress_tick(&progress_pending);
         if (slice->next_local < slice->count) {
             if (!load_merge_entry(slice, full_indexer))
                 goto done;
@@ -710,6 +718,8 @@ static bool compile_slices(Egtb **out, const char *path,
     output = NULL;
     ok = true;
 done:
+    egtb_progress_flush(&progress_pending);
+    egtb_progress_end(ok);
     if (output != NULL)
         egtb_close(output);
     close_merge_slices(slices, slice_count);
@@ -773,7 +783,7 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
                                     slice_statistics))
                     goto done;
             } else if (!options->quiet) {
-                printf("resuming: slice white-row=%d black-row=%d already complete\n",
+                egtb_progress_log("resuming: slice white-row=%d black-row=%d already complete\n",
                        white < 0 ? 0 : white + 1,
                        black < 0 ? 0 : black + 1);
             }
@@ -785,7 +795,7 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
             break;
     }
     if (!options->quiet) {
-        printf("compiling completed slices into %s\n", path);
+        egtb_progress_log("compiling completed slices into %s\n", path);
         fflush(stdout);
     }
     if (!compile_slices(out, path, directory, material, full_indexer, options))

@@ -2,6 +2,7 @@
 
 #include "bitmap.h"
 #include "frontier.h"
+#include "progress.h"
 #include "movegen.h"
 
 #include <stdarg.h>
@@ -19,6 +20,16 @@
 #define GENERATE_MOVES draughts_generate_moves
 #define GENERATE_QUIET_PREDECESSORS draughts_generate_quiet_predecessors
 #endif
+
+static uint64_t progress_bitmap_count(const Bitmap *bitmap)
+{
+    uint64_t count = 0;
+    if (!egtb_progress_enabled())
+        return 0;
+    for (size_t i = 0; i < bitmap->word_count; ++i)
+        count += (unsigned)__builtin_popcountll(bitmap->words[i]);
+    return count;
+}
 
 static double monotonic_seconds(void)
 {
@@ -1269,6 +1280,7 @@ typedef struct {
     size_t correction_count;
     size_t correction_capacity;
     bool failed;
+    uint64_t progress_pending;
 } ConsistencyRepairWorker;
 
 static bool append_consistency_correction(
@@ -1325,13 +1337,14 @@ static bool inspect_consistency_position(ConsistencyRepairWorker *worker,
                 worker, index, (EgtbSide)side, old_value, new_value))
             return false;
     }
+    egtb_progress_tick(&worker->progress_pending);
     if (worker->full_pass && worker->verified_positions != NULL &&
         worker->correction_count == corrections_before)
         bitmap_set(worker->verified_positions, index);
     return true;
 }
 
-static void *run_consistency_repair_worker(void *opaque)
+static void *run_consistency_repair_worker_body(void *opaque)
 {
     ConsistencyRepairWorker *worker = opaque;
     uint64_t index;
@@ -1369,6 +1382,15 @@ static void *run_consistency_repair_worker(void *opaque)
             }
         }
     }
+    return NULL;
+}
+
+static void *run_consistency_repair_worker(void *opaque)
+{
+    ConsistencyRepairWorker *worker = opaque;
+    worker->progress_pending = 0;
+    run_consistency_repair_worker_body(opaque);
+    egtb_progress_flush(&worker->progress_pending);
     return NULL;
 }
 
@@ -1458,6 +1480,7 @@ static bool apply_consistency_corrections(
                             egtb_last_error());
             ++statistics->updates[side];
             ++*updates_this_pass;
+            egtb_progress_add(1);
         }
     }
     if (last_index != UINT64_MAX &&
@@ -1549,6 +1572,13 @@ bool egtb_make_consistent_threaded(
         uint64_t updates_this_pass = 0;
         bitmap_clear(&affected);
         ++local.passes;
+        char progress_label[128];
+        snprintf(progress_label, sizeof(progress_label),
+                 "consistency repair pass %llu: checking",
+                 (unsigned long long)local.passes);
+        egtb_progress_begin(progress_label,
+                            full_pass ? position_count : progress_bitmap_count(&pending),
+                            "positions");
         if (!egtb_flush(database)) {
             fail("cannot flush consistency snapshot: %s", egtb_last_error());
             goto done;
@@ -1606,11 +1636,20 @@ bool egtb_make_consistent_threaded(
             fail("cannot close consistency views: %s", egtb_last_error());
             goto done;
         }
+        egtb_progress_end(true);
+        uint64_t correction_total = 0;
+        for (i = 0; i < thread_count; ++i)
+            correction_total += workers[i].correction_count;
+        snprintf(progress_label, sizeof(progress_label),
+                 "consistency repair pass %llu: applying corrections",
+                 (unsigned long long)local.passes);
+        egtb_progress_begin(progress_label, correction_total, "updates");
         if (!apply_consistency_corrections(
                 database, indexer, workers, thread_count, reporter,
                 reporter_context, &affected, verified_positions, &local,
                 &updates_this_pass))
             goto done;
+        egtb_progress_end(true);
         if (updates_this_pass == 0)
             break;
         {
@@ -1630,6 +1669,7 @@ bool egtb_make_consistent_threaded(
         *statistics = local;
     ok = true;
 done:
+    egtb_progress_end(ok);
     if (workers != NULL &&
         !close_consistency_repair_views(workers, thread_count, NULL))
         ok = false;
@@ -1664,9 +1704,10 @@ typedef struct {
     int16_t expected_value;
     bool mismatch;
     bool failed;
+    uint64_t progress_pending;
 } ConsistencyVerifyWorker;
 
-static void *run_consistency_verify_worker(void *opaque)
+static void *run_consistency_verify_worker_body(void *opaque)
 {
     ConsistencyVerifyWorker *worker = opaque;
     EgtbSequentialReader reader;
@@ -1731,7 +1772,17 @@ static void *run_consistency_verify_worker(void *opaque)
                 return NULL;
             }
         }
+        egtb_progress_tick(&worker->progress_pending);
     }
+    return NULL;
+}
+
+static void *run_consistency_verify_worker(void *opaque)
+{
+    ConsistencyVerifyWorker *worker = opaque;
+    worker->progress_pending = 0;
+    run_consistency_verify_worker_body(opaque);
+    egtb_progress_flush(&worker->progress_pending);
     return NULL;
 }
 
@@ -1811,6 +1862,10 @@ bool egtb_verify_consistent_threaded(
             }
         }
     }
+    egtb_progress_begin("final read-only verification",
+                        position_count - (verified_positions != NULL
+                            ? progress_bitmap_count(verified_positions) : 0),
+                        "positions");
     for (i = 0; i < thread_count; ++i) {
         int error = pthread_create(&threads[i], NULL,
                                    run_consistency_verify_worker,
@@ -1860,6 +1915,7 @@ join:
         *statistics = local;
     ok = true;
 done:
+    egtb_progress_end(ok);
     if (workers != NULL)
         for (i = 0; i < thread_count; ++i) {
             if (workers[i].scan_view != NULL &&
@@ -1999,6 +2055,7 @@ typedef struct {
     EgtbInitializationStatistics initialization;
     bool failed;
     char error[256];
+    uint64_t progress_pending;
 } FrontierWorker;
 
 static void frontier_worker_error(FrontierWorker *worker,
@@ -2084,6 +2141,7 @@ static bool initialize_frontier_range(FrontierWorker *worker)
                 return false;
             }
         }
+        egtb_progress_tick(&worker->progress_pending);
     }
     worker->initialization = local;
     return true;
@@ -2122,6 +2180,7 @@ static bool process_frontier_source(uint64_t index, void *opaque)
     DraughtsPosition position;
     FrontierCandidateContext candidates;
     size_t predecessor_count;
+    egtb_progress_tick(&worker->progress_pending);
     if (index < worker->first_index || index >= worker->end_index) {
         frontier_worker_error(worker, "frontier index is owned by another worker");
         return false;
@@ -2270,6 +2329,7 @@ static void compile_frontier_range(FrontierWorker *worker)
                                       egtb_last_error());
                 goto done;
             }
+            egtb_progress_add(page_count);
         }
         first += count;
     }
@@ -2278,7 +2338,7 @@ done:
     worker->compilation_buffer = NULL;
 }
 
-static void *run_frontier_worker(void *opaque)
+static void *run_frontier_worker_body(void *opaque)
 {
     FrontierWorker *worker = opaque;
     if (worker->work == FRONTIER_WORK_INITIALIZE) {
@@ -2311,6 +2371,7 @@ static void *run_frontier_worker(void *opaque)
                index < worker->end_index) {
             uint64_t candidate = index++;
             ++worker->candidate_count;
+            egtb_progress_tick(&worker->progress_pending);
             if (worker->work == FRONTIER_WORK_LOSS_CANDIDATES) {
                 EgPosition indexed;
                 DraughtsPosition position;
@@ -2383,10 +2444,50 @@ static void *run_frontier_worker(void *opaque)
     return NULL;
 }
 
+static void *run_frontier_worker(void *opaque)
+{
+    FrontierWorker *worker = opaque;
+    worker->progress_pending = 0;
+    run_frontier_worker_body(opaque);
+    egtb_progress_flush(&worker->progress_pending);
+    return NULL;
+}
+
 static bool run_frontier_workers(FrontierWorker *workers, pthread_t *threads,
                                  unsigned thread_count)
 {
     unsigned i, created = 0;
+    char label[160];
+    uint64_t total = 0;
+    switch (workers[0].work) {
+    case FRONTIER_WORK_INITIALIZE:
+        snprintf(label, sizeof(label), "initialization");
+        break;
+    case FRONTIER_WORK_COMPILE:
+        snprintf(label, sizeof(label), "frontier compilation");
+        break;
+    default:
+        snprintf(label, sizeof(label), "backtracking %s %s-in-%d: %s",
+                 workers[0].successor_side == EGTB_WHITE_TO_MOVE ? "WTM" : "BTM",
+                 workers[0].distance % 2 ? "won" : "lost", workers[0].distance,
+                 workers[0].work == FRONTIER_WORK_WON_SOURCES ||
+                 workers[0].work == FRONTIER_WORK_LOST_SOURCES
+                     ? "predecessor generation" : "candidate evaluation");
+        break;
+    }
+    if (workers[0].work == FRONTIER_WORK_INITIALIZE ||
+        workers[0].work == FRONTIER_WORK_COMPILE)
+        for (i = 0; i < thread_count; ++i)
+            total += workers[i].end_index - workers[i].first_index;
+    else if (workers[0].work == FRONTIER_WORK_WON_SOURCES ||
+             workers[0].work == FRONTIER_WORK_LOST_SOURCES)
+        total = frontier_store_count(workers[0].frontiers,
+                    workers[0].successor_side,
+                    workers[0].work == FRONTIER_WORK_WON_SOURCES
+                        ? workers[0].distance : -workers[0].distance);
+    else
+        total = progress_bitmap_count(workers[0].candidates);
+    egtb_progress_begin(label, total, "positions");
     for (i = 0; i < thread_count; ++i) {
         int error;
         workers[i].failed = false;
@@ -2405,12 +2506,17 @@ static bool run_frontier_workers(FrontierWorker *workers, pthread_t *threads,
             return fail("cannot join frontier worker %u: %s", i,
                         strerror(error));
     }
-    if (created != thread_count)
+    if (created != thread_count) {
+        egtb_progress_end(false);
         return false;
+    }
     for (i = 0; i < thread_count; ++i)
-        if (workers[i].failed)
+        if (workers[i].failed) {
+            egtb_progress_end(false);
             return fail("frontier worker %u failed: %s", i,
                         workers[i].error);
+        }
+    egtb_progress_end(true);
     return true;
 }
 
@@ -2989,7 +3095,9 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     local.consistency_seconds = monotonic_seconds() - phase_started;
     phase_started = monotonic_seconds();
     local.maximum_dtm = 0;
-    for (uint64_t index = 0; index < position_count; ++index)
+    egtb_progress_begin("final DTM scan", position_count, "positions");
+    uint64_t scan_pending = 0;
+    for (uint64_t index = 0; index < position_count; ++index) {
         for (side = 0; side < 2; ++side) {
             int16_t value;
             uint16_t distance;
@@ -3001,6 +3109,10 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
             if (distance > local.maximum_dtm)
                 local.maximum_dtm = distance;
         }
+        egtb_progress_tick(&scan_pending);
+    }
+    egtb_progress_flush(&scan_pending);
+    egtb_progress_end(true);
     local.final_scan_seconds = monotonic_seconds() - phase_started;
     local.total_seconds = monotonic_seconds() - generation_started;
     if (statistics != NULL)

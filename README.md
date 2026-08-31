@@ -72,6 +72,39 @@ startup. It is independent of Git tags and commit identifiers:
 ./generate_egtb --revision
 ```
 
+## Timestamped progress and ETA
+
+Generation logs timestamp phase starts/completions and print progress once
+per minute while work is running. Progress includes completed/total work,
+percentage, elapsed wall time, throughput and estimated seconds remaining.
+The ETA uses `remaining work / average wall-clock throughput`; it is an
+estimate and may change as work becomes more or less expensive.
+
+Initialization, each backtracking source/candidate phase, frontier compilation,
+each consistency check/correction pass, compaction, resident loading, final
+verification, slice merging and statistics collection report separately.
+Verification counts exclude positions already verified. Backtracking cannot
+predict the final mate distance, and repair cannot predict how many passes
+remain, so ETAs refer to the **current phase**, not the whole database.
+Stages without a measurable work count report elapsed time and `ETA=unknown`.
+
+```sh
+# Default: periodic progress every 60 seconds, plus phase boundaries.
+./generate_egtb -j 16 1 1 1 1
+
+# Optional interval in seconds (1..3600); 0 disables progress reporting.
+EGTB_PROGRESS_SECONDS=30 ./generate_egtb -j 16 1 1 1 1
+
+# Job scripts redirect output: follow their log while generation is running.
+tail -f logs/2x2/1wX-1wO-1bX-1bO.log
+```
+
+Timestamps use local time with a UTC offset. Durations and ETA use the
+monotonic clock, so system-clock adjustments do not distort them. Updates
+are newline-delimited and flushed immediately; the final statistics tables
+retain their existing format. The library is silent unless the optional,
+process-wide progress reporter is explicitly enabled before launching workers.
+
 ## Board and material representation
 
 Squares are numbered 0 through 49. A position contains four `uint64_t`

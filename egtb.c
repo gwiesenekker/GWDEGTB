@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "egtb.h"
+#include "progress.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1867,6 +1868,7 @@ static void *load_resident_pages(void *opaque)
                                         [(uint16_t)EGTB_STORED_DRAW] +=
                     valid_entries;
             }
+            egtb_progress_add(1);
             continue;
         }
         if (length > compressed_capacity ||
@@ -1908,6 +1910,7 @@ static void *load_resident_pages(void *opaque)
         if (!egtb->planar)
             memcpy(&worker->entries[first_index], destination,
                    valid_entries * sizeof(EgtbEntry));
+        egtb_progress_add(1);
     }
 done:
     free(codec);
@@ -1938,6 +1941,7 @@ bool egtb_resident_load(EgtbResident **out, Egtb *backing,
         return fail("resident EGTB does not fit in address space");
     if (backing->page_count < thread_count)
         thread_count = (unsigned)backing->page_count;
+    egtb_progress_begin("resident load", backing->page_count, "pages");
     resident = calloc(1, sizeof(*resident));
     workers = calloc(thread_count, sizeof(*workers));
     threads = calloc(thread_count, sizeof(*threads));
@@ -1992,6 +1996,7 @@ bool egtb_resident_load(EgtbResident **out, Egtb *backing,
     resident = NULL;
     ok = true;
 done:
+    egtb_progress_end(ok);
     if (resident != NULL) {
         free(resident->entries);
         free(resident);
@@ -2234,12 +2239,14 @@ bool egtb_compact(const char *path, int compression_level,
                              source->page_size, &options,
                              source->format_version))
         goto done;
+    egtb_progress_begin("compaction", source->page_count, "pages");
     target->exact_layout = true;
     for (page = 0; page < source->page_count; ++page) {
         size_t cache_index;
         if (!cached_page(source, page, &cache_index) ||
             !store_page(target, page, cache_data(source, cache_index), true))
             goto done;
+        egtb_progress_add(1);
     }
     if (!egtb_close(target)) {
         target = NULL;
@@ -2255,6 +2262,7 @@ bool egtb_compact(const char *path, int compression_level,
     ok = true;
 
 done:
+    egtb_progress_end(ok);
     if (target != NULL)
         egtb_close(target);
     if (source != NULL)

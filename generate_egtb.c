@@ -1,4 +1,5 @@
 #include "egtb.h"
+#include "progress.h"
 #include "endgame_index.h"
 #include "generator.h"
 #include "material.h"
@@ -362,7 +363,8 @@ int main(int argc, char **argv)
         printf("GWDEGTB revision %s\n", gwdegtb_revision);
         return EXIT_SUCCESS;
     }
-    printf("GWDEGTB revision %s starting\n", gwdegtb_revision);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    egtb_progress_log("GWDEGTB revision %s starting\n", gwdegtb_revision);
     if (!configuration_page_size(&page_size)) {
         fprintf(stderr, "invalid EGTB_PAGE_SIZE: expected a power of two from 128 to 32768 bytes\n");
         return EXIT_FAILURE;
@@ -458,6 +460,23 @@ int main(int argc, char **argv)
     printf("frontier compilation: %" PRIu64 " MiB assembly buffer total\n",
            compilation_buffer_bytes / (1024 * 1024));
     fflush(stdout);
+    unsigned progress_seconds = 60;
+    const char *progress_setting = getenv("EGTB_PROGRESS_SECONDS");
+    if (progress_setting != NULL && *progress_setting != '\0') {
+        char *end;
+        errno = 0;
+        unsigned long value = strtoul(progress_setting, &end, 10);
+        if (errno || *end != '\0' || *progress_setting < '0' ||
+            *progress_setting > '9' || value > 3600) {
+            fprintf(stderr, "invalid EGTB_PROGRESS_SECONDS: expected 0..3600\n");
+            goto done;
+        }
+        progress_seconds = (unsigned)value;
+    }
+    if (!egtb_progress_start(progress_seconds)) {
+        fprintf(stderr, "cannot start progress reporter\n");
+        goto done;
+    }
     generation_started = wall_seconds();
     setup_seconds = generation_started - program_started;
     if (sliced) {
@@ -516,6 +535,7 @@ int main(int argc, char **argv)
     catalog_cache_statistics(catalogs, thread_count,
                              &generation_dependencies);
     phase_started = wall_seconds();
+    egtb_progress_begin("finalize/close", UINT64_MAX, "");
     if (!egtb_flush(database)) {
         fprintf(stderr, "cannot finalize %s: %s\n", path, egtb_last_error());
         goto done;
@@ -528,6 +548,7 @@ int main(int argc, char **argv)
     database = NULL;
     for (unsigned worker = 0; worker < thread_count; ++worker)
         close_catalog(&catalogs[worker]);
+    egtb_progress_end(true);
     finalize_seconds = wall_seconds() - phase_started;
     phase_started = wall_seconds();
     if (!egtb_compact(path, 9, readonly_cache_pages) ||
@@ -583,6 +604,9 @@ int main(int argc, char **argv)
     catalog_cache_statistics(catalogs, thread_count,
                              &verification_dependencies);
     phase_started = wall_seconds();
+    egtb_progress_begin("statistics", resident != NULL ? 1 : positions,
+                        resident != NULL ? "histograms" : "positions");
+    uint64_t statistics_pending = 0;
     if (!egtb_storage_statistics(database, &storage)) {
         fprintf(stderr, "cannot read storage statistics for %s: %s\n",
                 path, egtb_last_error());
@@ -595,8 +619,9 @@ int main(int argc, char **argv)
         if (!egtb_resident_dtm_histogram(resident, histogram,
                                          UINT16_MAX + 1u))
             goto done;
+        egtb_progress_add(1);
     } else {
-        for (uint64_t index = 0; index < positions; ++index)
+        for (uint64_t index = 0; index < positions; ++index) {
             for (unsigned side = 0; side < 2; ++side) {
                 int16_t value;
                 if (!egtb_get(database, index, (EgtbSide)side, &value))
@@ -604,7 +629,11 @@ int main(int argc, char **argv)
                 ++histogram[(size_t)side * (UINT16_MAX + 1u) +
                             (uint16_t)value];
             }
+            egtb_progress_tick(&statistics_pending);
+        }
     }
+    egtb_progress_flush(&statistics_pending);
+    egtb_progress_end(true);
     statistics_seconds = wall_seconds() - phase_started;
     printf("generated %s: material=%u %u %u %u positions=%" PRIu64
            " maximum-index=%" PRIu64 " passes=%" PRIu64
@@ -702,6 +731,8 @@ int main(int argc, char **argv)
                         "workspace was retained: %s\n",
                 egtb_sliced_last_error());
 done:
+    egtb_progress_end(ok);
+    egtb_progress_stop();
     egtb_resident_destroy(resident);
     if (database != NULL && !egtb_close(database))
         ok = false;
@@ -717,7 +748,7 @@ done:
     free(histogram);
     if (!ok && created)
         unlink(path);
-    printf("GWDEGTB revision %s %s\n", gwdegtb_revision,
+    egtb_progress_log("GWDEGTB revision %s %s\n", gwdegtb_revision,
            ok ? "completed" : "failed");
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
