@@ -447,8 +447,9 @@ int main(int argc, char **argv)
         probe_contexts[worker] = &catalogs[worker];
     }
     if (sliced && material.white_men == 0 && material.black_men == 0) {
-        fprintf(stderr, "--sliced requires at least one man\n");
-        goto done;
+        fprintf(stderr, "warning: ignoring --sliced because the material "
+                        "contains no men\n");
+        sliced = false;
     }
     printf("generating %s%s with %u thread%s, %u MiB writable cache total, "
            "%u MiB dependency cache per worker/database\n",

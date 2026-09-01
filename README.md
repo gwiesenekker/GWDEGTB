@@ -324,6 +324,14 @@ EGTB_THREADS=16 ./3x1.sh
 # Continue with 3x2.sh, 3x3.sh, 4x1.sh, ... through the seven-piece jobs.
 ```
 
+Set `EGTB_SLICED=--sliced` to make every family script use man-row sliced
+generation. An unset value, or any value other than the exact string
+`--sliced`, selects ordinary generation:
+
+```sh
+EGTB_THREADS=16 EGTB_SLICED=--sliced ./4x3.sh
+```
+
 Logs are written below `logs/<family>/`. Generation order sorts by total piece
 count, larger White side first, then White kings descending and Black kings
 descending. This matches the historical GWD order and ensures promotion
@@ -337,6 +345,9 @@ producing the same ordinary full-index `.dtm` file:
 ```sh
 ./generate_egtb --sliced -j 16 0 4 0 3
 ```
+
+For king-only material, `--sliced` prints a warning and is ignored because
+there are no man rows by which to partition the database.
 
 The most-forward man identifies a slice. One colour with men gives up to nine
 slices; men of both colours give up to 81. White rows are generated from 2

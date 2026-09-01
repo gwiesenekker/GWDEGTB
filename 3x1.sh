@@ -5,6 +5,8 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 log_dir=${EGTB_LOG_DIR:-"$script_dir/logs/3x1"}
 threads=${EGTB_THREADS:-1}
+sliced=${EGTB_SLICED:-}
+[ "$sliced" = "--sliced" ] || sliced=
 
 cd "$script_dir"
 mkdir -p "$log_dir"
@@ -21,7 +23,7 @@ generate()
 
     printf 'Generating %s (log: %s)\n' "$name" "$log"
     rm -f -- "$database"
-    if ./generate_egtb -j "$threads" "$white_kings" "$white_men" \
+    if ./generate_egtb $sliced -j "$threads" "$white_kings" "$white_men" \
             "$black_kings" "$black_men" >"$log" 2>&1; then
         sed -n '/^generated /,$p' "$log"
     else
