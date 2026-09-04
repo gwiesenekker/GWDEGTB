@@ -12,7 +12,32 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(EGTB_PADDED_MOVEGEN)
+#if defined(EGTB_PADDED_MOVEGEN) && \
+    !defined(EGTB_PADDED_MOVEGEN_CALLBACK)
+#define GENERATE_QUIET_PREDECESSORS \
+    draughts_generate_quiet_predecessors_padded
+
+static inline bool generate_moves_padded_visit(
+    const DraughtsPosition *position, EgtbSide side,
+    DraughtsMoveVisitor visitor, void *context, size_t *move_count)
+{
+    DraughtsMove moves[DRAUGHTS_MOVES_MAX];
+    size_t count, index;
+    if (!draughts_generate_moves_padded_into(
+            position, side, moves, DRAUGHTS_MOVES_MAX, &count))
+        return false;
+    if (visitor != NULL) {
+        for (index = 0; index < count; ++index)
+            if (!visitor(&moves[index], context))
+                return false;
+    }
+    if (move_count != NULL)
+        *move_count = count;
+    return true;
+}
+
+#define GENERATE_MOVES generate_moves_padded_visit
+#elif defined(EGTB_PADDED_MOVEGEN)
 #define GENERATE_MOVES draughts_generate_moves_padded
 #define GENERATE_QUIET_PREDECESSORS \
     draughts_generate_quiet_predecessors_padded

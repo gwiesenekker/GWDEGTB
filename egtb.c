@@ -2077,6 +2077,78 @@ bool egtb_resident_dtm_histogram(const EgtbResident *resident,
     return true;
 }
 
+static void consider_dtm_example(EgtbDtmExamples *examples, uint64_t index,
+                                 EgtbSide side, int16_t value)
+{
+    EgtbDtmExample *example;
+    if (value == EGTB_DRAW) {
+        if (!examples->draw.available ||
+            side < examples->draw_side ||
+            (side == examples->draw_side && index < examples->draw.index)) {
+            examples->draw.index = index;
+            examples->draw.dtm = value;
+            examples->draw.available = true;
+            examples->draw_side = side;
+        }
+        return;
+    }
+    example = value > 0 ? &examples->longest_win[side]
+                        : &examples->longest_loss[side];
+    if (!example->available ||
+        (value > 0 ? value > example->dtm : value < example->dtm) ||
+        (value == example->dtm && index < example->index)) {
+        example->index = index;
+        example->dtm = value;
+        example->available = true;
+    }
+}
+
+bool egtb_find_dtm_examples(Egtb *backing, const EgtbResident *resident,
+                            EgtbDtmExamples *examples)
+{
+    uint64_t positions, pending = 0;
+    if (backing == NULL || examples == NULL ||
+        (resident != NULL && !egtb_resident_matches(resident, backing)))
+        return fail("invalid DTM examples scan");
+    memset(examples, 0, sizeof(*examples));
+    examples->draw_side = EGTB_BLACK_TO_MOVE;
+    positions = backing->maximum_index + 1;
+    if (resident != NULL) {
+        for (uint64_t index = 0; index < positions; ++index) {
+            int16_t white, black;
+            if (!egtb_resident_get_pair(resident, index, &white, &black))
+                return false;
+            consider_dtm_example(examples, index, EGTB_WHITE_TO_MOVE, white);
+            consider_dtm_example(examples, index, EGTB_BLACK_TO_MOVE, black);
+            egtb_progress_tick(&pending);
+        }
+        egtb_progress_flush(&pending);
+        return true;
+    }
+    {
+        EgtbView *view = NULL;
+        EgtbSequentialReader reader;
+        bool ok = false;
+        if (!egtb_view_create(&view, backing, 1, false) ||
+            !egtb_sequential_reader_init(&reader, view, 0, positions))
+            goto done;
+        for (uint64_t index = 0; index < positions; ++index) {
+            int16_t white, black;
+            if (!egtb_sequential_reader_next(&reader, &white, &black))
+                goto done;
+            consider_dtm_example(examples, index, EGTB_WHITE_TO_MOVE, white);
+            consider_dtm_example(examples, index, EGTB_BLACK_TO_MOVE, black);
+            egtb_progress_tick(&pending);
+        }
+        egtb_progress_flush(&pending);
+        ok = true;
+done:
+        if (view != NULL && !egtb_view_close(view))
+            ok = false;
+        return ok;
+    }
+}
+
 uint64_t egtb_maximum_index(const Egtb *egtb)
 {
     return egtb == NULL ? 0 : egtb->maximum_index;

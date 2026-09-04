@@ -7,10 +7,13 @@ BENCH_CFLAGS ?= -O3 -DNDEBUG -march=native -std=c11 -Wall -Wextra -Wpedantic -pt
 LDLIBS ?= -lzstd
 BUILD_REVISION := $(strip $(shell cat REVISION))
 
-.PHONY: all test check-stats benchmark benchmark-egtb benchmark-movegen benchmark-combinatorial-index clean
+.PHONY: all test check-stats benchmark benchmark-egtb benchmark-movegen benchmark-combinatorial-index benchmark-wdl-probe benchmark-tunstall benchmark-wdl3 clean
 
-all: libgwdegtb.a test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap generate_egtb check_stats benchmark_index benchmark_combinatorial_index benchmark_egtb \
+all: libgwdegtb.a test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap generate_egtb dtm_examples verify_dtm check_stats benchmark_index benchmark_combinatorial_index benchmark_egtb \
 	benchmark_movegen
+all: benchmark_wdl_probe
+all: benchmark_tunstall
+all: benchmark_wdl3
 all: test_dtm16 test_progress test_8piece
 
 test_8piece: test_8piece.o generator_padded.o frontier.o bitmap.o movegen.o libgwdegtb.a
@@ -22,18 +25,24 @@ test_progress: test_progress.o progress.o
 %.o: %.c Makefile
 	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-generate_egtb: generate_egtb.o sliced.o generator_padded.o frontier.o bitmap.o material.o movegen.o endgame_index.o egtb.o progress.o revision.o
+generate_egtb: generate_egtb.o dtm_fen.o sliced.o generator_padded.o frontier.o bitmap.o material.o movegen.o endgame_index.o egtb.o progress.o revision.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-libgwdegtb.a: gwdegtb.o wdl.o egtb.o progress.o material.o endgame_index.o
+dtm_examples: dtm_examples.o dtm_fen.o material.o endgame_index.o movegen.o egtb.o progress.o revision.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+verify_dtm: verify_dtm.o generator_padded.o frontier.o bitmap.o material.o movegen.o endgame_index.o egtb.o progress.o revision.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+libgwdegtb.a: gwdegtb.o wdl.o egtb.o progress.o material.o endgame_index.o dtm_fen.o
 	$(AR) rcs $@ $^
 
 generate_egtb.o: revision.h
 
-generate_egtb_padded: generate_egtb.o sliced.o generator_padded.o frontier.o bitmap.o material.o movegen.o endgame_index.o egtb.o progress.o revision.o
+generate_egtb_padded: generate_egtb.o dtm_fen.o sliced.o generator_padded.o frontier.o bitmap.o material.o movegen.o endgame_index.o egtb.o progress.o revision.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-generate_egtb_table: generate_egtb.o sliced.o generator.o frontier.o bitmap.o material.o movegen.o endgame_index.o egtb.o progress.o revision.o
+generate_egtb_table: generate_egtb.o dtm_fen.o sliced.o generator.o frontier.o bitmap.o material.o movegen.o endgame_index.o egtb.o progress.o revision.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 revision.o: revision.c revision.h REVISION Makefile
@@ -94,6 +103,15 @@ benchmark_movegen: benchmark_movegen.c movegen.c movegen.h endgame_index.c \
 		endgame_index.h
 	$(CC) $(BENCH_CFLAGS) -o $@ benchmark_movegen.c movegen.c endgame_index.c
 
+benchmark_wdl_probe: benchmark_wdl_probe.o libgwdegtb.a
+	$(CC) $(BENCH_CFLAGS) -o $@ $^ $(LDLIBS)
+
+benchmark_tunstall: benchmark_tunstall.o libgwdegtb.a
+	$(CC) $(BENCH_CFLAGS) -o $@ $^ $(LDLIBS) -lm
+
+benchmark_wdl3: benchmark_wdl3.o libgwdegtb.a
+	$(CC) $(BENCH_CFLAGS) -o $@ $^ $(LDLIBS)
+
 test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_dtm16 test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap
 	./test_progress
 	./test_8piece
@@ -128,6 +146,15 @@ benchmark-movegen: benchmark_movegen
 benchmark-combinatorial-index: benchmark_combinatorial_index
 	./benchmark_combinatorial_index
 
+benchmark-wdl-probe: benchmark_wdl_probe
+	@echo "usage: ./benchmark_wdl_probe DIRECTORY DATABASE [CACHE_MIB] [LOOKUPS]"
+
+benchmark-tunstall: benchmark_tunstall
+	@echo "usage: ./benchmark_tunstall DIRECTORY DATABASE [8|16]"
+
+benchmark-wdl3: benchmark_wdl3
+	@echo "usage: ./benchmark_wdl3 DIRECTORY DATABASE"
+
 test: test_progress test_8piece
 
 clean:
@@ -135,10 +162,12 @@ clean:
 	$(RM) test_progress test_progress.o
 	$(RM) test_dtm16 test_dtm16.o
 	$(RM) libgwdegtb.a test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap check_stats benchmark_index benchmark_combinatorial_index \
-		benchmark_egtb benchmark_movegen test_index.o test_slice_index.o test_sliced.o test_egtb.o \
+		benchmark_egtb benchmark_movegen benchmark_wdl_probe benchmark_wdl_probe.o benchmark_tunstall benchmark_tunstall.o benchmark_wdl3 benchmark_wdl3.o test_index.o test_slice_index.o test_sliced.o test_egtb.o \
 		test_gwdegtb.o test_movegen.o test_generator.o test_material.o test_bitmap.o test_combinatorial_index.o check_stats.o combinatorial_index.o endgame_index.o egtb.o progress.o wdl.o gwdegtb.o movegen.o \
 	generator.o generator_padded.o frontier.o bitmap.o material.o sliced.o generate_egtb \
-		generate_egtb_padded generate_egtb_table generate_egtb.o revision.o
+		generate_egtb_padded generate_egtb_table generate_egtb.o revision.o \
+		dtm_examples dtm_examples.o dtm_fen.o
+	$(RM) verify_dtm verify_dtm.o
 	$(RM) *.d
 
 -include $(wildcard *.d)

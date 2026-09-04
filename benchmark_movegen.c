@@ -178,6 +178,63 @@ static bool benchmark_backend(const MovegenBackend *backend,
     return true;
 }
 
+static bool benchmark_padded_direct(const DraughtsPosition *positions,
+                                    uint64_t samples,
+                                    BenchmarkResult *result)
+{
+    DraughtsMove moves[DRAUGHTS_MOVES_MAX];
+    uint64_t sample;
+    double start;
+    memset(result, 0, sizeof(*result));
+
+    for (sample = 0; sample < samples && sample < 10000; ++sample) {
+        size_t ignored;
+        draughts_generate_moves_padded_into(
+            &positions[sample], EGTB_WHITE_TO_MOVE, moves,
+            DRAUGHTS_MOVES_MAX, &ignored);
+        draughts_generate_moves_padded_into(
+            &positions[sample], EGTB_BLACK_TO_MOVE, moves,
+            DRAUGHTS_MOVES_MAX, &ignored);
+    }
+    start = now_seconds();
+    for (sample = 0; sample < samples; ++sample) {
+        unsigned side;
+        for (side = 0; side < 2; ++side) {
+            size_t count;
+            if (!draughts_generate_moves_padded_into(
+                    &positions[sample], (EgtbSide)side, moves,
+                    DRAUGHTS_MOVES_MAX, &count))
+                return false;
+            result->moves += count;
+        }
+    }
+    result->generate_seconds = now_seconds() - start;
+
+    start = now_seconds();
+    for (sample = 0; sample < samples; ++sample) {
+        unsigned side;
+        for (side = 0; side < 2; ++side) {
+            ApplyContext context = {positions[sample], (EgtbSide)side,
+                                    0, 0, 0, false};
+            size_t count, index;
+            if (!draughts_generate_moves_padded_into(
+                    &positions[sample], (EgtbSide)side, moves,
+                    DRAUGHTS_MOVES_MAX, &count))
+                return false;
+            for (index = 0; index < count; ++index)
+                if (!apply_move(&moves[index], &context))
+                    return false;
+            if (context.failed)
+                return false;
+            result->checksum += context.checksum + count;
+            if (context.maximum_capture > result->maximum_capture)
+                result->maximum_capture = context.maximum_capture;
+        }
+    }
+    result->apply_seconds = now_seconds() - start;
+    return true;
+}
+
 static void print_result(const MovegenBackend *backend,
                          const BenchmarkResult *result, uint64_t operations)
 {
@@ -219,7 +276,7 @@ int main(int argc, char **argv)
         "padded", draughts_has_capture_padded,
         draughts_generate_moves_padded,
         draughts_generate_quiet_predecessors_padded};
-    BenchmarkResult table_result, padded_result;
+    BenchmarkResult table_result, padded_result, direct_result;
 
     if (argc == 3 && strcmp(argv[1], "--samples") == 0) {
         if (!parse_samples(argv[2], &samples)) {
@@ -260,7 +317,8 @@ int main(int argc, char **argv)
     operations = samples * 2;
 
     if (!benchmark_backend(&table, positions, samples, &table_result) ||
-        !benchmark_backend(&padded, positions, samples, &padded_result)) {
+        !benchmark_backend(&padded, positions, samples, &padded_result) ||
+        !benchmark_padded_direct(positions, samples, &direct_result)) {
         fprintf(stderr, "move-generation benchmark failed: %s\n",
                 draughts_movegen_last_error());
         free(positions);
@@ -270,7 +328,10 @@ int main(int argc, char **argv)
         table_result.moves != padded_result.moves ||
         table_result.predecessors != padded_result.predecessors ||
         table_result.checksum != padded_result.checksum ||
-        table_result.maximum_capture != padded_result.maximum_capture) {
+        table_result.maximum_capture != padded_result.maximum_capture ||
+        padded_result.moves != direct_result.moves ||
+        padded_result.checksum != direct_result.checksum ||
+        padded_result.maximum_capture != direct_result.maximum_capture) {
         fprintf(stderr, "move-generation backends produced different results\n");
         free(positions);
         return EXIT_FAILURE;
@@ -284,6 +345,17 @@ int main(int argc, char **argv)
                                                  "portable fallback");
     print_result(&table, &table_result, operations);
     print_result(&padded, &padded_result, operations);
+    printf("padded direct-output path:\n");
+    printf("  legal generation:   %10.3f positions/s  %10.3f moves/s\n",
+           (double)operations / direct_result.generate_seconds,
+           (double)direct_result.moves / direct_result.generate_seconds);
+    printf("  generation+do/undo: %10.3f positions/s  %10.3f moves/s\n",
+           (double)operations / direct_result.apply_seconds,
+           (double)direct_result.moves / direct_result.apply_seconds);
+    printf("  callback/direct speedup: generation=%.3fx "
+           "generation+do/undo=%.3fx\n",
+           padded_result.generate_seconds / direct_result.generate_seconds,
+           padded_result.apply_seconds / direct_result.apply_seconds);
     printf("padded/table speedup: capture=%.3fx generation=%.3fx "
            "generation+do/undo=%.3fx predecessors=%.3fx\n",
            table_result.capture_seconds / padded_result.capture_seconds,

@@ -30,6 +30,7 @@ typedef struct {
     DraughtsMove *allocated;
     size_t count;
     size_t capacity;
+    bool fixed;
 } CaptureBuffer;
 
 typedef struct {
@@ -69,6 +70,9 @@ static bool record_capture(CaptureBuffer *buffer, unsigned *maximum,
         buffer->count = 0;
     }
     if (buffer->count == buffer->capacity) {
+        if (buffer->fixed)
+            return fail("more than %zu maximum capture moves",
+                        buffer->capacity);
         size_t capacity = buffer->capacity * 2;
         DraughtsMove *moves;
         if (capacity < buffer->capacity ||
@@ -481,7 +485,7 @@ bool draughts_generate_moves(const DraughtsPosition *position, EgtbSide side,
                              size_t *move_count)
 {
     DraughtsMove stack_moves[256];
-    CaptureBuffer buffer = {stack_moves, NULL, 0, 256};
+    CaptureBuffer buffer = {stack_moves, NULL, 0, 256, false};
     CaptureSearch search;
     size_t quiet_count = 0;
     initialize_geometry();
@@ -744,10 +748,11 @@ static inline unsigned padded_field_from_square(unsigned square)
     return square + 6 + square / 10;
 }
 
+static uint8_t padded_square[64];
+
 static inline unsigned padded_square_from_field(unsigned field)
 {
-    unsigned relative = field - 6;
-    return relative - relative / 11;
+    return padded_square[field];
 }
 
 static inline unsigned padded_square_from_bit(uint64_t bit)
@@ -777,6 +782,7 @@ static void initialize_padded_geometry(void)
     for (square = 0; square < 50; ++square) {
         unsigned field = padded_field_from_square(square);
         uint64_t start = BIT(field);
+        padded_square[field] = (uint8_t)square;
         for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
             uint64_t scan = padded_step(start, direction);
             uint64_t between = 0;
@@ -813,7 +819,7 @@ static inline uint64_t padded_take_nearest_bit(uint64_t *bits,
     return bit;
 }
 
-static uint64_t compact_to_padded(uint64_t compact)
+static inline uint64_t compact_to_padded(uint64_t compact)
 {
 #if DRAUGHTS_HAVE_BMI2
     return _pdep_u64(compact, PADDED_BOARD_MASK);
@@ -828,7 +834,7 @@ static uint64_t compact_to_padded(uint64_t compact)
 #endif
 }
 
-static uint64_t padded_to_compact(uint64_t padded)
+static inline uint64_t padded_to_compact(uint64_t padded)
 {
 #if DRAUGHTS_HAVE_BMI2
     return _pext_u64(padded, PADDED_BOARD_MASK);
@@ -882,6 +888,22 @@ static inline uint64_t padded_opponents(const PaddedPosition *position,
     return side == EGTB_WHITE_TO_MOVE
                ? position->black_men | position->black_kings
                : position->white_men | position->white_kings;
+}
+
+static uint64_t padded_man_capture_starts(uint64_t men,
+                                          uint64_t opponents,
+                                          uint64_t all)
+{
+    uint64_t empty = PADDED_BOARD_MASK & ~all;
+    uint64_t starts = 0;
+    unsigned direction;
+
+    for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
+        unsigned opposite = direction ^ 3U;
+        uint64_t victims = opponents & padded_step(empty, opposite);
+        starts |= men & padded_step(victims, opposite);
+    }
+    return starts;
 }
 
 static bool padded_emit_capture(PaddedCaptureSearch *search,
@@ -961,6 +983,7 @@ static void padded_search_all_captures(const PaddedPosition *position,
     uint64_t men = padded_side_men(position, side);
     uint64_t kings = padded_side_kings(position, side);
     uint64_t all = padded_occupied(position);
+    men = padded_man_capture_starts(men, search->opponents, all);
     while (men != 0 && search->ok) {
         uint64_t piece = men & (UINT64_C(0) - men);
         men &= men - 1;
@@ -1002,13 +1025,8 @@ static bool padded_position_has_capture(const PaddedPosition *position,
     uint64_t kings = padded_side_kings(position, side);
     uint64_t opponents = padded_opponents(position, side);
     uint64_t all = padded_occupied(position);
-    unsigned direction;
-
-    for (direction = 0; direction < DIRECTION_COUNT; ++direction) {
-        uint64_t victims = padded_step(men, direction) & opponents;
-        if ((padded_step(victims, direction) & ~all) != 0)
-            return true;
-    }
+    if (padded_man_capture_starts(men, opponents, all) != 0)
+        return true;
     while (kings != 0) {
         uint64_t king = kings & (UINT64_C(0) - kings);
         kings &= kings - 1;
@@ -1031,27 +1049,24 @@ bool draughts_has_capture_padded(const DraughtsPosition *position,
     return padded_position_has_capture(&padded, side);
 }
 
-static bool padded_visit_quiet_move(uint64_t from, uint64_t to,
-                                    DraughtsMoveVisitor visitor,
-                                    void *context, size_t *count)
+static bool padded_store_quiet_move(uint64_t from, uint64_t to,
+                                    DraughtsMove *moves, size_t capacity,
+                                    size_t *count)
 {
-    if (visitor != NULL) {
-        DraughtsMove move;
-        move.from = (uint8_t)padded_square_from_bit(from);
-        move.to = (uint8_t)padded_square_from_bit(to);
-        move.captured = 0;
-        move.capture_count = 0;
-        if (!visitor(&move, context))
-            return fail("move visitor rejected a padded quiet move");
-    }
-    ++*count;
+    DraughtsMove move;
+    if (*count == capacity)
+        return fail("more than %zu quiet moves", capacity);
+    move.from = (uint8_t)padded_square_from_bit(from);
+    move.to = (uint8_t)padded_square_from_bit(to);
+    move.captured = 0;
+    move.capture_count = 0;
+    moves[(*count)++] = move;
     return true;
 }
 
-static bool padded_generate_quiet_moves(const PaddedPosition *position,
-                                        EgtbSide side,
-                                        DraughtsMoveVisitor visitor,
-                                        void *context, size_t *count)
+static bool padded_generate_quiet_moves_into(
+    const PaddedPosition *position, EgtbSide side, DraughtsMove *moves,
+    size_t capacity, size_t *count)
 {
     uint64_t men = padded_side_men(position, side);
     uint64_t kings = padded_side_kings(position, side);
@@ -1063,20 +1078,15 @@ static bool padded_generate_quiet_moves(const PaddedPosition *position,
     for (direction = first_direction; direction < first_direction + 2;
          ++direction) {
         uint64_t targets = padded_step(men, direction) & ~all;
-        if (visitor == NULL) {
-            *count += bit_count(targets);
-            continue;
-        }
         while (targets != 0) {
             uint64_t target = targets & (UINT64_C(0) - targets);
             uint64_t from = padded_step(target, 3 - direction);
             targets &= targets - 1;
-            if (!padded_visit_quiet_move(from, target, visitor, context,
+            if (!padded_store_quiet_move(from, target, moves, capacity,
                                          count))
                 return false;
         }
     }
-
     while (kings != 0) {
         uint64_t king = kings & (UINT64_C(0) - kings);
         kings &= kings - 1;
@@ -1091,7 +1101,7 @@ static bool padded_generate_quiet_moves(const PaddedPosition *position,
             while (targets != 0) {
                 uint64_t target =
                     padded_take_nearest_bit(&targets, direction);
-                if (!padded_visit_quiet_move(king, target, visitor, context,
+                if (!padded_store_quiet_move(king, target, moves, capacity,
                                              count))
                     return false;
             }
@@ -1100,21 +1110,20 @@ static bool padded_generate_quiet_moves(const PaddedPosition *position,
     return true;
 }
 
-bool draughts_generate_moves_padded(
-    const DraughtsPosition *position, EgtbSide side,
-    DraughtsMoveVisitor visitor, void *context, size_t *move_count)
+bool draughts_generate_moves_padded_into(
+    const DraughtsPosition *position, EgtbSide side, DraughtsMove *moves,
+    size_t capacity, size_t *move_count)
 {
-    DraughtsMove stack_moves[256];
-    CaptureBuffer buffer = {stack_moves, NULL, 0, 256};
+    CaptureBuffer buffer = {moves, NULL, 0, capacity, true};
     PaddedPosition padded;
     PaddedCaptureSearch search;
-    size_t quiet_count = 0;
-    if (move_count != NULL)
-        *move_count = 0;
+    if (move_count == NULL || (moves == NULL && capacity != 0))
+        return fail("invalid direct padded move-generation output");
+    *move_count = 0;
 #ifndef NDEBUG
     if (!draughts_position_is_valid(position) ||
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
-        return fail("invalid padded move-generation position or side");
+        return fail("invalid direct padded move-generation position or side");
 #endif
     padded = make_padded_position(position);
     memset(&search, 0, sizeof(search));
@@ -1122,26 +1131,33 @@ bool draughts_generate_moves_padded(
     search.buffer = &buffer;
     search.ok = true;
     padded_search_all_captures(&padded, side, &search);
-    if (!search.ok) {
-        free(buffer.allocated);
+    if (!search.ok)
         return false;
-    }
     if (search.maximum != 0) {
-        if (!visit_captures(&buffer, visitor, context)) {
-            free(buffer.allocated);
-            return false;
-        }
-        if (move_count != NULL)
-            *move_count = buffer.count;
-        free(buffer.allocated);
+        *move_count = buffer.count;
         return true;
     }
-    free(buffer.allocated);
-    if (!padded_generate_quiet_moves(&padded, side, visitor, context,
-                                     &quiet_count))
+    return padded_generate_quiet_moves_into(&padded, side, moves, capacity,
+                                             move_count);
+}
+
+bool draughts_generate_moves_padded(
+    const DraughtsPosition *position, EgtbSide side,
+    DraughtsMoveVisitor visitor, void *context, size_t *move_count)
+{
+    DraughtsMove moves[DRAUGHTS_MOVES_MAX];
+    size_t count, index;
+    if (!draughts_generate_moves_padded_into(
+            position, side, moves, DRAUGHTS_MOVES_MAX, &count))
         return false;
+    if (visitor != NULL) {
+        for (index = 0; index < count; ++index) {
+            if (!visitor(&moves[index], context))
+                return fail("move visitor rejected a padded generated move");
+        }
+    }
     if (move_count != NULL)
-        *move_count = quiet_count;
+        *move_count = count;
     return true;
 }
 

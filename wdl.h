@@ -9,6 +9,7 @@
 
 #define WDL_FORMAT_VERSION 1
 #define WDL_PAGE_SIZE 1024
+#define WDL_MAX_DECOMPRESSION_THREADS 256
 
 typedef enum {
     WDL_DRAW = 0,
@@ -30,6 +31,7 @@ typedef struct {
 } WdlStorageStatistics;
 
 typedef struct Wdl Wdl;
+typedef struct WdlImage WdlImage;
 
 const char *wdl_last_error(void);
 
@@ -50,6 +52,21 @@ bool wdl_get(Wdl *wdl, uint64_t index, EgtbSide side, WdlResult *result);
 
 /* Decompress the complete packed WDL bitmap into caller-owned storage. */
 bool wdl_decompress_into(Wdl *wdl, void *data, size_t size);
+bool wdl_decompress_into_threaded(Wdl *wdl, void *data, size_t size,
+                                  unsigned thread_count);
+
+/* Immutable, caller-owned in-memory image of a complete compressed WDL file. */
+bool wdl_file_size(const char *path, size_t *size);
+bool wdl_file_load_into(const char *path, void *data, size_t size);
+bool wdl_image_attach(WdlImage **out, const void *data, size_t size);
+void wdl_image_destroy(WdlImage *image);
+uint64_t wdl_image_maximum_index(const WdlImage *image);
+uint64_t wdl_image_page_count(const WdlImage *image);
+bool wdl_image_page(const WdlImage *image, uint64_t page,
+                    const void **compressed, size_t *compressed_size,
+                    uint32_t *checksum);
+bool wdl_image_validate_page(const WdlImage *image, uint64_t page,
+                             const void *uncompressed, size_t size);
 
 uint64_t wdl_maximum_index(const Wdl *wdl);
 uint64_t wdl_page_count(const Wdl *wdl);

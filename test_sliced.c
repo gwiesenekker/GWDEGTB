@@ -21,6 +21,7 @@ int main(int argc, char **argv)
 {
     char directory[] = "/tmp/gwdegtb-sliced-test-XXXXXX";
     char unsliced_path[256] = "", sliced_path[256] = "";
+    char manifest_path[256] = "";
     EgIndexer indexer = {0};
     Egtb *unsliced = NULL, *sliced = NULL;
     Bitmap verified = {0};
@@ -46,6 +47,8 @@ int main(int argc, char **argv)
     snprintf(unsliced_path, sizeof(unsliced_path), "%s/unsliced.dtm",
              directory);
     snprintf(sliced_path, sizeof(sliced_path), "%s/sliced.dtm", directory);
+    snprintf(manifest_path, sizeof(manifest_path), "%s.work/manifest",
+             sliced_path);
     if (!eg_indexer_init(&indexer, 1, 1, 0, 0) ||
         !egtb_create(&unsliced, unsliced_path,
                      eg_position_count(&indexer) - 1, page_size,
@@ -74,6 +77,37 @@ int main(int argc, char **argv)
     sliced = NULL;
     if (unlink(sliced_path) != 0)
         goto done;
+    {
+        FILE *manifest = fopen(manifest_path, "r+b");
+        long corruption_offset = -1;
+        int original = EOF;
+        char line[256];
+        if (manifest == NULL)
+            goto done;
+        while (fgets(line, sizeof(line), manifest) != NULL)
+            if (strncmp(line, "revision ", 9) == 0) {
+                corruption_offset = ftell(manifest) - (long)strlen(line) + 9;
+                break;
+            }
+        if (corruption_offset < 0 ||
+            fseek(manifest, corruption_offset, SEEK_SET) != 0 ||
+            (original = fgetc(manifest)) == EOF ||
+            fseek(manifest, corruption_offset, SEEK_SET) != 0 ||
+            fputc(original == '9' ? '8' : '9', manifest) == EOF ||
+            fclose(manifest) != 0)
+            goto done;
+        manifest = NULL;
+        if (egtb_generate_sliced(&sliced, sliced_path, &material, &indexer,
+                                 &sliced_options, &sliced_statistics) ||
+            sliced != NULL ||
+            strstr(egtb_sliced_last_error(), "checksum mismatch") == NULL)
+            goto done;
+        manifest = fopen(manifest_path, "r+b");
+        if (manifest == NULL ||
+            fseek(manifest, corruption_offset, SEEK_SET) != 0 ||
+            fputc(original, manifest) == EOF || fclose(manifest) != 0)
+            goto done;
+    }
     memset(&sliced_statistics, 0, sizeof(sliced_statistics));
     if (!egtb_generate_sliced(&sliced, sliced_path, &material, &indexer,
                               &sliced_options, &sliced_statistics) ||

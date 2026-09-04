@@ -1,4 +1,5 @@
 #include "egtb.h"
+#include "dtm_fen.h"
 #include "progress.h"
 #include "endgame_index.h"
 #include "generator.h"
@@ -31,6 +32,38 @@ static double wall_seconds(void)
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         return 0.0;
     return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+
+static void consider_example(EgtbDtmExamples *examples, uint64_t index,
+                             EgtbSide side, int16_t value)
+{
+    EgtbDtmExample *example;
+    if (value == EGTB_DRAW) {
+        if (!examples->draw.available || side < examples->draw_side ||
+            (side == examples->draw_side && index < examples->draw.index)) {
+            examples->draw = (EgtbDtmExample){index, value, true};
+            examples->draw_side = side;
+        }
+        return;
+    }
+    example = value > 0 ? &examples->longest_win[side]
+                        : &examples->longest_loss[side];
+    if (!example->available ||
+        (value > 0 ? value > example->dtm : value < example->dtm) ||
+        (value == example->dtm && index < example->index))
+        *example = (EgtbDtmExample){index, value, true};
+}
+
+static void print_dtm_example(const char *label, const EgIndexer *indexer,
+                              const EgtbDtmExample *example, EgtbSide side)
+{
+    char fen[256];
+    if (example->available &&
+        egtb_format_dtm_fen(indexer, example->index, side, example->dtm,
+                            fen, sizeof(fen)))
+        printf("  %-20s %s\n", label, fen);
+    else
+        printf("  %-20s unavailable\n", label);
 }
 
 typedef struct {
@@ -240,25 +273,6 @@ static bool catalog_probe(const DraughtsPosition *position, EgtbSide side,
     return true;
 }
 
-static void report_correction(uint64_t index, EgtbSide side,
-                              const DraughtsPosition *position,
-                              int16_t old_value, int16_t new_value,
-                              void *context)
-{
-    (void)context;
-    if ((old_value > 0 && new_value > 0 && new_value < old_value) ||
-        (old_value != EGTB_DRAW && old_value <= 0 &&
-         new_value < old_value))
-        printf("self-consistency correction: index=%" PRIu64 " %s "
-               "WM=%013" PRIx64 " BM=%013" PRIx64
-               " WK=%013" PRIx64 " BK=%013" PRIx64
-               " was=%d now=%d\n",
-               index, side == EGTB_WHITE_TO_MOVE ? "WTM" : "BTM",
-               position->white_men, position->black_men,
-               position->white_kings, position->black_kings,
-               old_value, new_value);
-}
-
 static bool parse_count(const char *text, unsigned *count)
 {
     char *end;
@@ -343,6 +357,7 @@ int main(int argc, char **argv)
     EgIndexer indexer;
     Egtb *database = NULL;
     EgtbResident *resident = NULL;
+    EgtbDtmExamples examples = {0};
     uint64_t *histogram = NULL;
     uint64_t positions, resident_limit_bytes, verification_cache_bytes;
     uint64_t compilation_buffer_bytes;
@@ -493,7 +508,7 @@ int main(int argc, char **argv)
             catalog_probe,
             &catalogs[0],
             probe_contexts,
-            report_correction,
+            NULL,
             NULL,
             false,
             (size_t)compilation_buffer_bytes
@@ -518,7 +533,7 @@ int main(int argc, char **argv)
             &verified_positions, (size_t)compilation_buffer_bytes
         };
         if (!egtb_generate_threaded(database, &indexer, catalog_probe,
-                                    &catalogs[0], report_correction, NULL,
+                                    &catalogs[0], NULL, NULL,
                                     &thread_options, &generation)) {
             const char *catalog_error = "";
             for (unsigned worker = 0; worker < thread_count; ++worker) {
@@ -606,8 +621,7 @@ int main(int argc, char **argv)
     catalog_cache_statistics(catalogs, thread_count,
                              &verification_dependencies);
     phase_started = wall_seconds();
-    egtb_progress_begin("statistics", resident != NULL ? 1 : positions,
-                        resident != NULL ? "histograms" : "positions");
+    egtb_progress_begin("statistics", positions, "positions");
     uint64_t statistics_pending = 0;
     if (!egtb_storage_statistics(database, &storage)) {
         fprintf(stderr, "cannot read storage statistics for %s: %s\n",
@@ -619,10 +633,11 @@ int main(int argc, char **argv)
         goto done;
     if (resident != NULL) {
         if (!egtb_resident_dtm_histogram(resident, histogram,
-                                         UINT16_MAX + 1u))
+                                         UINT16_MAX + 1u) ||
+            !egtb_find_dtm_examples(database, resident, &examples))
             goto done;
-        egtb_progress_add(1);
     } else {
+        examples.draw_side = EGTB_BLACK_TO_MOVE;
         for (uint64_t index = 0; index < positions; ++index) {
             for (unsigned side = 0; side < 2; ++side) {
                 int16_t value;
@@ -630,6 +645,7 @@ int main(int argc, char **argv)
                     goto done;
                 ++histogram[(size_t)side * (UINT16_MAX + 1u) +
                             (uint16_t)value];
+                consider_example(&examples, index, (EgtbSide)side, value);
             }
             egtb_progress_tick(&statistics_pending);
         }
@@ -695,6 +711,21 @@ int main(int argc, char **argv)
                 printf("%8d %20" PRIu64 "\n", value, count);
         }
     }
+    printf("DTM example positions:\n");
+    print_dtm_example("WTM longest win", &indexer,
+                      &examples.longest_win[EGTB_WHITE_TO_MOVE],
+                      EGTB_WHITE_TO_MOVE);
+    print_dtm_example("WTM longest loss", &indexer,
+                      &examples.longest_loss[EGTB_WHITE_TO_MOVE],
+                      EGTB_WHITE_TO_MOVE);
+    print_dtm_example("BTM longest win", &indexer,
+                      &examples.longest_win[EGTB_BLACK_TO_MOVE],
+                      EGTB_BLACK_TO_MOVE);
+    print_dtm_example("BTM longest loss", &indexer,
+                      &examples.longest_loss[EGTB_BLACK_TO_MOVE],
+                      EGTB_BLACK_TO_MOVE);
+    print_dtm_example("draw", &indexer, &examples.draw,
+                      examples.draw_side);
     printf("storage: raw=%" PRIu64 " payload=%" PRIu64 " file=%" PRIu64
            " bytes overall=%.2f%% (%.2f:1)\n",
            storage.logical_uncompressed_bytes,

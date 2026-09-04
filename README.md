@@ -67,6 +67,42 @@ make check-stats
 `make libgwdegtb.a` builds the static library used by GWD. Link it with Zstd
 and POSIX threads, for example `-L/path/to/GWDEGTB -lgwdegtb -lzstd -pthread`.
 
+### Verify a completed DTM
+
+`verify_dtm` opens a database strictly read-only and exhaustively checks both
+side-to-move values of every indexed position against all legal successors.
+Opening validates the header and page directory; the complete current DTM is
+then decompressed and CRC32C-checked page by page. Captures, promotions and
+other material-changing moves are resolved through the required lower-material
+DTMs in the same directory. Missing dependencies, truncated files, checksum
+errors and DTM inconsistencies all produce a nonzero exit status.
+
+```sh
+make verify_dtm
+
+./verify_dtm -d /path/to/dtms -j 16 3 1 1 2
+./verify_dtm -d /path/to/dtms -j 16 3 1 0 3
+./verify_dtm -d /path/to/dtms -j 16 2 2 3 0
+./verify_dtm -d /path/to/dtms -j 16 2 2 2 1
+```
+
+The argument order is WK, WM, BK, BM. `-j` defaults to four and can also be
+set through `EGTB_THREADS`. The verifier uses the same memory controls as final
+generation verification:
+
+```sh
+# Decompress the current DTM completely when it needs at most 32 GiB.
+EGTB_RESIDENT_LIMIT_GIB=32 ./verify_dtm -d /path/to/dtms -j 16 3 1 1 2
+
+# Force disk-cache verification, with a 16 GiB total current-DTM cache.
+EGTB_RESIDENT_LIMIT_GIB=0 EGTB_VERIFICATION_CACHE_GIB=16 \
+    ./verify_dtm -d /path/to/dtms -j 16 3 1 1 2
+```
+
+Dependency caches remain private per worker and database. The command never
+repairs, compacts or otherwise writes the DTM. A successful run ends with a
+prominent `VERIFIED ...` line and reports the number of values checked.
+
 The manually maintained `REVISION` file supplies the revision printed at
 startup. It is independent of Git tags and commit identifiers:
 
@@ -370,11 +406,13 @@ special handling.
 
 Temporary state is stored under `<database>.work`. A completed slice is first
 verified under an `.incomplete` name, atomically renamed, and recorded in an
-atomically replaced manifest. Restarting the same command validates every
-completed slice header and page checksum, restores its generation statistics,
-and resumes at the first missing slice. The workspace is deleted only after
-the final full database passes verification. Set `EGTB_KEEP_SLICES=1` to retain
-it deliberately, for example when testing restart behavior.
+atomically replaced CRC32C-protected manifest. Restarting the same command
+validates the manifest checksum and every completed slice header and page
+checksum, restores its generation statistics, and resumes at the first missing
+slice. Legacy version-1 manifests are accepted once and upgraded atomically.
+The workspace is deleted only after the final full database passes
+verification. Set `EGTB_KEEP_SLICES=1` to retain it deliberately, for example
+when testing restart behavior.
 
 ### Eight-piece generation
 
@@ -604,6 +642,33 @@ GWDEGTB revision 2.102 completed
 The `positions-checked` and `positions-skipped` totals count WTM and BTM
 separately, hence twice the number of indexed placements.
 
+## Representative DTM positions
+
+`generate_egtb` prints a deterministic example of the longest WTM win, WTM
+loss, BTM win and BTM loss, plus one draw. Existing databases can be scanned
+without regenerating them:
+
+```sh
+./dtm_examples 1 1 1 1
+./dtm_examples -d /path/to/dtm 3 0 0 3
+```
+
+The four material arguments use the standard white-kings, white-men,
+black-kings, black-men order. Output is PDN FEN followed by the exact DTM in
+braces:
+
+```text
+DTM example positions for 1wX-0wO-1bX-0bO.dtm:
+WTM longest win      W:WK41:BK46 {3}
+WTM longest loss     W:WK5:BK46 {-2}
+BTM longest win      B:WK46:BK41 {3}
+BTM longest loss     B:WK5:BK46 {-2}
+draw                 W:WK49:BK50 {-1}
+```
+
+The reusable C scan is `egtb_find_dtm_examples()`; FEN formatting is provided
+by `egtb_format_dtm_fen()` in `dtm_fen.h`.
+
 ## Packed WDL databases
 
 A WDL entry uses four bits: two bits for WTM followed by two for BTM. In each
@@ -653,6 +718,20 @@ if (!gwdegtb_wdl_attach("1wX-0wO-0bX-1bO", bitmap, bytes)) {
 The optional `.wdl` suffix is accepted. GWD owns the allocation. A mirrored
 basename resolves to its canonical database automatically.
 
+Resident WDL decompression uses four worker threads by default. Compressed
+pages are read independently with `pread()`, decompressed with one Zstd context
+per worker, checksum-verified, and written directly into disjoint ranges of the
+caller-owned bitmap. Applications that want another worker count can call
+`gwdegtb_wdl_decompress_threads()` explicitly:
+
+```c
+if (!gwdegtb_wdl_decompress_threads(egtb_directory,
+                                    "1wX-0wO-0bX-1bO",
+                                    bitmap, bytes, 8)) {
+    fprintf(stderr, "%s\n", gwdegtb_last_error());
+}
+```
+
 `gwdegtb_wdl_decompress()` is also the GWD open-or-generate boundary. If the
 canonical `.wdl` is absent, the process calling this function compiles it from
 the corresponding `.dtm`, atomically installs the compressed WDL file, and
@@ -675,6 +754,186 @@ lookup in the packed resident bitmap. It returns `1` for win, `0` for loss,
 `-1` for draw, and `-32768` if the material has not been loaded or the input is
 invalid. Load all configured WDL databases before starting concurrent lookup;
 do not unload them until those lookups have stopped.
+
+GWD versions that already use GWDEGTB's compact square-0..49 bitboards can
+avoid the padded-board conversion by calling `gwdegtb_wdl_lookup_compact()`:
+
+```c
+int16_t result = gwdegtb_wdl_lookup_compact(
+    white_kings, white_men, black_kings, black_men,
+    GWDEGTB_WHITE_TO_MOVE);
+```
+
+It performs the same validation, material lookup and automatic mirroring as
+the padded entry point.
+
+### Compressed-resident WDL API for GWD
+
+The compressed tier keeps each complete WDL file image in caller-owned
+memory and expands only the pages touched by search. This can reduce WDL RAM
+substantially, at the cost of one small mutable cache per search thread.
+The compressed images, directory entries and indexers are immutable after
+attachment. A GwdegtbWdlProbe is not thread-safe and belongs to exactly one
+thread; its cache budget is shared across all compressed WDLs attached in that
+process.
+
+For an OpenMPI shared allocation, the master obtains the exact compressed-file
+size (and generates the WDL from DTM if it is absent), broadcasts that size,
+and loads the file image. Every rank attaches its rank-local pointer only after
+the shared window has been synchronized:
+
+~~~c
+size_t compressed_bytes = 0;
+uint64_t shared_bytes = 0;
+
+if (is_master &&
+    !gwdegtb_wdl_compressed_info(egtb_directory, database_name,
+                                 &compressed_bytes))
+    abort();
+if (is_master && compressed_bytes == 0) {
+    /* Neither the configured WDL nor its source DTM exists yet: skip it. */
+}
+if (is_master)
+    shared_bytes = compressed_bytes;
+MPI_Bcast(&shared_bytes, 1, MPI_UINT64_T, 0, communicator);
+compressed_bytes = (size_t)shared_bytes;
+
+if (compressed_bytes == 0)
+    continue;
+
+/* Allocate compressed_bytes in the existing MPI shared-window wrapper. */
+if (is_master &&
+    !gwdegtb_wdl_compressed_load(egtb_directory, database_name,
+                                 shared_image, compressed_bytes))
+    abort();
+
+/* Synchronize the shared window here. */
+if (!gwdegtb_wdl_compressed_attach(database_name, shared_image,
+                                   compressed_bytes))
+    abort();
+~~~
+
+Create one probe for the main search thread and one independently in every
+worker thread:
+
+~~~c
+GwdegtbWdlProbe *probe;
+size_t cache_bytes = 16 * 1024 * 1024;
+
+if (!gwdegtb_wdl_probe_create(cache_bytes, &probe))
+    abort();
+
+int16_t result = gwdegtb_wdl_lookup_probe(
+    probe, white_kings, white_men, black_kings, black_men,
+    GWDEGTB_WHITE_TO_MOVE);
+~~~
+
+For compact square-0..49 bitboards, use the otherwise identical
+`gwdegtb_wdl_lookup_probe_compact()` call.
+
+Material selection and mirroring remain automatic. The result convention is
+identical to gwdegtb_wdl_lookup(). Probe statistics expose lookups, hits,
+misses and actual page decompressions. They also report the requested cache
+budget, actual allocated bytes, and power-of-two entry count; the allocated
+size can be noticeably smaller than the requested budget because the
+direct-mapped cache requires a power-of-two number of entries. At shutdown,
+first destroy every
+thread's probe, then call gwdegtb_wdl_compressed_unload_all() on every rank,
+and only then release the shared windows. The unload call destroys GWDEGTB's
+small image handles and indexers; it never frees caller-owned image bytes.
+
+The performance comparison utility runs identical random positions through
+the fully resident and compressed tiers:
+
+~~~sh
+make benchmark_wdl_probe
+./benchmark_wdl_probe /path/to/wdl 1wX-1wO-1bX-1bO 16 1000000
+~~~
+
+The final two arguments are the per-thread cache size in MiB and lookup count.
+On a local 1wX-1wO-1bX-1bO test, a warm 16 MiB direct-mapped probe cache
+reached a 99.78% hit rate and took about 1.22 times the resident lookup time.
+Larger databases and smaller caches can be much more expensive because every
+miss performs Zstd decompression and CRC32C verification; benchmark the actual
+GWD workload before choosing the cache budget.
+
+An experimental codec utility compares the existing page-wise Zstd-3 format
+with a basic Tunstall code over the identical, unmodified 4-bit WDL stream:
+
+~~~sh
+make benchmark_tunstall
+./benchmark_tunstall /path/to/wdl 3wX-0wO-3bX-0bO 16
+./benchmark_tunstall /path/to/wdl 3wX-0wO-3bX-0bO 8
+~~~
+
+The final argument selects fixed 8- or 16-bit codes. The experiment builds one
+global dictionary per EGTB, encodes every 1,024-byte page independently, checks
+sampled round trips, and compares estimated file size, compression time and
+hot-buffer page expansion. It deliberately retains every GWDEGTB position and
+does not reproduce KingsRow's capture-position exclusions, multiple tuned
+catalogs, or direct compressed-run lookup.
+
+The companion three-bit experiment reserves eight codes for the common WDL
+outcome pairs, records the rare loss/loss pair in an exception list, and
+compares fixed and delta-varint exception positions. It Zstd-compresses the
+current four-bit form and both three-bit forms independently for every page,
+then constructs a hypothetical hybrid from the smallest page candidate:
+
+~~~sh
+make benchmark_wdl3
+./benchmark_wdl3 /path/to/wdl 3wX-0wO-3bX-0bO
+~~~
+
+The existing 14-byte directory can carry the selected codec in unused high
+bits of the compressed-length field, so the estimated hybrid does not require
+a larger directory. Sampled pages are expanded and compared byte-for-byte
+before decode throughput is measured.
+
+### Disk-cached DTM API for GWD
+
+Exact DTM probing is intended for the single-threaded root search and PV
+construction. GWD only calls `gwdegtb_dtm_lookup()` on the root process. The
+library derives the canonical filename from the position, lazily opens it on
+its first lookup, retains its dictionary, and assigns it a small cache of
+checksum-verified uncompressed pages. The complete database remains compressed
+on disk.
+
+Query with the DTM directory, a per-database cache budget in bytes, the same
+padded WK/WM/BK/BM bitboards as WDL, and side-to-move:
+
+```c
+size_t cache_bytes = 4 * 1024 * 1024;
+int16_t dtm = gwdegtb_dtm_lookup(egtb_directory, cache_bytes,
+                                 white_kings, white_men,
+                                 black_kings, black_men,
+                                 GWDEGTB_WHITE_TO_MOVE);
+```
+
+When GWD already stores square-0..49 compact bitboards, the corresponding
+call avoids padded-board conversion:
+
+```c
+int16_t dtm = gwdegtb_dtm_lookup_compact(
+    egtb_directory, cache_bytes,
+    white_kings, white_men, black_kings, black_men,
+    GWDEGTB_WHITE_TO_MOVE);
+```
+
+Its lookup, mirroring, caching and result semantics are otherwise identical.
+
+Subsequent probes of the same canonical material reuse its open handle and
+cache. The budget is rounded down to complete expanded pages, with a minimum
+of one page for WTM and one for BTM. A missing canonical file is remembered so
+later probes return unavailable without repeatedly accessing the filesystem;
+`gwdegtb_dtm_close_all()` clears both open handles and remembered misses.
+
+The result is the exact public ply value: `1, 3, 5, ...` for a win; `0, -2,
+-4, ...` for a loss; and `-1` for a draw. `GWDEGTB_DTM_UNAVAILABLE`
+(`INT16_MIN`) means that the required database is not open, the input is
+invalid, or disk lookup failed. A side to move with no pieces is returned as
+lost-in-0 without requiring a database. At orderly shutdown,
+`gwdegtb_dtm_close_all()` closes every DTM handle and releases its indexer,
+dictionary, and page cache.
 
 ## Storage and move-generation benchmarks
 

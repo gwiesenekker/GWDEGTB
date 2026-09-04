@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 #define DRAUGHTS_BOARD_MASK ((UINT64_C(1) << 50) - 1)
+#define DRAUGHTS_MOVES_MAX 256
 
 typedef struct {
     uint64_t white_men;
@@ -57,6 +58,9 @@ bool draughts_generate_moves(const DraughtsPosition *position, EgtbSide side,
 bool draughts_generate_moves_padded(
     const DraughtsPosition *position, EgtbSide side,
     DraughtsMoveVisitor visitor, void *context, size_t *move_count);
+bool draughts_generate_moves_padded_into(
+    const DraughtsPosition *position, EgtbSide side, DraughtsMove *moves,
+    size_t capacity, size_t *move_count);
 bool draughts_padded_backend_uses_bmi2(void);
 
 /* True when at least one capture is available; maximum length is not computed. */

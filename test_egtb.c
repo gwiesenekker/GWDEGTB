@@ -249,6 +249,17 @@ static bool test_direct_cache_views(void)
         egtb_resident_bytes(resident) != positions * sizeof(EgtbEntry))
         goto done;
     {
+        EgtbDtmExamples disk_examples, resident_examples;
+        if (!egtb_find_dtm_examples(direct, NULL, &disk_examples) ||
+            !egtb_find_dtm_examples(direct, resident, &resident_examples) ||
+            memcmp(&disk_examples, &resident_examples,
+                   sizeof(disk_examples)) != 0 ||
+            !resident_examples.longest_win[EGTB_WHITE_TO_MOVE].available ||
+            !resident_examples.longest_loss[EGTB_BLACK_TO_MOVE].available ||
+            !resident_examples.draw.available)
+            goto done;
+    }
+    {
         uint64_t *histogram =
             calloc((size_t)2 * (UINT16_MAX + 1u), sizeof(*histogram));
         uint64_t *expected =

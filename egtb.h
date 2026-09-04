@@ -23,6 +23,19 @@ typedef struct {
     int16_t black_to_move;
 } EgtbEntry;
 
+typedef struct {
+    uint64_t index;
+    int16_t dtm;
+    bool available;
+} EgtbDtmExample;
+
+typedef struct {
+    EgtbDtmExample longest_win[2];
+    EgtbDtmExample longest_loss[2];
+    EgtbDtmExample draw;
+    EgtbSide draw_side;
+} EgtbDtmExamples;
+
 typedef struct Egtb Egtb;
 typedef struct EgtbView EgtbView;
 typedef struct EgtbResident EgtbResident;
@@ -144,6 +157,16 @@ uint64_t egtb_resident_bytes(const EgtbResident *resident);
 bool egtb_resident_dtm_histogram(const EgtbResident *resident,
                                  uint64_t *histogram,
                                  size_t bins_per_side);
+
+/*
+ * Find deterministic representative positions: the greatest positive DTM
+ * and most-negative loss for each side, plus the lowest-index WTM draw (or
+ * BTM draw if no WTM draw exists). If resident is non-NULL it must match
+ * backing and is scanned directly; otherwise a one-page sequential view is
+ * used. Categories which do not occur have available=false.
+ */
+bool egtb_find_dtm_examples(Egtb *backing, const EgtbResident *resident,
+                            EgtbDtmExamples *examples);
 
 uint64_t egtb_maximum_index(const Egtb *egtb);
 uint64_t egtb_page_count(const Egtb *egtb);

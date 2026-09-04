@@ -19,6 +19,11 @@
 /generate_egtb
 /generate_egtb_padded
 /generate_egtb_table
+/dtm_examples
+/verify_dtm
+/benchmark_wdl_probe
+/benchmark_tunstall
+/benchmark_wdl3
 /libgwdegtb.a
 /revision.o
 /*.dtm

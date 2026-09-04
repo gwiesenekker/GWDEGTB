@@ -183,6 +183,23 @@ static bool generate_and_check_backend(
            generated == check->moves && !check->failed;
 }
 
+static bool generate_and_check_padded_into(
+    const DraughtsPosition *position, EgtbSide side, MoveCheck *check)
+{
+    DraughtsMove moves[DRAUGHTS_MOVES_MAX];
+    size_t generated, index;
+    memset(check, 0, sizeof(*check));
+    check->original = *position;
+    check->side = side;
+    if (!draughts_generate_moves_padded_into(
+            position, side, moves, DRAUGHTS_MOVES_MAX, &generated))
+        return false;
+    for (index = 0; index < generated; ++index)
+        if (!check_move(&moves[index], check))
+            return false;
+    return generated == check->moves && !check->failed;
+}
+
 static bool same_move_result(const MoveCheck *a, const MoveCheck *b)
 {
     return a->moves == b->moves &&
@@ -196,12 +213,14 @@ static bool same_move_result(const MoveCheck *a, const MoveCheck *b)
 static bool generate_and_check(const DraughtsPosition *position, EgtbSide side,
                                MoveCheck *check)
 {
-    MoveCheck padded;
+    MoveCheck padded, direct;
     return generate_and_check_backend(position, side, check,
                                       draughts_generate_moves) &&
            generate_and_check_backend(position, side, &padded,
                                       draughts_generate_moves_padded) &&
-           same_move_result(check, &padded);
+           generate_and_check_padded_into(position, side, &direct) &&
+           same_move_result(check, &padded) &&
+           same_move_result(check, &direct);
 }
 
 static bool generate_predecessors_backend(

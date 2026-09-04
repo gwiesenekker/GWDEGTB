@@ -14,7 +14,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-enum { SLICE_ROWS = 10, SLICE_MANIFEST_VERSION = 1 };
+enum {
+    SLICE_ROWS = 10,
+    SLICE_MANIFEST_LEGACY_VERSION = 1,
+    SLICE_MANIFEST_VERSION = 2,
+    SLICE_MANIFEST_MAX_SIZE = 1024 * 1024
+};
 
 typedef struct {
     Egtb *database;
@@ -71,6 +76,64 @@ static bool same_material(const EgtbMaterial *a, const EgtbMaterial *b)
            a->white_men == b->white_men &&
            a->black_kings == b->black_kings &&
            a->black_men == b->black_men;
+}
+
+static uint32_t manifest_crc32c(const void *data, size_t size)
+{
+    uint32_t table[256];
+    const unsigned char *bytes = data;
+    uint32_t crc = UINT32_MAX;
+
+    for (unsigned entry = 0; entry < 256; ++entry) {
+        uint32_t value = entry;
+        for (unsigned bit = 0; bit < 8; ++bit)
+            value = (value >> 1) ^
+                    (UINT32_C(0x82f63b78) &
+                     (UINT32_C(0) - (value & 1)));
+        table[entry] = value;
+    }
+    for (size_t i = 0; i < size; ++i)
+        crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >> 8);
+    return ~crc;
+}
+
+static bool verify_manifest_checksum(const char *path)
+{
+    FILE *file = NULL;
+    unsigned char *contents = NULL;
+    long length;
+    size_t size, checksum_line;
+    uint32_t stored, calculated;
+    int consumed = 0;
+    bool ok = false;
+
+    file = fopen(path, "rb");
+    if (file == NULL || fseek(file, 0, SEEK_END) != 0 ||
+        (length = ftell(file)) < 0 || fseek(file, 0, SEEK_SET) != 0)
+        goto done;
+    size = (size_t)length;
+    if (size == 0 || size > SLICE_MANIFEST_MAX_SIZE)
+        goto done;
+    contents = malloc(size + 1);
+    if (contents == NULL || fread(contents, 1, size, file) != size ||
+        contents[size - 1] != '\n')
+        goto done;
+    contents[size] = '\0';
+    checksum_line = size - 1;
+    while (checksum_line > 0 && contents[checksum_line - 1] != '\n')
+        --checksum_line;
+    if (sscanf((const char *)contents + checksum_line,
+               "checksum crc32c %" SCNx32 "%n", &stored, &consumed) != 1 ||
+        consumed != 24 || checksum_line + (size_t)consumed + 1 != size ||
+        contents[checksum_line + (size_t)consumed] != '\n')
+        goto done;
+    calculated = manifest_crc32c(contents, checksum_line);
+    ok = calculated == stored;
+done:
+    free(contents);
+    if (file != NULL)
+        fclose(file);
+    return ok;
 }
 
 static bool make_work_directory(char *buffer, size_t size, const char *path)
@@ -247,12 +310,18 @@ static bool validate_manifest(const char *directory,
         return errno == ENOENT;
     if (fscanf(file, "%63s %u\n", magic, &version) != 2 ||
         strcmp(magic, "GWDEGTB-SLICES") != 0 ||
-        version != SLICE_MANIFEST_VERSION ||
+        (version != SLICE_MANIFEST_LEGACY_VERSION &&
+         version != SLICE_MANIFEST_VERSION) ||
         fscanf(file, "material %u %u %u %u\n", &wk, &wm, &bk, &bm) != 4 ||
         fscanf(file, "positions %" SCNu64 "\n", &stored_positions) != 1 ||
         fscanf(file, "page-size %u\n", &stored_page) != 1) {
         fclose(file);
         return sliced_fail("invalid slice manifest %s", path);
+    }
+    if (version == SLICE_MANIFEST_VERSION &&
+        !verify_manifest_checksum(path)) {
+        fclose(file);
+        return sliced_fail("slice manifest checksum mismatch: %s", path);
     }
     if (wk != material->white_kings || wm != material->white_men ||
         bk != material->black_kings || bm != material->black_men ||
@@ -265,6 +334,8 @@ static bool validate_manifest(const char *directory,
         while (fgets(line, sizeof(line), file) != NULL) {
             int white, black;
             EgtbGenerationStatistics part = {0};
+            if (strncmp(line, "checksum ", 9) == 0)
+                break;
             if (sscanf(line,
                        "complete %d %d %" SCNu64 " %hu %" SCNu64
                        " %" SCNu64 " %" SCNu64
@@ -296,22 +367,27 @@ static bool write_manifest(const char *directory,
                                slice_statistics[SLICE_ROWS][SLICE_ROWS])
 {
     char path[512], temporary[512];
-    FILE *file;
+    char *contents = NULL;
+    size_t contents_size = 0;
+    FILE *memory = NULL, *file = NULL;
+    uint32_t checksum;
+    bool ok = false;
     snprintf(path, sizeof(path), "%s/manifest", directory);
     snprintf(temporary, sizeof(temporary), "%s/manifest.incomplete", directory);
-    file = fopen(temporary, "w");
-    if (file == NULL)
-        return sliced_fail("cannot write slice manifest: %s", strerror(errno));
-    fprintf(file, "GWDEGTB-SLICES %u\n", SLICE_MANIFEST_VERSION);
-    fprintf(file, "material %u %u %u %u\n", material->white_kings,
+    memory = open_memstream(&contents, &contents_size);
+    if (memory == NULL)
+        return sliced_fail("cannot assemble slice manifest: %s",
+                           strerror(errno));
+    fprintf(memory, "GWDEGTB-SLICES %u\n", SLICE_MANIFEST_VERSION);
+    fprintf(memory, "material %u %u %u %u\n", material->white_kings,
             material->white_men, material->black_kings, material->black_men);
-    fprintf(file, "positions %" PRIu64 "\n", full_positions);
-    fprintf(file, "page-size %u\n", page_size);
-    fprintf(file, "revision %s\n", gwdegtb_revision);
+    fprintf(memory, "positions %" PRIu64 "\n", full_positions);
+    fprintf(memory, "page-size %u\n", page_size);
+    fprintf(memory, "revision %s\n", gwdegtb_revision);
     for (int white = 0; white < SLICE_ROWS; ++white)
         for (int black = 0; black < SLICE_ROWS; ++black)
             if (completed[white][black])
-                fprintf(file,
+                fprintf(memory,
                         "complete %d %d %" PRIu64 " %u %" PRIu64
                         " %" PRIu64 " %" PRIu64
                         " %.17g %.17g %.17g %.17g %.17g %.17g\n",
@@ -327,10 +403,43 @@ static bool write_manifest(const char *directory,
                         slice_statistics[white][black].consistency_seconds,
                         slice_statistics[white][black].final_scan_seconds,
                         slice_statistics[white][black].total_seconds);
-    if (fflush(file) != 0 || fsync(fileno(file)) != 0 || fclose(file) != 0 ||
-        rename(temporary, path) != 0)
-        return sliced_fail("cannot commit slice manifest: %s", strerror(errno));
-    return true;
+    if (fclose(memory) != 0) {
+        memory = NULL;
+        sliced_fail("cannot assemble slice manifest: %s", strerror(errno));
+        goto done;
+    }
+    memory = NULL;
+    checksum = manifest_crc32c(contents, contents_size);
+    file = fopen(temporary, "wb");
+    if (file == NULL) {
+        sliced_fail("cannot commit slice manifest: %s", strerror(errno));
+        goto done;
+    }
+    bool write_ok =
+        fwrite(contents, 1, contents_size, file) == contents_size &&
+        fprintf(file, "checksum crc32c %08" PRIx32 "\n", checksum) >= 0 &&
+        fflush(file) == 0 && fsync(fileno(file)) == 0;
+    if (fclose(file) != 0)
+        write_ok = false;
+    file = NULL;
+    if (!write_ok) {
+        sliced_fail("cannot commit slice manifest: %s", strerror(errno));
+        goto done;
+    }
+    if (rename(temporary, path) != 0) {
+        sliced_fail("cannot commit slice manifest: %s", strerror(errno));
+        goto done;
+    }
+    ok = true;
+done:
+    if (memory != NULL)
+        fclose(memory);
+    if (file != NULL)
+        fclose(file);
+    free(contents);
+    if (!ok)
+        unlink(temporary);
+    return ok;
 }
 
 static bool completed_slice_valid(const char *directory,

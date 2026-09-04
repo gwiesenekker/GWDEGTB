@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,8 +44,17 @@ struct Wdl {
     size_t compressed_capacity;
 };
 
+struct WdlImage {
+    const unsigned char *data;
+    size_t size;
+    uint64_t maximum_index;
+    uint64_t page_count;
+    uint64_t packed_bytes;
+    uint64_t data_offset;
+};
+
 static const unsigned char wdl_magic[8] = {'I','P','D','W','D','L','\0','\0'};
-static char last_error[256];
+static _Thread_local char last_error[256];
 
 static bool fail(const char *format, ...)
 {
@@ -687,23 +697,326 @@ bool wdl_get(Wdl *wdl, uint64_t index, EgtbSide side, WdlResult *result)
 
 bool wdl_decompress_into(Wdl *wdl, void *data, size_t size)
 {
-    unsigned char *bitmap = data;
-    WdlCacheEntry entry;
-    uint64_t page;
+    return wdl_decompress_into_threaded(wdl, data, size, 1);
+}
 
-    if (wdl == NULL || data == NULL || wdl->packed_bytes > SIZE_MAX ||
-        size != (size_t)wdl->packed_bytes)
-        return fail("invalid resident WDL destination");
-    for (page = 0; page < wdl->page_count; ++page) {
-        uint64_t offset = page * WDL_PAGE_SIZE;
-        size_t bytes = WDL_PAGE_SIZE;
-        if (bytes > wdl->packed_bytes - offset)
-            bytes = (size_t)(wdl->packed_bytes - offset);
-        if (!load_page(wdl, page, &entry)) {
+typedef struct {
+    const Wdl *wdl;
+    unsigned char *bitmap;
+    uint64_t first_page;
+    uint64_t end_page;
+    bool failed;
+    char error[256];
+} WdlDecompressWorker;
+
+static bool pread_worker(int descriptor, uint64_t offset, void *data,
+                         size_t size, char *error, size_t error_size)
+{
+    unsigned char *destination = data;
+    while (size != 0) {
+        ssize_t got = pread(descriptor, destination, size, (off_t)offset);
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0) {
+            snprintf(error, error_size, "WDL file read failed or was truncated: %s",
+                     got < 0 ? strerror(errno) : "unexpected end of file");
             return false;
         }
-        memcpy(bitmap + offset, entry.data, bytes);
+        destination += (size_t)got;
+        offset += (uint64_t)got;
+        size -= (size_t)got;
     }
+    return true;
+}
+
+static void *decompress_wdl_pages(void *opaque)
+{
+    WdlDecompressWorker *worker = opaque;
+    const Wdl *wdl = worker->wdl;
+    ZSTD_DCtx *decompressor = ZSTD_createDCtx();
+    unsigned char *compressed = malloc(ZSTD_compressBound(WDL_PAGE_SIZE));
+    unsigned char decoded[WDL_PAGE_SIZE];
+    int descriptor = fileno(wdl->file);
+    if (decompressor == NULL || compressed == NULL) {
+        snprintf(worker->error, sizeof(worker->error),
+                 "cannot allocate WDL decompression workspace");
+        worker->failed = true;
+        goto done;
+    }
+    for (uint64_t page = worker->first_page; page < worker->end_page; ++page) {
+        uint64_t output_offset = page * WDL_PAGE_SIZE;
+        size_t output_bytes = WDL_PAGE_SIZE;
+        if (output_bytes > wdl->packed_bytes - output_offset)
+            output_bytes = (size_t)(wdl->packed_bytes - output_offset);
+        if (wdl->offsets[page] == 0) {
+            memset(worker->bitmap + output_offset, 0, output_bytes);
+            continue;
+        }
+        uint16_t length = wdl->lengths[page];
+        size_t decompressed;
+        if (!pread_worker(descriptor, wdl->offsets[page], compressed, length,
+                          worker->error, sizeof(worker->error))) {
+            worker->failed = true;
+            break;
+        }
+        decompressed = ZSTD_decompressDCtx(decompressor, decoded,
+                                            sizeof(decoded), compressed,
+                                            length);
+        if (ZSTD_isError(decompressed)) {
+            snprintf(worker->error, sizeof(worker->error),
+                     "WDL Zstd decompression failed for page %" PRIu64 ": %s",
+                     page, ZSTD_getErrorName(decompressed));
+            worker->failed = true;
+            break;
+        }
+        if (decompressed != sizeof(decoded)) {
+            snprintf(worker->error, sizeof(worker->error),
+                     "decompressed WDL page %" PRIu64 " has an invalid size",
+                     page);
+            worker->failed = true;
+            break;
+        }
+        if (crc32c(decoded, sizeof(decoded)) != wdl->checksums[page]) {
+            snprintf(worker->error, sizeof(worker->error),
+                     "CRC32C mismatch for WDL page %" PRIu64, page);
+            worker->failed = true;
+            break;
+        }
+        memcpy(worker->bitmap + output_offset, decoded, output_bytes);
+    }
+done:
+    free(compressed);
+    ZSTD_freeDCtx(decompressor);
+    return NULL;
+}
+
+bool wdl_decompress_into_threaded(Wdl *wdl, void *data, size_t size,
+                                  unsigned thread_count)
+{
+    WdlDecompressWorker *workers = NULL;
+    pthread_t *threads = NULL;
+    unsigned created = 0;
+    bool ok = false;
+
+    if (wdl == NULL || data == NULL || wdl->packed_bytes > SIZE_MAX ||
+        size != (size_t)wdl->packed_bytes || thread_count == 0 ||
+        thread_count > WDL_MAX_DECOMPRESSION_THREADS)
+        return fail("invalid resident WDL destination");
+    if (thread_count > wdl->page_count)
+        thread_count = (unsigned)wdl->page_count;
+    if (thread_count == 0)
+        thread_count = 1;
+    workers = calloc(thread_count, sizeof(*workers));
+    threads = calloc(thread_count, sizeof(*threads));
+    if (workers == NULL || threads == NULL) {
+        fail("cannot allocate WDL decompression workers");
+        goto done;
+    }
+    for (unsigned worker = 0; worker < thread_count; ++worker) {
+        uint64_t pages_per_worker = wdl->page_count / thread_count;
+        uint64_t extra = wdl->page_count % thread_count;
+        workers[worker].wdl = wdl;
+        workers[worker].bitmap = data;
+        workers[worker].first_page = worker * pages_per_worker +
+                                     (worker < extra ? worker : extra);
+        workers[worker].end_page = workers[worker].first_page +
+                                   pages_per_worker + (worker < extra);
+        int error = pthread_create(&threads[worker], NULL,
+                                   decompress_wdl_pages, &workers[worker]);
+        if (error != 0) {
+            fail("cannot create WDL decompression worker %u: %s",
+                 worker, strerror(error));
+            goto join;
+        }
+        ++created;
+    }
+join:
+    for (unsigned worker = 0; worker < created; ++worker) {
+        int error = pthread_join(threads[worker], NULL);
+        if (error != 0) {
+            fail("cannot join WDL decompression worker %u: %s",
+                 worker, strerror(error));
+            goto done;
+        }
+    }
+    if (created != thread_count)
+        goto done;
+    for (unsigned worker = 0; worker < thread_count; ++worker)
+        if (workers[worker].failed) {
+            fail("WDL decompression worker %u failed: %s", worker,
+                 workers[worker].error);
+            goto done;
+        }
+    ok = true;
+done:
+    free(threads);
+    free(workers);
+    return ok;
+}
+
+bool wdl_file_size(const char *path, size_t *size)
+{
+    struct stat status;
+    if (path == NULL || size == NULL)
+        return fail("invalid WDL file-size argument");
+    if (stat(path, &status) != 0)
+        return fail("cannot stat %s: %s", path, strerror(errno));
+    if (status.st_size < 0 || (uint64_t)status.st_size > SIZE_MAX)
+        return fail("WDL file does not fit in address space");
+    *size = (size_t)status.st_size;
+    return true;
+}
+
+bool wdl_file_load_into(const char *path, void *data, size_t size)
+{
+    size_t expected;
+    int descriptor;
+    unsigned char *destination = data;
+    size_t remaining = size;
+    off_t offset = 0;
+    if (data == NULL)
+        return fail("invalid compressed WDL destination");
+    if (!wdl_file_size(path, &expected))
+        return false;
+    if (size != expected)
+        return fail("invalid compressed WDL destination size");
+    descriptor = open(path, O_RDONLY);
+    if (descriptor < 0)
+        return fail("cannot open %s: %s", path, strerror(errno));
+    while (remaining != 0) {
+        ssize_t got = pread(descriptor, destination, remaining, offset);
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0) {
+            close(descriptor);
+            return fail("cannot read %s: %s", path,
+                        got < 0 ? strerror(errno) : "unexpected end of file");
+        }
+        destination += (size_t)got;
+        remaining -= (size_t)got;
+        offset += got;
+    }
+    if (close(descriptor) != 0)
+        return fail("cannot close %s: %s", path, strerror(errno));
+    return true;
+}
+
+bool wdl_image_attach(WdlImage **out, const void *data, size_t size)
+{
+    const unsigned char *bytes = data;
+    WdlImage *image = NULL;
+    uint64_t calculated_pages, directory_offset;
+    if (out == NULL || data == NULL || size < WDL_HEADER_SIZE)
+        return fail("invalid compressed WDL image");
+    *out = NULL;
+    if (memcmp(bytes, wdl_magic, sizeof(wdl_magic)) != 0 ||
+        bytes[8] != WDL_FORMAT_VERSION ||
+        get_u16(bytes + 10) != WDL_HEADER_SIZE ||
+        get_u32(bytes + 12) != WDL_PAGE_SIZE)
+        return fail("unsupported compressed WDL image");
+    image = calloc(1, sizeof(*image));
+    if (image == NULL)
+        return fail("cannot allocate compressed WDL image handle");
+    image->data = bytes;
+    image->size = size;
+    image->maximum_index = get_u64(bytes + 16);
+    image->page_count = get_u64(bytes + 24);
+    directory_offset = get_u64(bytes + 32);
+    image->data_offset = get_u64(bytes + 40);
+    image->packed_bytes = get_u64(bytes + 48);
+    if (image->maximum_index == UINT64_MAX) {
+        fail("invalid compressed WDL maximum index");
+        goto failure;
+    }
+    calculated_pages = image->packed_bytes / WDL_PAGE_SIZE +
+                       (image->packed_bytes % WDL_PAGE_SIZE != 0);
+    if (image->packed_bytes != (image->maximum_index + 1) / 2 +
+                                   ((image->maximum_index + 1) % 2 != 0) ||
+        calculated_pages != image->page_count ||
+        directory_offset != WDL_HEADER_SIZE ||
+        image->page_count > (UINT64_MAX - WDL_HEADER_SIZE) /
+                                WDL_DIRECTORY_ENTRY_SIZE ||
+        image->data_offset != WDL_HEADER_SIZE +
+                                  image->page_count * WDL_DIRECTORY_ENTRY_SIZE ||
+        image->data_offset > size) {
+        fail("inconsistent compressed WDL header");
+        goto failure;
+    }
+    for (uint64_t page = 0; page < image->page_count; ++page) {
+        const unsigned char *entry =
+            bytes + WDL_HEADER_SIZE + page * WDL_DIRECTORY_ENTRY_SIZE;
+        uint64_t offset = get_u64(entry);
+        uint16_t length = get_u16(entry + 8);
+        uint32_t checksum = get_u32(entry + 10);
+        if (offset == 0) {
+            if (length != 0 || checksum != 0) {
+                fail("invalid implicit compressed WDL page %" PRIu64, page);
+                goto failure;
+            }
+        } else if (offset < image->data_offset || length == 0 ||
+                   offset > size || length > size - offset) {
+            fail("invalid compressed WDL page %" PRIu64, page);
+            goto failure;
+        }
+    }
+    if (crc32c("123456789", 9) != UINT32_C(0xe3069283)) {
+        fail("internal WDL CRC32C self-test failed");
+        goto failure;
+    }
+    *out = image;
+    return true;
+failure:
+    free(image);
+    return false;
+}
+
+void wdl_image_destroy(WdlImage *image)
+{
+    free(image);
+}
+
+uint64_t wdl_image_maximum_index(const WdlImage *image)
+{
+    return image == NULL ? 0 : image->maximum_index;
+}
+
+uint64_t wdl_image_page_count(const WdlImage *image)
+{
+    return image == NULL ? 0 : image->page_count;
+}
+
+bool wdl_image_page(const WdlImage *image, uint64_t page,
+                    const void **compressed, size_t *compressed_size,
+                    uint32_t *checksum)
+{
+    const unsigned char *entry;
+    uint64_t offset;
+    if (image == NULL || compressed == NULL || compressed_size == NULL ||
+        checksum == NULL || page >= image->page_count)
+        return fail("invalid compressed WDL page lookup");
+    entry = image->data + WDL_HEADER_SIZE +
+            page * WDL_DIRECTORY_ENTRY_SIZE;
+    offset = get_u64(entry);
+    *compressed_size = get_u16(entry + 8);
+    *checksum = get_u32(entry + 10);
+    *compressed = offset == 0 ? NULL : image->data + offset;
+    return true;
+}
+
+bool wdl_image_validate_page(const WdlImage *image, uint64_t page,
+                             const void *uncompressed, size_t size)
+{
+    const unsigned char *entry;
+    if (image == NULL || uncompressed == NULL ||
+        page >= image->page_count || size != WDL_PAGE_SIZE)
+        return fail("invalid uncompressed WDL page");
+    entry = image->data + WDL_HEADER_SIZE +
+            page * WDL_DIRECTORY_ENTRY_SIZE;
+    if (get_u64(entry) == 0)
+        return true;
+    if (crc32c(uncompressed, size) != get_u32(entry + 10))
+        return fail("CRC32C mismatch for compressed WDL page %" PRIu64,
+                    page);
     return true;
 }
 
