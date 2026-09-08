@@ -44,6 +44,19 @@ int main(int argc, char **argv)
            material[2], material[3]);
     printf("legal positions: %" PRIu64 "\n", eg_position_count(&indexer));
     printf("maximum index:  %" PRIu64 "\n", eg_max_index(&indexer));
+#ifndef NDEBUG
+    {
+        EgPosition position;
+        if (eg_index_to_position(NULL, 0, &position) ||
+            eg_index_to_position(&indexer, 0, NULL) ||
+            eg_index_to_position(&indexer, eg_position_count(&indexer),
+                                  &position)) {
+            fprintf(stderr, "inverse argument validation FAILED\n");
+            eg_indexer_destroy(&indexer);
+            return EXIT_FAILURE;
+        }
+    }
+#endif
     eg_indexer_destroy(&indexer);
 
     if (!eg_test_material(material[0], material[1], material[2], material[3],

@@ -15,6 +15,12 @@ all: benchmark_wdl_probe
 all: benchmark_tunstall
 all: benchmark_wdl3
 all: test_dtm16 test_progress test_8piece
+all: test_storage_safety
+
+test_storage_safety: test_storage_safety.o libgwdegtb.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test: test_storage_safety
 
 test_8piece: test_8piece.o generator_padded.o frontier.o bitmap.o movegen.o libgwdegtb.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -69,6 +75,11 @@ check_stats: check_stats.o endgame_index.o
 test_egtb: test_egtb.o egtb.o progress.o wdl.o endgame_index.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+test_crc32c: test_crc32c.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+test: test_crc32c
+
 test_dtm16: test_dtm16.o egtb.o progress.o wdl.o endgame_index.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -113,9 +124,12 @@ benchmark_wdl3: benchmark_wdl3.o libgwdegtb.a
 	$(CC) $(BENCH_CFLAGS) -o $@ $^ $(LDLIBS)
 
 test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_dtm16 test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap
+	./test_crc32c
 	./test_progress
 	./test_8piece
 	./test_index
+	./test_index 0 0 0 0
+	./test_index 1 1 1 1
 	./test_slice_index
 	./test_sliced
 	./test_sliced 2048
@@ -124,6 +138,7 @@ test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb
 	./test_combinatorial_index
 	./test_egtb
 	./test_dtm16
+	./test_storage_safety
 	./test_gwdegtb
 	./test_movegen
 	./test_generator
@@ -158,6 +173,8 @@ benchmark-wdl3: benchmark_wdl3
 test: test_progress test_8piece
 
 clean:
+	$(RM) test_storage_safety test_storage_safety.o
+	$(RM) test_crc32c test_crc32c.o
 	$(RM) test_8piece test_8piece.o
 	$(RM) test_progress test_progress.o
 	$(RM) test_dtm16 test_dtm16.o

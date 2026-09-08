@@ -615,8 +615,8 @@ static bool generate_one_slice(const char *directory,
         goto done;
     }
     database = NULL;
-    if (!egtb_compact(incomplete_path, options->compression_level,
-                      options->slice_read_cache_pages) ||
+    if (!egtb_compact_copy(incomplete_path,
+                           options->slice_read_cache_pages) ||
         !egtb_open_readonly(&database, incomplete_path, 1)) {
         sliced_fail("cannot compact generated slice: %s", egtb_last_error());
         goto done;

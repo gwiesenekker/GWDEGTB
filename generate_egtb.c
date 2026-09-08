@@ -568,7 +568,7 @@ int main(int argc, char **argv)
     egtb_progress_end(true);
     finalize_seconds = wall_seconds() - phase_started;
     phase_started = wall_seconds();
-    if (!egtb_compact(path, 9, readonly_cache_pages) ||
+    if (!egtb_compact_copy(path, readonly_cache_pages) ||
         !egtb_open_readonly(&database, path, readonly_cache_pages)) {
         fprintf(stderr, "cannot compact/reopen %s: %s\n", path,
                 egtb_last_error());

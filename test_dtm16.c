@@ -105,7 +105,7 @@ static bool legacy(const char *path, unsigned version)
         bytes[version == 2 ? i * 2 : i] = (unsigned char)(i % 256);
     if (!fixture(path, version, bytes, sizeof(bytes), crc(bytes, sizeof(bytes))))
         return false;
-    for (unsigned pass = 0; pass < 2; ++pass) {
+    for (unsigned pass = 0; pass < 3; ++pass) {
         EgtbSequentialReader reader;
         if (!egtb_open_readonly(&db, path, 2) ||
             !egtb_resident_load(&resident, db, 2) ||
@@ -129,7 +129,8 @@ static bool legacy(const char *path, unsigned version)
         view = NULL;
         if (!egtb_close(db)) { db = NULL; goto done; }
         db = NULL;
-        if (!egtb_compact(path, 1, 2)) goto done;
+        if (!(pass == 0 ? egtb_compact_copy(path, 2)
+                        : egtb_compact(path, 1, 2))) goto done;
     }
     /* Legacy writes must reject wide values without dirtying the cache. */
     if (!egtb_open_readwrite(&db, path, 2) ||
@@ -147,6 +148,42 @@ done:
 static int16_t code_at(uint64_t i)
 {
     return i == 0 ? EGTB_STORED_DRAW : (int16_t)((int)i - 16384);
+}
+
+/* Dense and colliding planar views, including nonzero range origins and
+ * non-power-of-two/odd requested capacities. Both planes must stay distinct. */
+static bool check_view_addressing(Egtb *db)
+{
+    static const size_t capacities[] = {1, 2, 4, 6, 7, 8, 12, 128};
+    for (size_t c = 0; c < sizeof(capacities) / sizeof(capacities[0]); ++c) {
+        EgtbView *view = NULL;
+        EgtbSequentialReader reader;
+        bool ok = true;
+        if (!egtb_view_create_range(&view, db, capacities[c], false, 7, 13))
+            return false;
+        /* A permutation interleaves pages, exercising collisions and hits. */
+        for (uint64_t n = 0; ok && n < 3072; ++n) {
+            uint64_t i = 7 * 512 + (n * 2053) % 3072;
+            int16_t w, b, pair_w, pair_b;
+            ok = egtb_view_get(view, i, EGTB_WHITE_TO_MOVE, &w) &&
+                 egtb_view_get(view, i, EGTB_BLACK_TO_MOVE, &b) &&
+                 egtb_view_get_pair(view, i, &pair_w, &pair_b) &&
+                 w == egtb_decode_dtm(code_at(i)) &&
+                 b == egtb_decode_dtm(code_at(32767 - i)) &&
+                 pair_w == w && pair_b == b;
+        }
+        ok = ok && egtb_sequential_reader_init(&reader, view, 7 * 512 + 3,
+                                               13 * 512 - 5);
+        for (uint64_t i = 7 * 512 + 3; ok && i < 13 * 512 - 5; ++i) {
+            int16_t w, b;
+            ok = egtb_sequential_reader_next(&reader, &w, &b) &&
+                 w == egtb_decode_dtm(code_at(i)) &&
+                 b == egtb_decode_dtm(code_at(32767 - i));
+        }
+        if (!egtb_view_close(view) || !ok)
+            return false;
+    }
+    return true;
 }
 
 static bool wide(const char *path, const char *wdl_path)
@@ -189,6 +226,7 @@ static bool wide(const char *path, const char *wdl_path)
     for (unsigned pass = 0; pass < 2; ++pass) {
         EgtbSequentialReader reader;
         if (!egtb_open_readonly(&db, path, 2) ||
+            !check_view_addressing(db) ||
             !egtb_resident_load(&resident, db, 3) ||
             egtb_resident_bytes(resident) != 32768 * sizeof(EgtbEntry) ||
             !egtb_resident_dtm_histogram(resident, histogram, 65536) ||
@@ -211,7 +249,7 @@ static bool wide(const char *path, const char *wdl_path)
         view = NULL;
         if (!egtb_close(db)) { db = NULL; goto done; }
         db = NULL;
-        if (!egtb_compact(path, 3, 2)) goto done;
+        if (!egtb_compact_copy(path, 2) || !egtb_compact(path, 3, 2)) goto done;
     }
     if (!wdl_compile(path, wdl_path, 1, 2, NULL, NULL) ||
         !wdl_open(&wdl, wdl_path, 2, 1, 2)) goto done;

@@ -648,6 +648,7 @@ static bool load_page(Wdl *wdl, uint64_t page, WdlCacheEntry *entry)
 {
     size_t decompressed;
     uint32_t checksum;
+    entry->page_number = UINT64_MAX;
     if (wdl->offsets[page] == 0) {
         memset(entry->data, 0, sizeof(entry->data));
     } else {

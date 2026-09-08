@@ -346,6 +346,101 @@ bool eg_position_to_index(const EgIndexer *e, const EgPosition *position,
     return true;
 }
 
+/* The unsliced tables have no frontier requirements (requirement_states=1,
+ * piece_stride[3]=1). Keep their hot loop free of slice tests and remainder
+ * arithmetic while preserving the same empty/WM/BM/WK/BK ordering. */
+static bool inverse_unsliced(const EgIndexer *e, uint64_t index,
+                             EgPosition *position)
+{
+    unsigned rem[4];
+    uint64_t state;
+    uint64_t bit = 1;
+    uint64_t white_men = 0, black_men = 0;
+    uint64_t white_kings = 0, black_kings = 0;
+    unsigned pieces_left;
+    unsigned square;
+
+    rem[0] = e->white_men;
+    rem[1] = e->black_men;
+    rem[2] = e->white_kings;
+    rem[3] = e->black_kings;
+    pieces_left = rem[0] + rem[1] + rem[2] + rem[3];
+    state = e->square_stride +
+            (uint64_t)rem[0] * e->piece_stride[0] +
+            (uint64_t)rem[1] * e->piece_stride[1] +
+            (uint64_t)rem[2] * e->piece_stride[2] + rem[3];
+
+    for (square = 0; square < 50; ++square, bit <<= 1) {
+        uint64_t block = e->ways[state];
+        enum Piece piece = EMPTY;
+
+        if (index < block)
+            goto selected;
+        index -= block;
+        if (square >= 5 && rem[0] != 0) {
+            block = e->ways[state - e->piece_stride[0]];
+            if (index < block) {
+                piece = WHITE_MAN;
+                goto selected;
+            }
+            index -= block;
+        }
+        if (square <= 44 && rem[1] != 0) {
+            block = e->ways[state - e->piece_stride[1]];
+            if (index < block) {
+                piece = BLACK_MAN;
+                goto selected;
+            }
+            index -= block;
+        }
+        if (rem[2] != 0) {
+            block = e->ways[state - e->piece_stride[2]];
+            if (index < block) {
+                piece = WHITE_KING;
+                goto selected;
+            }
+            index -= block;
+        }
+        if (rem[3] != 0) {
+            block = e->ways[state - e->piece_stride[3]];
+            if (index < block) {
+                piece = BLACK_KING;
+                goto selected;
+            }
+            index -= block;
+        }
+
+        return false; /* Unreachable for an in-range index. */
+
+selected:
+        state += e->square_stride;
+        if (piece != EMPTY) {
+            unsigned piece_index = (unsigned)piece - 1;
+            --rem[piece_index];
+            state -= e->piece_stride[piece_index];
+            switch (piece) {
+            case WHITE_MAN:  white_men |= bit; break;
+            case BLACK_MAN:  black_men |= bit; break;
+            case WHITE_KING: white_kings |= bit; break;
+            case BLACK_KING: black_kings |= bit; break;
+            default: break;
+            }
+            if (--pieces_left == 0)
+                break;
+        }
+    }
+    position->white_men = white_men;
+    position->black_men = black_men;
+    position->white_kings = white_kings;
+    position->black_kings = black_kings;
+#ifndef NDEBUG
+    return index == 0 && rem[0] == 0 && rem[1] == 0 &&
+           rem[2] == 0 && rem[3] == 0;
+#else
+    return true;
+#endif
+}
+
 bool eg_index_to_position(const EgIndexer *e, uint64_t index,
                           EgPosition *position)
 {
@@ -362,6 +457,8 @@ bool eg_index_to_position(const EgIndexer *e, uint64_t index,
         index >= e->position_count)
         return false;
 #endif
+    if (!e->sliced)
+        return inverse_unsliced(e, index, position);
     rem[0] = e->white_men;
     rem[1] = e->black_men;
     rem[2] = e->white_kings;

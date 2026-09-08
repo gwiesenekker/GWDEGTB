@@ -187,4 +187,8 @@ bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics);
 bool egtb_compact(const char *path, int compression_level,
                   size_t source_cache_pages);
 
+/* Remove holes without recompression. Every live page is decompressed and
+ * checksum-validated before its original compressed block is copied. */
+bool egtb_compact_copy(const char *path, size_t source_cache_pages);
+
 #endif

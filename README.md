@@ -20,8 +20,8 @@ regression and performance tests.
 - Canonical material orientation with automatic color/board mirroring.
 - Compressed on-disk frontier streams and persistent outcome bitmaps, avoiding
   a full database scan for every DTM layer.
-- A repair pass for exact-DTM transpositions and otherwise unreachable setup
-  positions, followed by fatal read-only verification.
+- A defensive exact-DTM consistency check/repair pass, followed by fatal
+  read-only verification; unreachable setup positions remain part of the graph.
 - Tested position counts for all 120 seven-piece material distributions.
 - Independent counts and sampled index/slice round trips for all 165
   eight-piece material distributions; eight-piece move-generation tests.
@@ -232,6 +232,10 @@ The combinatorial inverse became faster from four pieces onward, reaching
 pieces. The production generator retains the transition index because random
 position-to-index calculation is its dominant indexing workload.
 
+Unsliced inversion uses a dedicated loop without slice-boundary checks or
+frontier-requirement arithmetic. Sliced inversion retains its existing path;
+both use the same index order and on-disk format as before.
+
 ## Move generation
 
 `movegen.c` implements international draughts rules:
@@ -317,6 +321,12 @@ little-endian order; legacy blocks retain their original byte CRC. An implicit
 directory entry `(offset=0,length=0)` represents an all-draw page and consumes
 no block storage.
 
+DTM checksums use eight-byte hardware CRC32C operations on x86-64 CPUs with
+SSE4.2, selected at runtime, with a portable fallback on other CPUs. The
+checksum values and file format are identical on both paths. `make test`
+compares both implementations against an independent reference, including
+unaligned buffers and partial final words.
+
 The file begins with a versioned header containing the page size and maximum
 index, followed by an in-memory directory with a 64-bit block offset and
 16-bit compressed length per page. A newly written block reserves 20% of the
@@ -325,7 +335,11 @@ appended and its directory entry is updated. `egtb_compact()` rewrites only
 live blocks, removes reserved slack and abandoned blocks, and atomically
 installs the compacted file.
 
-DTM caches are direct-mapped by page number. Read-only handles share the file
+DTM caches are direct-mapped by page number. Planar cache views retain the
+logical page and side throughout addressing; power-of-two slot counts per
+side use a mask instead of division. This preserves the existing mapping and
+eviction policy, including non-power-of-two cache sizes.
+Read-only handles share the file
 header and immutable directory by path, while each `EgtbView` owns its cache,
 Zstd contexts, buffers, and statistics. Cache misses use `pread()`, so worker
 threads do not share a seek pointer. Writable views use `pwrite()` and flush a
@@ -455,22 +469,30 @@ compressed database for every mate distance.
    of complete DTM pages and the corresponding whole 64-bit bitmap words. No
    two workers write the same final page.
 
-3. **Initialize exact known values.** Workers enumerate their slices for both
+3. **Initialize known outcomes and DTM seeds.** Workers enumerate their slices for both
    WTM and BTM. No-move positions become lost-in-zero; immediate mates become
    won-in-one. Captures and promotions query previously generated databases,
    so initialization can also discover DTM values larger than one. Every known
    result is appended to the worker's exact-DTM frontier stream.
+   Mixed internal/external potential losses without an external draw or loss
+   are also scheduled as deferred candidates at the largest external winning
+   distance. An initialized win can still be shortened by an internal move.
 
 4. **Maintain persistent outcomes.** Shared WTM/BTM won and lost bitmaps hold
    accumulated outcomes. The compressed streams identify the exact current
    frontier, while a shared atomic candidate bitmap routes its predecessors to
    their owning workers. These structures replace random writes to a working
    DTM during propagation.
+   Lost-in-zero entries are propagated first, so winning quiet moves that
+   immobilize the opponent are discovered before the won-in-one layer.
 
 5. **Propagate won to lost.** For a won-in-N frontier, legal quiet inverse moves
    generate candidate opponent predecessors. A predecessor is lost in N+1 only
    when every legal forward move is a known win no longer than N and at least
    one is exactly N. This implements the losing side's longest defense.
+   Deferred external candidates join the same layer, even if no internal
+   successor reaches distance N. Successor evaluation stops at the first
+   disproof; the padded backend still generates the complete legal move list.
 
 6. **Propagate lost to won.** For a lost-in-N frontier, every legal inverse move
    directly proves a candidate win in N+1: the inverse generator already
@@ -483,6 +505,8 @@ compressed database for every mate distance.
    the filesystem reclaims them automatically when their descriptors close or
    the process exits. No global stream lock or collection of per-distance files
    is required.
+   Deferred external candidates use a second compressed store with one file per
+   worker; that store is released before final DTM compilation.
 
 8. **Compile the final DTM.** Each worker assembles a page-aligned batch of its
    index range in a bounded, uncompressed paired-entry buffer initialized to
@@ -502,13 +526,17 @@ compressed database for every mate distance.
    separate random-access successor view.
    Corrections are merged and applied by one thread. Corrected positions and
    their quiet predecessors/successors form the next sparse worklist; passes
-   continue until no correction remains. This handles initialization
-   transpositions and setup positions that have no legal predecessor in the
-   current material database.
+   continue until no correction remains. This remains a defensive check, not
+   an intended substitute for missing retrograde events. The corrected
+   frontier scheduler includes both terminal-zero and external-distance events.
 
-10. **Recompute the maximum DTM.** After repair, one final linear DTM scan
-    determines the actual maximum distance, including any values changed by
-    consistency repair.
+10. **Maintain the maximum DTM without a database scan.** Each worker builds
+    a DTM histogram during the first consistency inspection (512 KiB/worker).
+    Applied corrections decrement the old bucket and increment the new bucket.
+    The nonempty buckets give the exact final maximum, even if repair removes
+    the last position at a formerly larger distance. `final DTM scan` is retained
+    in the timing summary as zero for the frontier generator; legacy paths still
+    perform their scan.
 
 11. **Record verified positions.** The initial consistency pass also builds a
     bitmap of positions already proved correct. Any correction and its quiet
@@ -516,8 +544,13 @@ compressed database for every mate distance.
     safely skip positions that remained verified.
 
 12. **Finalize and compact.** Dirty pages are flushed, the writable database is
-    closed, and live compressed blocks are rewritten without holes. The compact
-    file atomically replaces the working file and is reopened read-only.
+    closed, and live compressed blocks are copied without holes or recompression.
+    Every live page is decompressed and codec/CRC-validated before copying its
+    original compressed bytes. The compact file atomically replaces the working
+    file and is reopened read-only. Generation uses `egtb_compact_copy()`;
+    `egtb_compact(path, compression_level, cache_pages)` remains available for
+    explicit recompression at a requested level. File formats and the default
+    compression level are unchanged.
 
 13. **Verify the immutable result.** If the uncompressed database fits the
     resident-memory limit, workers decompress disjoint pages into a shared flat
@@ -582,6 +615,27 @@ cache lookups, hits, misses, decompressions, dirty evictions, compressed
 writes, storage ratios, and wall-clock time for each major phase.
 
 ## Example: 1 king + 1 man against 1 king + 1 man
+
+The detailed output below is a historical measurement, before revision 3.005.
+With terminal-zero propagation and deferred external loss candidates, this
+database now requires one consistency pass and zero corrections. Checked
+block-copy compaction replaces recompression, and the final DTM scan is folded
+into consistency histograms. An indicative single-run comparison on the same
+host (not a controlled scaling benchmark) gave:
+
+| Threads | Revision 3.004 total | Revision 3.005 total |
+|---|---:|---:|
+| 1 | 8.519 s | 6.226 s |
+| 16 | 1.939 s | 1.251 s |
+
+The compacted 1/1/1/1 database was byte-identical. All 23 canonical two-to-four
+piece databases generated with four threads required zero corrections and
+passed standalone `verify_dtm`, which checks all positions without a skip bitmap.
+The same held for all 12 five-piece 3x2 databases. Real nine-slice (2/0/1/1) and
+81-slice (1/1/1/1) generations also passed full verification and matched their
+unsliced databases entry-for-entry.
+Regression tests also cover high external DTM seeds, slice resume, shrinking
+DTM maxima, failed cache loads, shared-handle cleanup, and legacy-format copying.
 
 The following run used revision 2.101, 16 threads, and the optimized native
 build on the Ryzen 9 5950X described above. Individual correction records,

@@ -2,6 +2,7 @@
 
 #include "egtb.h"
 #include "progress.h"
+#include "crc32c.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -104,6 +105,7 @@ struct EgtbView {
     uint64_t first_page;
     uint64_t end_page;
     size_t slot_mask;
+    size_t logical_slots;
     bool dense_slots;
     bool power_of_two_slots;
     struct EgtbView *next;
@@ -121,8 +123,6 @@ static const unsigned char egtb_magic[8] = {'I','P','D','E','G','T','B','\0'};
 static Egtb *readonly_registry;
 static _Thread_local char last_error[256];
 static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
-static uint32_t crc32c_table[256];
 
 _Static_assert(sizeof(EgtbEntry) == 4, "EgtbEntry must occupy four bytes");
 
@@ -417,31 +417,6 @@ static uint32_t mix32(uint32_t value)
     value ^= value >> 15;
     value *= UINT32_C(0x846ca68b);
     return value ^ (value >> 16);
-}
-
-static void initialize_crc32c_table(void)
-{
-    unsigned entry;
-    for (entry = 0; entry < 256; ++entry) {
-        uint32_t value = entry;
-        unsigned bit;
-        for (bit = 0; bit < 8; ++bit)
-            value = (value >> 1) ^
-                    (UINT32_C(0x82f63b78) &
-                     (UINT32_C(0) - (value & 1)));
-        crc32c_table[entry] = value;
-    }
-}
-
-static uint32_t crc32c(const void *data, size_t size)
-{
-    const unsigned char *bytes = data;
-    uint32_t crc = UINT32_MAX;
-    size_t i;
-    pthread_once(&crc32c_once, initialize_crc32c_table);
-    for (i = 0; i < size; ++i)
-        crc = crc32c_table[(crc ^ bytes[i]) & 0xff] ^ (crc >> 8);
-    return ~crc;
 }
 
 
@@ -849,6 +824,7 @@ static bool cached_page(Egtb *egtb, uint64_t page, size_t *result)
             return false;
     }
     data = cache_data(egtb, index);
+    entry->valid = false;
     if (!load_page(egtb, page, data))
         return false;
     entry->page_index = page;
@@ -1167,8 +1143,6 @@ bool egtb_close(Egtb *egtb)
     bool ok = true;
     if (egtb == NULL)
         return true;
-    if (egtb->view_count != 0)
-        return fail("cannot close an EGTB with active cache views");
     if (egtb->registered) {
         Egtb **link = &readonly_registry;
         pthread_mutex_lock(&registry_mutex);
@@ -1177,11 +1151,16 @@ bool egtb_close(Egtb *egtb)
             pthread_mutex_unlock(&registry_mutex);
             return true;
         }
+        if (egtb->view_count != 0) {
+            pthread_mutex_unlock(&registry_mutex);
+            return fail("cannot close an EGTB with active cache views");
+        }
         while (*link != egtb)
             link = &(*link)->registry_next;
         *link = egtb->registry_next;
         pthread_mutex_unlock(&registry_mutex);
-    }
+    } else if (egtb->view_count != 0)
+        return fail("cannot close an EGTB with active cache views");
     if (!egtb->readonly)
         ok = egtb_flush(egtb);
     if (egtb->file != NULL && fclose(egtb->file) != 0)
@@ -1336,28 +1315,26 @@ static bool view_flush_slot(EgtbView *view, size_t slot)
     return true;
 }
 
-static inline size_t view_cache_slot(const EgtbView *view, uint64_t page)
+/* Keep the logical page and side supplied by the caller: reconstructing them
+ * from the physical page would require division by side_page_count. */
+static inline size_t view_cache_slot(const EgtbView *view, uint64_t page,
+                                    EgtbSide side)
 {
-    if (view->backing->planar) {
-        uint64_t logical = page % view->backing->side_page_count;
-        size_t per_side = view->capacity / 2;
-        size_t side = (size_t)(page / view->backing->side_page_count);
-        if (EGTB_LIKELY(view->dense_slots))
-            return side * per_side + (size_t)(logical - view->first_page);
-        return side * per_side + (size_t)logical % per_side;
-    }
+    size_t slot;
     if (EGTB_LIKELY(view->dense_slots))
-        return (size_t)(page - view->first_page);
-    if (EGTB_LIKELY(view->power_of_two_slots))
-        return (size_t)page & view->slot_mask;
-    return (size_t)(page % view->capacity);
+        slot = (size_t)(page - view->first_page);
+    else if (EGTB_LIKELY(view->power_of_two_slots))
+        slot = (size_t)page & view->slot_mask;
+    else
+        slot = (size_t)(page % view->logical_slots);
+    return view->backing->planar
+               ? (size_t)side * view->logical_slots + slot : slot;
 }
 
 #ifndef NDEBUG
 static bool view_contains_page(const EgtbView *view, uint64_t page)
 {
-    uint64_t logical = position_page(view->backing, page);
-    return logical >= view->first_page && logical < view->end_page;
+    return page >= view->first_page && page < view->end_page;
 }
 #endif
 
@@ -1371,6 +1348,7 @@ view_cache_miss(EgtbView *view, uint64_t page, size_t slot, EgtbEntry *data)
         if (!view_flush_slot(view, slot))
             return NULL;
     }
+    entry->valid = false;
     if (!view_load_page(view, page, data))
         return NULL;
     entry->page_index = page;
@@ -1381,9 +1359,12 @@ view_cache_miss(EgtbView *view, uint64_t page, size_t slot, EgtbEntry *data)
 }
 
 static inline EgtbEntry *view_cached_page(EgtbView *view, uint64_t page,
+                                          EgtbSide side,
                                           size_t *result_slot)
 {
-    size_t slot = view_cache_slot(view, page);
+    size_t slot = view_cache_slot(view, page, side);
+    if (view->backing->planar)
+        page += (uint64_t)side * view->backing->side_page_count;
     DirectCacheEntry *entry = &view->entries[slot];
     EgtbEntry *data = view_cache_data(view, slot);
     ++view->statistics.lookups;
@@ -1455,11 +1436,12 @@ bool egtb_view_create_range(EgtbView **out, Egtb *backing,
     view->end_page = end_page;
     view->dense_slots = cache_pages ==
         (size_t)(backing->planar ? 2 * range_pages : range_pages);
+    view->logical_slots = backing->planar ? cache_pages / 2 : cache_pages;
     view->power_of_two_slots =
-        !backing->planar && !view->dense_slots &&
-        (cache_pages & (cache_pages - 1)) == 0;
+        !view->dense_slots &&
+        (view->logical_slots & (view->logical_slots - 1)) == 0;
     if (view->power_of_two_slots)
-        view->slot_mask = cache_pages - 1;
+        view->slot_mask = view->logical_slots - 1;
     view->compressed_capacity = ZSTD_compressBound(backing->codec_capacity);
     view->entries = calloc(cache_pages, sizeof(*view->entries));
     view->data = malloc(cache_pages * backing->memory_page_size);
@@ -1566,12 +1548,12 @@ bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid cache-view lookup");
 #endif
-    split_storage_index(egtb, index, side, &page, &entry_index);
+    split_entry_index(egtb, index, &page, &entry_index);
 #ifndef NDEBUG
     if (!view_contains_page(view, page))
         return fail("cache-view lookup is outside its page range");
 #endif
-    entries = view_cached_page(view, page, NULL);
+    entries = view_cached_page(view, page, side, NULL);
     if (entries == NULL)
         return false;
     *value = egtb_decode_dtm(
@@ -1605,7 +1587,7 @@ bool egtb_view_get_pair(EgtbView *view, uint64_t index,
     if (page < view->first_page || page >= view->end_page)
         return fail("paired cache-view lookup is outside its page range");
 #endif
-    entries = view_cached_page(view, page, NULL);
+    entries = view_cached_page(view, page, EGTB_WHITE_TO_MOVE, NULL);
     if (entries == NULL)
         return false;
     *white_to_move = egtb_decode_dtm(entries[entry_index].white_to_move);
@@ -1660,9 +1642,10 @@ bool egtb_sequential_reader_next(EgtbSequentialReader *reader,
             EgtbEntry *white_page, *black_page;
             split_entry_index(egtb, reader->next_index, &logical_page,
                               &entry_index);
-            white_page = view_cached_page(reader->view, logical_page, NULL);
+            white_page = view_cached_page(reader->view, logical_page,
+                                           EGTB_WHITE_TO_MOVE, NULL);
             black_page = view_cached_page(
-                reader->view, logical_page + egtb->side_page_count, NULL);
+                reader->view, logical_page, EGTB_BLACK_TO_MOVE, NULL);
             if (white_page == NULL || black_page == NULL)
                 return false;
             reader->next_white =
@@ -1686,7 +1669,7 @@ bool egtb_sequential_reader_next(EgtbSequentialReader *reader,
         uint32_t entry_index;
         uint32_t available;
         split_entry_index(egtb, reader->next_index, &page, &entry_index);
-        entries = view_cached_page(reader->view, page, NULL);
+        entries = view_cached_page(reader->view, page, EGTB_WHITE_TO_MOVE, NULL);
         if (entries == NULL)
             return false;
         available = egtb->entries_per_page - entry_index;
@@ -1727,12 +1710,12 @@ bool egtb_view_set(EgtbView *view, uint64_t index, EgtbSide side,
         (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
         return fail("invalid cache-view update");
 #endif
-    split_storage_index(egtb, index, side, &page, &entry_index);
+    split_entry_index(egtb, index, &page, &entry_index);
 #ifndef NDEBUG
     if (!view_contains_page(view, page))
         return fail("cache-view update is outside its page range");
 #endif
-    entries = view_cached_page(view, page, &cache_slot);
+    entries = view_cached_page(view, page, side, &cache_slot);
     if (entries == NULL)
         return false;
     cache_entry = &view->entries[cache_slot];
@@ -1769,7 +1752,7 @@ bool egtb_view_write_page(EgtbView *view, uint64_t page,
         return fail("complete-page update has incorrect entry count");
     for (unsigned side = 0; side < (egtb->planar ? 2u : 1u); ++side) {
         uint64_t physical = page + side * egtb->side_page_count;
-        size_t slot = view_cache_slot(view, physical);
+        size_t slot = view_cache_slot(view, page, (EgtbSide)side);
         DirectCacheEntry *entry = &view->entries[slot];
         EgtbEntry *data = view_cache_data(view, slot);
         if (!view_flush_slot(view, slot))
@@ -2274,8 +2257,8 @@ static bool registry_contains(const char *path)
     return false;
 }
 
-bool egtb_compact(const char *path, int compression_level,
-                  size_t source_cache_pages)
+static bool compact_database(const char *path, int compression_level,
+                              size_t source_cache_pages, bool copy_blocks)
 {
     Egtb *source = NULL, *target = NULL;
     EgtbCreateOptions options;
@@ -2306,7 +2289,8 @@ bool egtb_compact(const char *path, int compression_level,
     unlink(temporary);
     options.cache_pages = 1;
     options.reserve_percent = 0;
-    options.compression_level = compression_level;
+    options.compression_level = copy_blocks ? source->compression_level
+                                            : compression_level;
     if (!create_with_version(&target, temporary, source->maximum_index,
                              source->page_size, &options,
                              source->format_version))
@@ -2314,11 +2298,31 @@ bool egtb_compact(const char *path, int compression_level,
     egtb_progress_begin("compaction", source->page_count, "pages");
     target->exact_layout = true;
     for (page = 0; page < source->page_count; ++page) {
-        size_t cache_index;
-        if (!cached_page(source, page, &cache_index) ||
-            !store_page(target, page, cache_data(source, cache_index), true))
+        /* Loading validates the codec and CRC even when copying compressed
+         * bytes. Do not rely on later verification, which can skip positions. */
+        EgtbEntry *data = cache_data(source, 0);
+        if (!load_page(source, page, data))
+            goto done;
+        if (copy_blocks) {
+            if (source->offsets[page] != 0) {
+                unsigned char checksum[EGTB_BLOCK_HEADER_SIZE];
+                uint16_t length = source->lengths[page];
+                if (!read_at(source->file, source->offsets[page], checksum,
+                              sizeof(checksum)) ||
+                    !append_block(target, get_u32(checksum), source->compressed,
+                                   length, length, &target->offsets[page]))
+                    goto done;
+                target->lengths[page] = length;
+            }
+        } else if (!store_page(target, page, data, true))
             goto done;
         egtb_progress_add(1);
+    }
+    if (!egtb_flush(target))
+        goto done;
+    if (fsync(fileno(target->file)) != 0) {
+        fail("cannot synchronize compacted EGTB: %s", strerror(errno));
+        goto done;
     }
     if (!egtb_close(target)) {
         target = NULL;
@@ -2343,4 +2347,15 @@ done:
         unlink(temporary);
     free(temporary);
     return ok;
+}
+
+bool egtb_compact(const char *path, int compression_level,
+                  size_t source_cache_pages)
+{
+    return compact_database(path, compression_level, source_cache_pages, false);
+}
+
+bool egtb_compact_copy(const char *path, size_t source_cache_pages)
+{
+    return compact_database(path, 0, source_cache_pages, true);
 }

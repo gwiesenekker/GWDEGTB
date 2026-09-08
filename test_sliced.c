@@ -59,6 +59,11 @@ int main(int argc, char **argv)
         !egtb_generate_sliced(&sliced, sliced_path, &material, &indexer,
                               &sliced_options, &sliced_statistics))
         goto done;
+    if (unsliced_statistics.consistency_updates[0] != 0 ||
+        unsliced_statistics.consistency_updates[1] != 0 ||
+        sliced_statistics.consistency_updates[0] != 0 ||
+        sliced_statistics.consistency_updates[1] != 0)
+        goto done;
     for (uint64_t index = 0; index < eg_position_count(&indexer); ++index)
         for (unsigned side = 0; side < 2; ++side) {
             int16_t expected = 0, actual = 0;

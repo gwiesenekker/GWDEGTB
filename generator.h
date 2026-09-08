@@ -111,6 +111,8 @@ typedef struct {
     uint64_t longer_losses[2];
     uint64_t other_updates[2];
     EgtbCacheStatistics cache;
+    /* Exact maximum after threaded repair, maintained through corrections. */
+    uint16_t maximum_dtm;
 } EgtbConsistencyStatistics;
 
 const char *egtb_generator_last_error(void);

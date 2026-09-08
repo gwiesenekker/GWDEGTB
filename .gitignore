@@ -30,5 +30,7 @@
 /*.wdl
 /logs/
 /test_dtm16
+/test_crc32c
 /test_progress
 /test_8piece
+test_storage_safety

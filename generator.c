@@ -6,6 +6,7 @@
 #include "movegen.h"
 
 #include <stdarg.h>
+#include <assert.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -284,16 +285,18 @@ bool egtb_initialize_terminal_positions(
         database, indexer, NULL, NULL, statistics);
 }
 
-static bool position_index(const EgIndexer *indexer,
-                           const DraughtsPosition *position, uint64_t *index)
+/* Only call after membership has been established. Public indexer validation
+ * and the sliced indexer's boundary checks remain unchanged. */
+static bool known_position_index(const EgIndexer *indexer,
+                                 const DraughtsPosition *position,
+                                 uint64_t *index)
 {
     EgPosition indexed;
     indexed.white_men = position->white_men;
     indexed.black_men = position->black_men;
     indexed.white_kings = position->white_kings;
     indexed.black_kings = position->black_kings;
-    if (!eg_indexer_contains_position(indexer, &indexed))
-        return false;
+    assert(eg_indexer_contains_position(indexer, &indexed));
     return eg_position_to_index(indexer, &indexed, index);
 }
 
@@ -305,7 +308,31 @@ static bool contains_position(const EgIndexer *indexer,
     indexed.black_men = position->black_men;
     indexed.white_kings = position->white_kings;
     indexed.black_kings = position->black_kings;
+#ifndef NDEBUG
     return eg_indexer_contains_position(indexer, &indexed);
+#else
+    /* Move generation supplies valid boards. Only material and slice changes
+     * determine whether the successor belongs to this database. */
+    if ((unsigned)__builtin_popcountll(indexed.white_men) != indexer->white_men ||
+        (unsigned)__builtin_popcountll(indexed.black_men) != indexer->black_men ||
+        (unsigned)__builtin_popcountll(indexed.white_kings) != indexer->white_kings ||
+        (unsigned)__builtin_popcountll(indexed.black_kings) != indexer->black_kings)
+        return false;
+    if (indexer->sliced) {
+        int white_row, black_row;
+        eg_position_slice(&indexed, &white_row, &black_row);
+        return white_row == indexer->white_man_row &&
+               black_row == indexer->black_man_row;
+    }
+    return true;
+#endif
+}
+
+static bool position_index(const EgIndexer *indexer,
+                           const DraughtsPosition *position, uint64_t *index)
+{
+    return contains_position(indexer, position) &&
+           known_position_index(indexer, position, index);
 }
 
 static bool generator_get(Egtb *database, EgtbView *view, uint64_t index,
@@ -339,7 +366,7 @@ static bool check_forward_successor(const DraughtsMove *move, void *opaque)
     if (friendly == 0) {
         value = 0;
     } else if (contains_position(context->indexer, &successor)) {
-        if (!position_index(context->indexer, &successor, &index)) {
+        if (!known_position_index(context->indexer, &successor, &index)) {
             context->failed = true;
             return false;
         }
@@ -981,7 +1008,7 @@ static bool resolve_successor(ConsistencyMoveContext *context,
     }
     if (contains_position(context->indexer, successor)) {
         uint64_t index;
-        if (!position_index(context->indexer, successor, &index) ||
+        if (!known_position_index(context->indexer, successor, &index) ||
             (context->resident != NULL
                  ? !egtb_resident_get(context->resident, index,
                                       context->successor_side, value)
@@ -1302,6 +1329,7 @@ typedef struct {
     uint64_t end_index;
     uint64_t positions_checked;
     ConsistencyCorrection *corrections;
+    uint64_t *histogram;
     size_t correction_count;
     size_t correction_capacity;
     bool failed;
@@ -1350,6 +1378,8 @@ static bool inspect_consistency_position(ConsistencyRepairWorker *worker,
     position.black_kings = indexed.black_kings;
     for (side = 0; side < 2; ++side) {
         int16_t old_value = old_values[side], new_value = EGTB_DRAW;
+        if (worker->full_pass)
+            ++worker->histogram[(uint16_t)old_value];
         if (!expected_dtm(worker->database, worker->indexer,
                           worker->successor_view, NULL,
                           &position, (EgtbSide)side,
@@ -1503,6 +1533,9 @@ static bool apply_consistency_corrections(
                 return fail("cannot apply correction at index %llu: %s",
                             (unsigned long long)correction->index,
                             egtb_last_error());
+            assert(worker->histogram[(uint16_t)correction->old_value] != 0);
+            --worker->histogram[(uint16_t)correction->old_value];
+            ++worker->histogram[(uint16_t)correction->new_value];
             ++statistics->updates[side];
             ++*updates_this_pass;
             egtb_progress_add(1);
@@ -1579,6 +1612,12 @@ bool egtb_make_consistent_threaded(
         workers[i].external_context = options->external_contexts != NULL
                                           ? options->external_contexts[i]
                                           : external_context;
+        workers[i].histogram = calloc((size_t)UINT16_MAX + 1,
+                                       sizeof(*workers[i].histogram));
+        if (workers[i].histogram == NULL) {
+            fail("cannot allocate consistency histogram");
+            goto done;
+        }
         workers[i].verified_positions = verified_positions;
         workers[i].first_index = first_page * entries_per_page;
         workers[i].end_index =
@@ -1690,6 +1729,14 @@ bool egtb_make_consistent_threaded(
         goto done;
     }
     cache_shrunk = false;
+    for (i = 0; i < thread_count; ++i)
+        for (unsigned code = 0; code <= UINT16_MAX; ++code) {
+            int value = code <= INT16_MAX ? (int)code : (int)code - 65536;
+            unsigned distance = (unsigned)(value < 0 ? -value : value);
+            if (value != EGTB_DRAW && workers[i].histogram[code] != 0 &&
+                distance > local.maximum_dtm)
+                local.maximum_dtm = (uint16_t)distance;
+        }
     if (statistics != NULL)
         *statistics = local;
     ok = true;
@@ -1701,8 +1748,10 @@ done:
     if (cache_shrunk && !egtb_resize_cache(database, original_cache_pages))
         ok = false;
     if (workers != NULL)
-        for (i = 0; i < thread_count; ++i)
+        for (i = 0; i < thread_count; ++i) {
             free(workers[i].corrections);
+            free(workers[i].histogram);
+        }
     bitmap_destroy(&affected);
     bitmap_destroy(&pending);
     free(threads);
@@ -2057,6 +2106,7 @@ typedef struct {
     unsigned owner;
     FrontierWork work;
     FrontierStore *frontiers;
+    FrontierStore *deferred; /* Loss candidates keyed by external max win. */
     Egtb *database;
     EgtbView *view;
     const EgIndexer *indexer;
@@ -2156,6 +2206,22 @@ static bool initialize_frontier_range(FrontierWorker *worker)
                 ++local.external_losses[side];
             } else {
                 ++local.unknown[side];
+                /* Mixed internal/external successors, no external
+                 * loss or draw: the position can only be lost once every
+                 * internal successor is won, and its DTM is then at least
+                 * longest_win + 1.  Re-evaluate it as a loss candidate when the
+                 * opponent's won-in-longest_win layer is processed. */
+                if (context.has_internal && !context.has_draw &&
+                    context.longest_win > 0 &&
+                    !frontier_store_append(worker->deferred, worker->owner,
+                                           opposite_side((EgtbSide)side),
+                                           (int16_t)context.longest_win,
+                                           index)) {
+                    frontier_worker_error(worker,
+                        "cannot append deferred candidate: %s",
+                        frontier_last_error());
+                    return false;
+                }
             }
             if (value != EGTB_DRAW &&
                 !frontier_store_append(worker->frontiers, worker->owner,
@@ -2255,6 +2321,9 @@ typedef struct {
 static bool check_frontier_successor(const DraughtsMove *move, void *opaque)
 {
     FrontierForwardContext *context = opaque;
+    /* Callback backends may keep visiting moves after a normal disproof. */
+    if (!context->all_winning)
+        return true;
     DraughtsPosition successor = context->position;
     uint64_t friendly, index;
     int16_t value;
@@ -2268,12 +2337,14 @@ static bool check_frontier_successor(const DraughtsMove *move, void *opaque)
     if (friendly == 0) {
         value = 0;
     } else if (contains_position(context->indexer, &successor)) {
-        if (!position_index(context->indexer, &successor, &index)) {
+        if (!known_position_index(context->indexer, &successor, &index)) {
             context->failed = true;
             return false;
         }
-        if (!bitmap_test(context->won, index))
+        if (!bitmap_test(context->won, index)) {
             context->all_winning = false;
+            return true;
+        }
         return true;
     } else if (context->external_probe == NULL ||
                !context->external_probe(&successor, context->successor_side,
@@ -2282,8 +2353,38 @@ static bool check_frontier_successor(const DraughtsMove *move, void *opaque)
         context->failed = true;
         return false;
     }
-    if (value <= 0 || value > context->won_distance)
+    if (value <= 0 || value > context->won_distance) {
         context->all_winning = false;
+        return true;
+    }
+    return true;
+}
+
+/* A disproof is a successful evaluation, not a move-generator error. */
+static bool check_frontier_moves(const DraughtsPosition *position,
+                                  EgtbSide mover,
+                                  FrontierForwardContext *forward,
+                                  size_t *move_count)
+{
+#ifdef EGTB_PADDED_MOVEGEN
+    DraughtsMove moves[DRAUGHTS_MOVES_MAX];
+    if (!draughts_generate_moves_padded_into(position, mover, moves,
+                                             DRAUGHTS_MOVES_MAX, move_count))
+        return false;
+    for (size_t i = 0; i < *move_count && forward->all_winning; ++i)
+        if (!check_frontier_successor(&moves[i], forward))
+            return false;
+    return true;
+#else
+    return GENERATE_MOVES(position, mover, check_frontier_successor,
+                          forward, move_count);
+#endif
+}
+
+static bool activate_deferred_candidate(uint64_t index, void *opaque)
+{
+    FrontierWorker *worker = opaque;
+    bitmap_set_atomic(worker->candidates, index);
     return true;
 }
 
@@ -2386,6 +2487,12 @@ static void *run_frontier_worker_body(void *opaque)
             !worker->failed)
             frontier_worker_error(worker, "cannot read frontier: %s",
                                   frontier_last_error());
+        if (won && !worker->failed &&
+            !frontier_store_visit(worker->deferred, worker->owner,
+                                  worker->successor_side, worker->distance,
+                                  activate_deferred_candidate, worker))
+            frontier_worker_error(worker, "cannot read deferred candidates: %s",
+                                  frontier_last_error());
         return NULL;
     }
     if (worker->work == FRONTIER_WORK_LOSS_CANDIDATES ||
@@ -2425,9 +2532,9 @@ static void *run_frontier_worker_body(void *opaque)
                 forward.external_probe = worker->external_probe;
                 forward.external_context = worker->external_context;
                 forward.all_winning = true;
-                if (!GENERATE_MOVES(&position, mover,
-                                    check_frontier_successor, &forward,
-                                    &move_count) || forward.failed) {
+                if (!check_frontier_moves(&position, mover, &forward,
+                                           &move_count) ||
+                    forward.failed) {
                     frontier_worker_error(worker,
                                           "cannot check loss candidate");
                     return NULL;
@@ -2576,43 +2683,6 @@ static bool initialize_frontier_store_parallel(
     return true;
 }
 
-typedef struct {
-    Bitmap *result;
-    Bitmap *opposite;
-    bool failed;
-} FrontierActivationContext;
-
-static bool activate_frontier_entry(uint64_t index, void *opaque)
-{
-    FrontierActivationContext *context = opaque;
-    if (bitmap_test(context->result, index))
-        return true;
-    if (bitmap_test(context->opposite, index)) {
-        context->failed = true;
-        return false;
-    }
-    bitmap_set(context->result, index);
-    return true;
-}
-
-static bool activate_terminal_losses(FrontierStore *frontiers,
-                                     Bitmap *won[2], Bitmap *lost[2],
-                                     unsigned thread_count)
-{
-    unsigned side, owner;
-    for (side = 0; side < 2; ++side)
-        for (owner = 0; owner < thread_count; ++owner) {
-            FrontierActivationContext context = {
-                lost[side], won[side], false
-            };
-            if (!frontier_store_visit(frontiers, owner, (EgtbSide)side, 0,
-                                      activate_frontier_entry, &context))
-                return fail("cannot activate terminal losses: %s",
-                            context.failed ? "conflicting outcome" :
-                                             frontier_last_error());
-        }
-    return true;
-}
 
 static bool frontier_backtrack_layer(
     FrontierWorker *workers, pthread_t *threads, unsigned thread_count,
@@ -2867,13 +2937,12 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     EgtbGenerationStatistics local = {0};
     EgtbConsistencyStatistics consistency = {0};
     FrontierStore *frontiers = NULL;
+    FrontierStore *deferred = NULL;
     FrontierWorker *workers = NULL;
     pthread_t *threads = NULL;
     Bitmap won[2] = {{0}, {0}};
     Bitmap lost[2] = {{0}, {0}};
     Bitmap candidates = {0};
-    Bitmap *won_ptrs[2] = {&won[0], &won[1]};
-    Bitmap *lost_ptrs[2] = {&lost[0], &lost[1]};
     uint64_t position_count, page_count, pages_per_worker, extra_pages;
     size_t original_cache_pages = 0;
     unsigned thread_count, side, i, created_views = 0;
@@ -2919,7 +2988,8 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         !bitmap_create(&lost[0], position_count) ||
         !bitmap_create(&lost[1], position_count) ||
         !bitmap_create(&candidates, position_count) ||
-        !frontier_store_create(&frontiers, thread_count, 1)) {
+        !frontier_store_create(&frontiers, thread_count, 1) ||
+        !frontier_store_create(&deferred, thread_count, 1)) {
         fail("cannot allocate frontier generator workspace: %s",
              frontier_last_error());
         goto done;
@@ -2933,6 +3003,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         uint64_t end_page = first_page + owned_pages;
         workers[i].owner = i;
         workers[i].frontiers = frontiers;
+        workers[i].deferred = deferred;
         workers[i].database = database;
         workers[i].indexer = indexer;
         workers[i].won[0] = &won[0];
@@ -2954,10 +3025,22 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
 
     phase_started = monotonic_seconds();
     if (!initialize_frontier_store_parallel(
-            workers, threads, thread_count, &local.initialization) ||
-        !activate_terminal_losses(frontiers, won_ptrs, lost_ptrs,
-                                  thread_count))
+            workers, threads, thread_count, &local.initialization))
         goto done;
+    /* Treat lost-in-0 positions as a regular lost frontier layer
+     * so that their quiet predecessors become won-in-1 during backtracking
+     * instead of being discovered by consistency repair. */
+    for (side = 0; side < 2; ++side) {
+        uint64_t sources = 0, candidate_count = 0, updates = 0;
+        if (!frontier_backtrack_layer(
+                workers, threads, thread_count, &candidates,
+                (EgtbSide)side, 0, false, &sources,
+                &candidate_count, &updates))
+            goto done;
+        local.new_wins[opposite_side((EgtbSide)side)] += updates;
+        if (updates != 0)
+            local.maximum_dtm = 1;
+    }
     local.initialization_seconds = monotonic_seconds() - phase_started;
     if (local.initialization.won_in_one[0] != 0 ||
         local.initialization.won_in_one[1] != 0)
@@ -3008,6 +3091,8 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         }
         if (frontier_store_maximum_distance(frontiers) <=
                 (uint16_t)won_distance &&
+            frontier_store_maximum_distance(deferred) <=
+                (uint16_t)won_distance &&
             loss_updates == 0 && win_updates == 0)
             break;
         if (won_distance > EGTB_MAX_WIN_DTM - 2) {
@@ -3019,6 +3104,8 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     local.backpropagation_seconds = monotonic_seconds() - phase_started;
 
     phase_started = monotonic_seconds();
+    frontier_store_destroy(deferred);
+    deferred = NULL;
     if (!frontier_store_finish(frontiers)) {
         fail("cannot finish frontier streams: %s", frontier_last_error());
         goto done;
@@ -3118,27 +3205,8 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         local.consistency_updates[side] = consistency.updates[side];
     local.consistency_cache = consistency.cache;
     local.consistency_seconds = monotonic_seconds() - phase_started;
-    phase_started = monotonic_seconds();
-    local.maximum_dtm = 0;
-    egtb_progress_begin("final DTM scan", position_count, "positions");
-    uint64_t scan_pending = 0;
-    for (uint64_t index = 0; index < position_count; ++index) {
-        for (side = 0; side < 2; ++side) {
-            int16_t value;
-            uint16_t distance;
-            if (!egtb_get(database, index, (EgtbSide)side, &value))
-                goto done;
-            if (value == EGTB_DRAW)
-                continue;
-            distance = value < 0 ? (uint16_t)-value : (uint16_t)value;
-            if (distance > local.maximum_dtm)
-                local.maximum_dtm = distance;
-        }
-        egtb_progress_tick(&scan_pending);
-    }
-    egtb_progress_flush(&scan_pending);
-    egtb_progress_end(true);
-    local.final_scan_seconds = monotonic_seconds() - phase_started;
+    local.maximum_dtm = consistency.maximum_dtm;
+    local.final_scan_seconds = 0; /* Folded into consistency histograms. */
     local.total_seconds = monotonic_seconds() - generation_started;
     if (statistics != NULL)
         *statistics = local;
@@ -3153,6 +3221,7 @@ done:
     if (cache_shrunk && !egtb_resize_cache(database, original_cache_pages))
         ok = false;
     frontier_store_destroy(frontiers);
+    frontier_store_destroy(deferred);
     bitmap_destroy(&candidates);
     bitmap_destroy(&lost[1]);
     bitmap_destroy(&lost[0]);

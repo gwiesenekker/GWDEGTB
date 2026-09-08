@@ -308,6 +308,7 @@ static bool test_complete_wk_bk_generation(void)
             win_value != 3 || loss_value != -2 || report.reports < 2 ||
             !report.saw_shorter_win || !report.saw_longer_loss ||
             consistency.passes < 2 ||
+            consistency.maximum_dtm != 3 ||
             consistency.shorter_wins[EGTB_WHITE_TO_MOVE] == 0 ||
             consistency.longer_losses[EGTB_WHITE_TO_MOVE] == 0)
             goto destroy_indexer;
@@ -567,6 +568,52 @@ done:
     return ok;
 }
 
+static bool probe_fixed_boundary(const DraughtsPosition *position,
+                                  EgtbSide side, void *context, int16_t *value)
+{
+    (void)position;
+    (void)side;
+    *value = *(const int16_t *)context;
+    return true;
+}
+
+/* Compare the frontier scheduler, before any repairs, against the legacy
+ * solver plus exhaustive consistency repair. Positive boundary seeds exercise
+ * deferred losses, negative seeds exercise shortening, draws block losses. */
+static bool test_frontier_events(bool mixed, int16_t boundary)
+{
+    char dir[] = "/tmp/ipd-frontier-events-XXXXXX", ap[256], bp[256];
+    EgIndexer ix = {0}; Egtb *a = NULL, *b = NULL;
+    EgtbCreateOptions create = {16, 20, 1};
+    EgtbThreadOptions threads = {4, 16, NULL, NULL, 8192};
+    EgtbGenerationStatistics old, current;
+    bool ok = false;
+    if (mkdtemp(dir) == NULL) return false;
+    snprintf(ap, sizeof(ap), "%s/legacy.dtm", dir);
+    snprintf(bp, sizeof(bp), "%s/frontier.dtm", dir);
+    if (!eg_indexer_init(&ix, mixed ? 1 : 0, mixed ? 0 : 1, 1, mixed ? 1 : 0) ||
+        !egtb_create(&a, ap, eg_max_index(&ix), 1024, &create) ||
+        !egtb_create(&b, bp, eg_max_index(&ix), 1024, &create) ||
+        !egtb_generate(a, &ix, probe_fixed_boundary, &boundary, NULL, NULL, &old) ||
+        !egtb_generate_threaded(b, &ix, probe_fixed_boundary, &boundary,
+                                NULL, NULL, &threads, &current) ||
+        current.consistency_passes != 1 || current.consistency_updates[0] != 0 ||
+        current.consistency_updates[1] != 0 || current.maximum_dtm != old.maximum_dtm)
+        goto done;
+    for (uint64_t i = 0; i < eg_position_count(&ix); ++i)
+        for (unsigned side = 0; side < 2; ++side) {
+            int16_t x, y;
+            if (!egtb_get(a, i, (EgtbSide)side, &x) ||
+                !egtb_get(b, i, (EgtbSide)side, &y) || x != y) goto done;
+        }
+    ok = true;
+done:
+    if (a != NULL && !egtb_close(a)) ok = false;
+    if (b != NULL && !egtb_close(b)) ok = false;
+    eg_indexer_destroy(&ix); unlink(ap); unlink(bp); rmdir(dir);
+    return ok;
+}
+
 int main(void)
 {
     static const uint64_t wk_bk_lost[2] = {0, 0};
@@ -578,6 +625,13 @@ int main(void)
     EgtbBacktrackStatistics wk_bk_backtrack, wk_backtrack;
     EgtbWinBacktrackStatistics wk_bk_win_backtrack, wk_win_backtrack;
     EgtbLossBacktrackStatistics wk_bk_loss_backtrack, wk_loss_backtrack;
+    if (!test_frontier_events(false, EGTB_DRAW) ||
+        !test_frontier_events(true, 301) ||
+        !test_frontier_events(true, -300) ||
+        !test_frontier_events(true, EGTB_DRAW)) {
+        fprintf(stderr, "frontier event regression failed: %s\n", egtb_generator_last_error());
+        return EXIT_FAILURE;
+    }
     if (!run_case(0, 0, 1, 1, 2450, wk_bk_lost, wk_bk_won,
                   wk_bk_unknown, &wk_bk_backtrack,
                   &wk_bk_win_backtrack, &wk_bk_loss_backtrack, true)) {

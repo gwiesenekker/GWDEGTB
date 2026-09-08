@@ -754,6 +754,7 @@ static bool load_compressed_cache_page(GwdegtbWdlProbe *probe,
     const void *compressed;
     size_t compressed_size, decompressed;
     uint32_t checksum;
+    entry->database = NULL;
     if (!wdl_image_page(database->image, page, &compressed,
                         &compressed_size, &checksum))
         return fail("cannot read compressed WDL directory: %s",
