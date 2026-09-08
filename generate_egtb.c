@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <zstd.h>
 
 #define GIBIBYTE (UINT64_C(1024) * 1024 * 1024)
 #define DEFAULT_RESIDENT_LIMIT_BYTES (UINT64_C(32) * GIBIBYTE)
@@ -345,7 +346,7 @@ int main(int argc, char **argv)
     EgtbMaterial requested, material;
     EgtbMaterialKind kind;
     char path[128];
-    EgtbCreateOptions options = {0, 20, 9};
+    EgtbCreateOptions options = {0, 20, 1};
     EgtbGenerationStatistics generation;
     EgtbConsistencyStatistics final_verification = {0};
     EgtbStorageStatistics storage;
@@ -381,6 +382,20 @@ int main(int argc, char **argv)
     }
     setvbuf(stdout, NULL, _IOLBF, 0);
     egtb_progress_log("GWDEGTB revision %s starting\n", gwdegtb_revision);
+    const char *compression_setting = getenv("EGTB_COMPRESSION_LEVEL");
+    if (compression_setting != NULL && *compression_setting != '\0') {
+        char *end;
+        errno = 0;
+        unsigned long level = strtoul(compression_setting, &end, 10);
+        if (errno || *end != '\0' || *compression_setting < '0' ||
+            *compression_setting > '9' || level < 1 ||
+            level > (unsigned long)ZSTD_maxCLevel()) {
+            fprintf(stderr, "invalid EGTB_COMPRESSION_LEVEL: expected 1..%d\n",
+                    ZSTD_maxCLevel());
+            return EXIT_FAILURE;
+        }
+        options.compression_level = (int)level;
+    }
     if (!configuration_page_size(&page_size)) {
         fprintf(stderr, "invalid EGTB_PAGE_SIZE: expected a power of two from 128 to 32768 bytes\n");
         return EXIT_FAILURE;
@@ -474,6 +489,7 @@ int main(int argc, char **argv)
            DEPENDENCY_CACHE_BYTES / (1024 * 1024));
     printf("DTM pages: %u bytes (%u positions per side)\n",
            page_size, page_size / (unsigned)sizeof(int16_t));
+    printf("DTM compression: Zstd level %d\n", options.compression_level);
     printf("frontier compilation: %" PRIu64 " MiB assembly buffer total\n",
            compilation_buffer_bytes / (1024 * 1024));
     fflush(stdout);
@@ -504,7 +520,7 @@ int main(int argc, char **argv)
             readonly_cache_pages,
             generation_cache_pages,
             20,
-            9,
+            options.compression_level,
             catalog_probe,
             &catalogs[0],
             probe_contexts,

@@ -568,6 +568,7 @@ sixteen 64-bit bitmap words. Current production defaults are:
 | Purpose | Default |
 |---|---:|
 | DTM page size (`EGTB_PAGE_SIZE`) | 2,048 bytes |
+| DTM Zstd compression (`EGTB_COMPRESSION_LEVEL`) | Level 1 |
 | Target writable cache | 1 GiB total |
 | Frontier compilation assembly buffer | 1 GiB total, divided among workers |
 | Dependency cache | 64 MiB per worker per opened dependency |
@@ -588,6 +589,20 @@ generation; existing databases retain the page size recorded in their headers.
 A sliced workspace must be resumed with its original page size. Cache budgets
 remain byte-based, so larger pages reduce the number of cached pages, not the
 configured cache memory. WDL pages remain fixed at 1,024 bytes.
+
+DTM compression defaults to Zstd level 1. Override it without rebuilding:
+
+```sh
+EGTB_COMPRESSION_LEVEL=6 ./generate_egtb -j 16 1 1 1 1
+EGTB_COMPRESSION_LEVEL=6 EGTB_THREADS=16 ./3x2.sh
+```
+
+The setting accepts positive levels from 1 through the linked Zstd library's
+maximum (currently 22), is printed at startup, and applies to new normal and
+sliced DTM files. Existing files retain their stored compression level, including
+completed slices when resuming a workspace. Final block-copy compaction preserves
+the compressed blocks. Temporary frontier streams remain at level 1; WDL
+compression is independent and unchanged.
 
 The dependency-cache figure is potentially multiplied by both the worker
 count and the number of dependency databases actually opened. Cache metadata
