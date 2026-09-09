@@ -35,26 +35,6 @@ static double wall_seconds(void)
     return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
-static void consider_example(EgtbDtmExamples *examples, uint64_t index,
-                             EgtbSide side, int16_t value)
-{
-    EgtbDtmExample *example;
-    if (value == EGTB_DRAW) {
-        if (!examples->draw.available || side < examples->draw_side ||
-            (side == examples->draw_side && index < examples->draw.index)) {
-            examples->draw = (EgtbDtmExample){index, value, true};
-            examples->draw_side = side;
-        }
-        return;
-    }
-    example = value > 0 ? &examples->longest_win[side]
-                        : &examples->longest_loss[side];
-    if (!example->available ||
-        (value > 0 ? value > example->dtm : value < example->dtm) ||
-        (value == example->dtm && index < example->index))
-        *example = (EgtbDtmExample){index, value, true};
-}
-
 static void print_dtm_example(const char *label, const EgIndexer *indexer,
                               const EgtbDtmExample *example, EgtbSide side)
 {
@@ -345,20 +325,20 @@ int main(int argc, char **argv)
 {
     EgtbMaterial requested, material;
     EgtbMaterialKind kind;
-    char path[128];
-    EgtbCreateOptions options = {0, 20, 1};
+    char path[128], work_path[160] = {0};
+    EgtbCreateOptions options = {0, 0, 1};
     EgtbGenerationStatistics generation;
     EgtbConsistencyStatistics final_verification = {0};
     EgtbStorageStatistics storage;
     EgtbCacheStatistics generation_dependencies = {0};
     EgtbCacheStatistics verification_dependencies = {0};
-    Bitmap verified_positions = {0};
     DatabaseCatalog *catalogs = NULL;
     void **probe_contexts = NULL;
     EgIndexer indexer;
     Egtb *database = NULL;
     EgtbResident *resident = NULL;
     EgtbDtmExamples examples = {0};
+    uint64_t resident_bytes_used = 0;
     uint64_t *histogram = NULL;
     uint64_t positions, resident_limit_bytes, verification_cache_bytes;
     uint64_t compilation_buffer_bytes;
@@ -373,7 +353,6 @@ int main(int argc, char **argv)
     double program_started = wall_seconds();
     double generation_started, phase_started;
     double setup_seconds, generation_seconds, finalize_seconds;
-    double compact_seconds, resident_load_seconds = 0.0;
     double verification_seconds, statistics_seconds;
     double total_seconds;
     if (argc == 2 && strcmp(argv[1], "--revision") == 0) {
@@ -402,7 +381,8 @@ int main(int argc, char **argv)
     }
     generation_cache_pages = GENERATION_CACHE_BYTES / page_size;
     readonly_cache_pages = READONLY_CACHE_BYTES / page_size;
-    options.cache_pages = generation_cache_pages;
+    /* Frontier compilation has its own assembly and compressed-batch buffers. */
+    options.cache_pages = 1;
     if (!configuration_bytes("EGTB_RESIDENT_LIMIT_GIB",
                              DEFAULT_RESIDENT_LIMIT_BYTES, true,
                              &resident_limit_bytes) ||
@@ -465,6 +445,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     indexer_initialized = true;
+    if (access(path, F_OK) == 0) {
+        fprintf(stderr, "database already exists: %s\n", path);
+        goto done;
+    }
+    snprintf(work_path, sizeof(work_path), "%s.incomplete", path);
     positions = eg_position_count(&indexer);
     catalogs = calloc(thread_count, sizeof(*catalogs));
     probe_contexts = calloc(thread_count, sizeof(*probe_contexts));
@@ -481,11 +466,10 @@ int main(int argc, char **argv)
                         "contains no men\n");
         sliced = false;
     }
-    printf("generating %s%s with %u thread%s, %u MiB writable cache total, "
+    printf("generating %s%s with %u thread%s, "
            "%u MiB dependency cache per worker/database\n",
            path, sliced ? " by man-row slices" : "", thread_count,
            thread_count == 1 ? "" : "s",
-           GENERATION_CACHE_BYTES / (1024 * 1024),
            DEPENDENCY_CACHE_BYTES / (1024 * 1024));
     printf("DTM pages: %u bytes (%u positions per side)\n",
            page_size, page_size / (unsigned)sizeof(int16_t));
@@ -519,7 +503,7 @@ int main(int argc, char **argv)
             generation_cache_pages,
             readonly_cache_pages,
             generation_cache_pages,
-            20,
+            0,
             options.compression_level,
             catalog_probe,
             &catalogs[0],
@@ -529,7 +513,7 @@ int main(int argc, char **argv)
             false,
             (size_t)compilation_buffer_bytes
         };
-        if (!egtb_generate_sliced(&database, path, &material, &indexer,
+        if (!egtb_generate_sliced(&database, work_path, &material, &indexer,
                                   &sliced_options, &generation)) {
             fprintf(stderr, "cannot generate sliced %s: %s\n", path,
                     egtb_sliced_last_error());
@@ -537,7 +521,7 @@ int main(int argc, char **argv)
         }
         created = true;
     } else {
-        if (!egtb_create(&database, path, positions - 1,
+        if (!egtb_create(&database, work_path, positions - 1,
                          page_size, &options)) {
             fprintf(stderr, "cannot create %s: %s\n", path,
                     egtb_last_error());
@@ -546,10 +530,10 @@ int main(int argc, char **argv)
         created = true;
         EgtbThreadOptions thread_options = {
             thread_count, generation_cache_pages, probe_contexts,
-            &verified_positions, (size_t)compilation_buffer_bytes
+            NULL, (size_t)compilation_buffer_bytes
         };
-        if (!egtb_generate_threaded(database, &indexer, catalog_probe,
-                                    &catalogs[0], NULL, NULL,
+        if (!egtb_compile_threaded(database, &indexer, catalog_probe,
+                                    &catalogs[0],
                                     &thread_options, &generation)) {
             const char *catalog_error = "";
             for (unsigned worker = 0; worker < thread_count; ++worker) {
@@ -567,108 +551,51 @@ int main(int argc, char **argv)
     generation_seconds = wall_seconds() - generation_started;
     catalog_cache_statistics(catalogs, thread_count,
                              &generation_dependencies);
+    /* The first full forward pass also supplies every histogram and example.
+     * The compact file remains unpublished throughout verification/repair. */
+    finalize_seconds = 0.0;
+    histogram = calloc((size_t)2 * 65536, sizeof(*histogram));
+    if (histogram == NULL) goto done;
     phase_started = wall_seconds();
-    egtb_progress_begin("finalize/close", UINT64_MAX, "");
-    if (!egtb_flush(database)) {
-        fprintf(stderr, "cannot finalize %s: %s\n", path, egtb_last_error());
+    EgtbVerificationOptions verify_options = {
+        thread_count, verification_cache_pages, probe_contexts, NULL
+    };
+    EgtbConsistencyStatistics repair = {0};
+    if (!egtb_finish_compiled(&database, work_path, &indexer,
+            catalog_probe, &catalogs[0], &verify_options, resident_limit_bytes,
+            &resident, &final_verification, &repair, histogram, &examples)) {
+        fprintf(stderr, "cannot verify compiled database %s: %s\n",
+                work_path, egtb_generator_last_error());
         goto done;
-    }
-    if (!egtb_close(database)) {
-        database = NULL;
-        fprintf(stderr, "cannot close %s: %s\n", path, egtb_last_error());
-        goto done;
-    }
-    database = NULL;
-    for (unsigned worker = 0; worker < thread_count; ++worker)
-        close_catalog(&catalogs[worker]);
-    egtb_progress_end(true);
-    finalize_seconds = wall_seconds() - phase_started;
-    phase_started = wall_seconds();
-    if (!egtb_compact_copy(path, readonly_cache_pages) ||
-        !egtb_open_readonly(&database, path, readonly_cache_pages)) {
-        fprintf(stderr, "cannot compact/reopen %s: %s\n", path,
-                egtb_last_error());
-        goto done;
-    }
-    compact_seconds = wall_seconds() - phase_started;
-    phase_started = wall_seconds();
-    {
-        uint64_t resident_bytes =
-            (egtb_maximum_index(database) + 1) * sizeof(EgtbEntry);
-        if (resident_limit_bytes != 0 &&
-            resident_bytes <= resident_limit_bytes) {
-            if (!egtb_resident_load(&resident, database, thread_count)) {
-                fprintf(stderr, "cannot load resident %s: %s\n", path,
-                        egtb_last_error());
-                goto done;
-            }
-            resident_load_seconds = wall_seconds() - phase_started;
-        }
-    }
-    phase_started = wall_seconds();
-    for (unsigned worker = 0; worker < thread_count; ++worker) {
-        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES);
-        probe_contexts[worker] = &catalogs[worker];
-    }
-    {
-        EgtbVerificationOptions verify_options = {
-            thread_count, verification_cache_pages, probe_contexts, resident
-        };
-        if (!egtb_verify_consistent_threaded(
-                database, &indexer, catalog_probe, &catalogs[0],
-                &verify_options,
-                verified_positions.words != NULL ? &verified_positions : NULL,
-                &final_verification)) {
-            const char *catalog_error = "";
-            for (unsigned worker = 0; worker < thread_count; ++worker) {
-                if (catalogs[worker].error[0] != '\0') {
-                    catalog_error = catalogs[worker].error;
-                    break;
-                }
-            }
-            fprintf(stderr, "fatal: compacted database %s failed final "
-                            "consistency verification: %s%s%s\n",
-                    path, egtb_generator_last_error(),
-                    *catalog_error ? ": " : "", catalog_error);
-            goto done;
-        }
     }
     verification_seconds = wall_seconds() - phase_started;
-    catalog_cache_statistics(catalogs, thread_count,
-                             &verification_dependencies);
+    generation.consistency_passes += 1 + repair.passes;
+    generation.consistency_updates[0] += repair.updates[0];
+    generation.consistency_updates[1] += repair.updates[1];
+    generation.maximum_dtm = final_verification.maximum_dtm;
+    catalog_cache_statistics(catalogs, thread_count, &verification_dependencies);
+    /* Dependency views stay warm across compilation and verification. Report
+     * this phase's increments, not the cumulative generation counters. */
+    verification_dependencies.lookups -= generation_dependencies.lookups;
+    verification_dependencies.hits -= generation_dependencies.hits;
+    verification_dependencies.misses -= generation_dependencies.misses;
+    verification_dependencies.decompressions -= generation_dependencies.decompressions;
+    verification_dependencies.dirty_evictions -= generation_dependencies.dirty_evictions;
+    verification_dependencies.compressed_writes -= generation_dependencies.compressed_writes;
     phase_started = wall_seconds();
-    egtb_progress_begin("statistics", positions, "positions");
-    uint64_t statistics_pending = 0;
-    if (!egtb_storage_statistics(database, &storage)) {
-        fprintf(stderr, "cannot read storage statistics for %s: %s\n",
-                path, egtb_last_error());
-        goto done;
-    }
-    histogram = calloc((size_t)2 * (UINT16_MAX + 1u), sizeof(*histogram));
-    if (histogram == NULL)
-        goto done;
-    if (resident != NULL) {
-        if (!egtb_resident_dtm_histogram(resident, histogram,
-                                         UINT16_MAX + 1u) ||
-            !egtb_find_dtm_examples(database, resident, &examples))
-            goto done;
-    } else {
-        examples.draw_side = EGTB_BLACK_TO_MOVE;
-        for (uint64_t index = 0; index < positions; ++index) {
-            for (unsigned side = 0; side < 2; ++side) {
-                int16_t value;
-                if (!egtb_get(database, index, (EgtbSide)side, &value))
-                    goto done;
-                ++histogram[(size_t)side * (UINT16_MAX + 1u) +
-                            (uint16_t)value];
-                consider_example(&examples, index, (EgtbSide)side, value);
-            }
-            egtb_progress_tick(&statistics_pending);
-        }
-    }
-    egtb_progress_flush(&statistics_pending);
-    egtb_progress_end(true);
+    if (!egtb_storage_statistics(database, &storage)) goto done;
     statistics_seconds = wall_seconds() - phase_started;
+    resident_bytes_used = resident != NULL ? egtb_resident_bytes(resident) : 0;
+    egtb_resident_destroy(resident);
+    resident = NULL;
+    if (!egtb_close(database)) { database = NULL; goto done; }
+    database = NULL;
+    phase_started = wall_seconds();
+    if (!egtb_publish(work_path, path)) {
+        fprintf(stderr, "cannot publish verified database: %s\n", egtb_last_error());
+        goto done;
+    }
+    finalize_seconds = wall_seconds() - phase_started;
     printf("generated %s: material=%u %u %u %u positions=%" PRIu64
            " maximum-index=%" PRIu64 " passes=%" PRIu64
            " maximum-dtm=%u threads=%u\n", path, material.white_kings,
@@ -678,11 +605,11 @@ int main(int argc, char **argv)
     printf("self-consistency: passes=%" PRIu64 " updates=%" PRIu64
            "/%" PRIu64 "\n", generation.consistency_passes,
            generation.consistency_updates[0], generation.consistency_updates[1]);
-    if (resident != NULL)
+    if (resident_bytes_used != 0)
         printf("final read-only consistency verification: threads=%u "
                "resident=%" PRIu64 " MiB positions-checked=%" PRIu64
                " positions-skipped=%" PRIu64 "\n",
-               thread_count, egtb_resident_bytes(resident) / (1024 * 1024),
+               thread_count, resident_bytes_used / (1024 * 1024),
                final_verification.positions_checked,
                final_verification.positions_skipped);
     else
@@ -764,13 +691,11 @@ int main(int argc, char **argv)
     printf("  %-28s %10.3f s\n", "final DTM scan",
            generation.final_scan_seconds);
     printf("  %-28s %10.3f s\n", "generator total", generation_seconds);
-    printf("  %-28s %10.3f s\n", "finalize/close", finalize_seconds);
-    printf("  %-28s %10.3f s\n", "compact/reopen", compact_seconds);
-    printf("  %-28s %10.3f s\n", "resident load", resident_load_seconds);
-    printf("  %-28s %10.3f s\n", "final verification",
+    printf("  %-28s %10.3f s\n", "durable publication", finalize_seconds);
+    printf("  %-28s %10.3f s\n", "verify + statistics/fallback",
            verification_seconds);
     printf("  %-28s %10.3f s\n",
-           resident != NULL ? "statistics extraction" : "statistics scan",
+           "storage metadata",
            statistics_seconds);
     printf("  %-28s %10.3f s\n", "total", total_seconds);
     ok = true;
@@ -791,12 +716,11 @@ done:
         free(catalogs);
     }
     free(probe_contexts);
-    bitmap_destroy(&verified_positions);
     if (indexer_initialized)
         eg_indexer_destroy(&indexer);
     free(histogram);
-    if (!ok && created)
-        unlink(path);
+    if (!ok && created && access(work_path, F_OK) == 0)
+        fprintf(stderr, "unpublished database retained at %s\n", work_path);
     egtb_progress_log("GWDEGTB revision %s %s\n", gwdegtb_revision,
            ok ? "completed" : "failed");
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;

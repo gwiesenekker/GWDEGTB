@@ -1779,7 +1779,28 @@ typedef struct {
     bool mismatch;
     bool failed;
     uint64_t progress_pending;
+    uint64_t *histogram;
+    EgtbDtmExamples examples;
+    uint16_t maximum_dtm;
 } ConsistencyVerifyWorker;
+
+static void merge_example(EgtbDtmExamples *examples, uint64_t index,
+                           EgtbSide side, int16_t value)
+{
+    EgtbDtmExample *e;
+    if (value == EGTB_DRAW) {
+        if (!examples->draw.available || side < examples->draw_side ||
+            (side == examples->draw_side && index < examples->draw.index)) {
+            examples->draw = (EgtbDtmExample){index, value, true};
+            examples->draw_side = side;
+        }
+        return;
+    }
+    e = value > 0 ? &examples->longest_win[side] : &examples->longest_loss[side];
+    if (!e->available || (value > 0 ? value > e->dtm : value < e->dtm) ||
+        (value == e->dtm && index < e->index))
+        *e = (EgtbDtmExample){index, value, true};
+}
 
 static void *run_consistency_verify_worker_body(void *opaque)
 {
@@ -1837,6 +1858,13 @@ static void *run_consistency_verify_worker_body(void *opaque)
                 return NULL;
             }
             ++worker->positions_checked;
+            if (worker->histogram != NULL) {
+                ++worker->histogram[(size_t)side * 65536 + (uint16_t)stored];
+                merge_example(&worker->examples, index, (EgtbSide)side, stored);
+            }
+            unsigned distance = stored == EGTB_DRAW ? 0 :
+                                stored < 0 ? (unsigned)-stored : (unsigned)stored;
+            if (distance > worker->maximum_dtm) worker->maximum_dtm = (uint16_t)distance;
             if (stored != expected) {
                 worker->mismatch = true;
                 worker->mismatch_index = index;
@@ -1860,12 +1888,13 @@ static void *run_consistency_verify_worker(void *opaque)
     return NULL;
 }
 
-bool egtb_verify_consistent_threaded(
+static bool verify_consistent_impl(
     Egtb *database, const EgIndexer *indexer,
     EgtbExternalProbe external_probe, void *external_context,
     const EgtbVerificationOptions *options,
     const Bitmap *verified_positions,
-    EgtbConsistencyStatistics *statistics)
+    EgtbConsistencyStatistics *statistics, uint64_t *histogram,
+    EgtbDtmExamples *examples)
 {
     EgtbConsistencyStatistics local = {0};
     ConsistencyVerifyWorker *workers = NULL;
@@ -1874,6 +1903,9 @@ bool egtb_verify_consistent_threaded(
     uint64_t entries_per_page;
     unsigned thread_count, created_threads = 0, i;
     bool ok = false;
+    if (statistics != NULL) memset(statistics, 0, sizeof(*statistics));
+    if (histogram != NULL) memset(histogram, 0, 2 * 65536 * sizeof(*histogram));
+    if (examples != NULL) memset(examples, 0, sizeof(*examples));
     if (database == NULL || indexer == NULL || options == NULL ||
         options->thread_count == 0 ||
         options->thread_count > EGTB_MAX_THREADS ||
@@ -1912,6 +1944,10 @@ bool egtb_verify_consistent_threaded(
         if (cache_pages == 0)
             cache_pages = 1;
         workers[i].database = database;
+        if (histogram != NULL || examples != NULL) {
+            workers[i].histogram = calloc(2 * 65536, sizeof(uint64_t));
+            if (workers[i].histogram == NULL) { fail("cannot allocate verification histogram"); goto done; }
+        }
         workers[i].indexer = indexer;
         workers[i].external_probe = external_probe;
         workers[i].external_context = options->external_contexts != NULL
@@ -1963,10 +1999,26 @@ join:
     if (created_threads != thread_count)
         goto done;
     local.passes = 1;
+    /* A storage/probe error takes precedence over a mismatch in another worker. */
+    for (i = 0; i < thread_count; ++i)
+        if (workers[i].failed) { fail("consistency verification worker %u failed", i); goto done; }
     for (i = 0; i < thread_count; ++i) {
         EgtbCacheStatistics cache;
         local.positions_checked += workers[i].positions_checked;
         local.positions_skipped += workers[i].positions_skipped;
+        if (workers[i].maximum_dtm > local.maximum_dtm) local.maximum_dtm = workers[i].maximum_dtm;
+        if (histogram != NULL)
+            for (size_t b = 0; b < 2 * 65536; ++b) histogram[b] += workers[i].histogram[b];
+        if (examples != NULL) {
+            for (unsigned s = 0; s < 2; ++s) {
+                EgtbDtmExample e = workers[i].examples.longest_win[s];
+                if (e.available) merge_example(examples, e.index, (EgtbSide)s, e.dtm);
+                e = workers[i].examples.longest_loss[s];
+                if (e.available) merge_example(examples, e.index, (EgtbSide)s, e.dtm);
+            }
+            EgtbDtmExample e = workers[i].examples.draw;
+            if (e.available) merge_example(examples, e.index, workers[i].examples.draw_side, e.dtm);
+        }
         egtb_view_cache_statistics(workers[i].scan_view, &cache);
         add_cache_statistics(&local.cache, &cache);
         egtb_view_cache_statistics(workers[i].successor_view, &cache);
@@ -1976,6 +2028,8 @@ join:
             goto done;
         }
         if (workers[i].mismatch) {
+            local.mismatch = true;
+            if (statistics != NULL) *statistics = local;
             fail("final consistency mismatch at index %llu, side %s: "
                  "stored=%d expected=%d",
                  (unsigned long long)workers[i].mismatch_index,
@@ -1998,10 +2052,63 @@ done:
             if (workers[i].successor_view != NULL &&
                 !egtb_view_close(workers[i].successor_view))
                 ok = false;
+            free(workers[i].histogram);
         }
     free(threads);
     free(workers);
     return ok;
+}
+
+bool egtb_verify_consistent_threaded(Egtb *db, const EgIndexer *idx,
+    EgtbExternalProbe probe, void *ctx, const EgtbVerificationOptions *opt,
+    const Bitmap *verified, EgtbConsistencyStatistics *stats)
+{
+    return verify_consistent_impl(db, idx, probe, ctx, opt, verified, stats, NULL, NULL);
+}
+
+bool egtb_verify_summary(Egtb *db, const EgIndexer *idx,
+    EgtbExternalProbe probe, void *ctx, const EgtbVerificationOptions *opt,
+    EgtbConsistencyStatistics *stats, uint64_t *hist, EgtbDtmExamples *examples)
+{
+    return verify_consistent_impl(db, idx, probe, ctx, opt, NULL, stats, hist, examples);
+}
+
+bool egtb_finish_compiled(Egtb **db, const char *path, const EgIndexer *idx,
+    EgtbExternalProbe probe, void *ctx, const EgtbVerificationOptions *opt,
+    uint64_t limit, EgtbResident **resident, EgtbConsistencyStatistics *verification,
+    EgtbConsistencyStatistics *repair, uint64_t *hist, EgtbDtmExamples *examples)
+{
+    if (!db || !*db || !opt || !resident || !verification || !repair)
+        return fail("invalid compiled finalization arguments");
+    *resident = NULL;
+    memset(repair, 0, sizeof(*repair));
+    memset(verification, 0, sizeof(*verification));
+    if (!egtb_close(*db)) { *db = NULL; return fail("cannot close compiled backing: %s", egtb_last_error()); }
+    *db = NULL;
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        if (!egtb_open_readonly(db, path, 1)) return fail("cannot reopen compiled backing: %s", egtb_last_error());
+        EgtbVerificationOptions options = *opt;
+        options.resident = NULL;
+        uint64_t n = eg_position_count(idx);
+        if (limit != 0 && n <= limit / sizeof(EgtbEntry)) {
+            if (!egtb_resident_load(resident, *db, options.thread_count))
+                return fail("cannot load compiled backing: %s", egtb_last_error());
+            options.resident = *resident;
+        }
+        if (egtb_verify_summary(*db, idx, probe, ctx, &options, verification, hist, examples)) return true;
+        if (!verification->mismatch || attempt != 0) return false;
+        egtb_progress_log("compiled DTM mismatch: running automatic repair before publication\n");
+        egtb_resident_destroy(*resident); *resident = NULL;
+        if (!egtb_close(*db)) { *db = NULL; return fail("cannot close failed verification backing"); }
+        *db = NULL;
+        if (!egtb_open_readwrite(db, path, 1)) return fail("cannot reopen for repair: %s", egtb_last_error());
+        options.resident = NULL;
+        if (!egtb_make_consistent_threaded(*db, idx, probe, ctx, NULL, NULL, &options, NULL, repair)) return false;
+        if (!egtb_close(*db)) { *db = NULL; return fail("cannot close repaired backing"); }
+        *db = NULL;
+        if (!egtb_compact_copy(path, 1)) return fail("cannot compact repaired backing: %s", egtb_last_error());
+    }
+    return false;
 }
 
 bool egtb_generate(Egtb *database, const EgIndexer *indexer,
@@ -2109,6 +2216,7 @@ typedef struct {
     FrontierStore *deferred; /* Loss candidates keyed by external max win. */
     Egtb *database;
     EgtbView *view;
+    EgtbPageWriter *writer;
     const EgIndexer *indexer;
     Bitmap *won[2];
     Bitmap *lost[2];
@@ -2449,8 +2557,10 @@ static void compile_frontier_range(FrontierWorker *worker)
         for (uint64_t offset = 0; offset < count; offset += per_page) {
             size_t page_count = count - offset < per_page
                                     ? (size_t)(count - offset) : per_page;
-            if (!egtb_view_write_page(worker->view, (first + offset) / per_page,
-                                      buffer + (size_t)offset, page_count)) {
+            if (!(worker->writer != NULL
+                    ? egtb_page_writer_put(worker->writer, buffer + (size_t)offset, page_count)
+                    : egtb_view_write_page(worker->view, (first + offset) / per_page,
+                                           buffer + (size_t)offset, page_count))) {
                 frontier_worker_error(worker, "cannot write compiled page: %s",
                                       egtb_last_error());
                 goto done;
@@ -2926,13 +3036,13 @@ done:
     return ok;
 }
 
-bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
+static bool generate_threaded_impl(Egtb *database, const EgIndexer *indexer,
                             EgtbExternalProbe external_probe,
                             void *external_context,
                             EgtbConsistencyReporter reporter,
                             void *reporter_context,
                             const EgtbThreadOptions *options,
-                            EgtbGenerationStatistics *statistics)
+                            EgtbGenerationStatistics *statistics, bool compile_only)
 {
     EgtbGenerationStatistics local = {0};
     EgtbConsistencyStatistics consistency = {0};
@@ -2953,7 +3063,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     double generation_started, phase_started;
 
     /* Retained temporarily for controlled A/B performance comparisons. */
-    if (getenv("EGTB_LEGACY_SCAN") != NULL)
+    if (!compile_only && getenv("EGTB_LEGACY_SCAN") != NULL)
         return egtb_generate_threaded_legacy(
             database, indexer, external_probe, external_context, reporter,
             reporter_context, options, statistics);
@@ -3117,6 +3227,10 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         goto done;
     }
     cache_shrunk = true;
+    if (compile_only && !egtb_prepare_compact(database)) {
+        fail("cannot prepare compact compilation: %s", egtb_last_error());
+        goto done;
+    }
     for (i = 0; i < thread_count; ++i) {
         uint64_t first_page = workers[i].first_index /
                               egtb_positions_per_page(database);
@@ -3144,8 +3258,10 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         workers[i].compilation_entries = buffer_entries;
         /* Only the output page(s) are cached; assembly has its own bounded
          * paired-entry buffer instead of a large random-write cache. */
-        if (!egtb_view_create_range(&workers[i].view, database, 2,
-                                    true, first_page, end_page)) {
+        if (!(compile_only
+                ? egtb_page_writer_create(&workers[i].writer, database, first_page, end_page)
+                : egtb_view_create_range(&workers[i].view, database, 2,
+                                         true, first_page, end_page))) {
             fail("cannot create compilation view %u: %s", i,
                  egtb_last_error());
             goto done;
@@ -3156,6 +3272,12 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     if (!run_frontier_workers(workers, threads, thread_count))
         goto done;
     for (i = 0; i < created_views; ++i) {
+        if (workers[i].writer != NULL) {
+            bool closed = egtb_page_writer_close(workers[i].writer);
+            workers[i].writer = NULL;
+            if (!closed) { fail("cannot finish compact batch: %s", egtb_last_error()); goto done; }
+            continue;
+        }
         if (!egtb_view_close(workers[i].view)) {
             workers[i].view = NULL;
             fail("cannot close compilation view %u: %s", i,
@@ -3165,7 +3287,7 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         workers[i].view = NULL;
     }
     created_views = 0;
-    if (!egtb_resize_cache(database, original_cache_pages)) {
+    if (!compile_only && !egtb_resize_cache(database, original_cache_pages)) {
         fail("cannot restore shared cache after compilation: %s",
              egtb_last_error());
         goto done;
@@ -3181,6 +3303,12 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
     bitmap_destroy(&lost[0]);
     bitmap_destroy(&won[1]);
     bitmap_destroy(&won[0]);
+    if (compile_only) {
+        local.total_seconds = monotonic_seconds() - generation_started;
+        if (statistics != NULL) *statistics = local;
+        ok = true;
+        goto done;
+    }
     if (options->verified_positions != NULL) {
         if (options->verified_positions->words != NULL ||
             !bitmap_create(options->verified_positions, position_count)) {
@@ -3212,6 +3340,12 @@ bool egtb_generate_threaded(Egtb *database, const EgIndexer *indexer,
         *statistics = local;
     ok = true;
 done:
+    if (workers != NULL)
+        for (i = 0; i < thread_count; ++i)
+            if (workers[i].writer != NULL) {
+                if (!egtb_page_writer_close(workers[i].writer)) ok = false;
+                workers[i].writer = NULL;
+            }
     for (i = 0; i < created_views; ++i)
         if (workers[i].view != NULL) {
             if (!egtb_view_close(workers[i].view))
@@ -3230,4 +3364,17 @@ done:
     free(threads);
     free(workers);
     return ok;
+}
+
+bool egtb_generate_threaded(Egtb *db, const EgIndexer *idx,
+    EgtbExternalProbe probe, void *ctx, EgtbConsistencyReporter reporter,
+    void *reporter_ctx, const EgtbThreadOptions *opt, EgtbGenerationStatistics *stats)
+{
+    return generate_threaded_impl(db, idx, probe, ctx, reporter, reporter_ctx, opt, stats, false);
+}
+
+bool egtb_compile_threaded(Egtb *db, const EgIndexer *idx,
+    EgtbExternalProbe probe, void *ctx, const EgtbThreadOptions *opt, EgtbGenerationStatistics *stats)
+{
+    return generate_threaded_impl(db, idx, probe, ctx, NULL, NULL, opt, stats, true);
 }

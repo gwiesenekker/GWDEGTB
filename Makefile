@@ -16,6 +16,12 @@ all: benchmark_tunstall
 all: benchmark_wdl3
 all: test_dtm16 test_progress test_8piece
 all: test_storage_safety
+all: test_compact_pipeline
+
+test_compact_pipeline: test_compact_pipeline.o generator_padded.o frontier.o bitmap.o movegen.o libgwdegtb.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test: test_compact_pipeline
 
 test_storage_safety: test_storage_safety.o libgwdegtb.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -125,6 +131,7 @@ benchmark_wdl3: benchmark_wdl3.o libgwdegtb.a
 
 test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_dtm16 test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap
 	./test_crc32c
+	./test_compact_pipeline
 	./test_progress
 	./test_8piece
 	./test_index
@@ -173,6 +180,7 @@ benchmark-wdl3: benchmark_wdl3
 test: test_progress test_8piece
 
 clean:
+	$(RM) test_compact_pipeline test_compact_pipeline.o
 	$(RM) test_storage_safety test_storage_safety.o
 	$(RM) test_crc32c test_crc32c.o
 	$(RM) test_8piece test_8piece.o

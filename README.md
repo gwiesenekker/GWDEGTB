@@ -329,11 +329,13 @@ unaligned buffers and partial final words.
 
 The file begins with a versioned header containing the page size and maximum
 index, followed by an in-memory directory with a 64-bit block offset and
-16-bit compressed length per page. A newly written block reserves 20% of the
-uncompressed page size by default. A dirty page that outgrows its slot is
-appended and its directory entry is updated. `egtb_compact()` rewrites only
-live blocks, removes reserved slack and abandoned blocks, and atomically
-installs the compacted file.
+16-bit compressed length per page. General writable storage supports a
+configurable minimum block reservation (20% of the uncompressed page in the
+library defaults). The compact compiler uses zero reserve and exact-sized
+blocks instead. A dirty page that outgrows its slot is appended and its
+directory entry is updated. `egtb_compact_copy()` removes holes while checking
+and preserving compressed blocks; `egtb_compact()` additionally recompresses.
+The normal successful generator path needs neither operation.
 
 DTM caches are direct-mapped by page number. Planar cache views retain the
 logical page and side throughout addressing; power-of-two slot counts per
@@ -405,8 +407,8 @@ toward 10 and, within each White row, Black rows from 9 toward 1, omitting
 empty frontier rows. A forward man move
 therefore either remains in the current slice or enters a completed read-only
 slice. Captures and promotions continue to use normal material dependencies.
-Each slice retains the full multithreaded frontier, consistency-repair, and
-read-only verification pipeline.
+Each slice uses compact compilation and mandatory full read-only verification,
+with automatic consistency repair only as a mismatch fallback.
 
 Slice indices are independently dense. Their position counts sum exactly to
 the normal full-index count. Empty slices are omitted: six or more men cannot
@@ -414,8 +416,8 @@ fit behind a frontier on their final single row. After every nonempty slice
 is verified, an up-to-9- or up-to-81-way
 monotonic merge reranks its positions with the unchanged full index and writes
 the standard DTM. Missing, duplicate, or out-of-order full indices are fatal.
-The completed full database then undergoes the normal compaction and exhaustive
-read-only consistency verification, so GWD and WDL compilation require no
+The completed full database then undergoes exhaustive read-only consistency
+verification before publication, so GWD and WDL compilation require no
 special handling.
 
 Temporary state is stored under `<database>.work`. A completed slice is first
@@ -508,56 +510,51 @@ compressed database for every mate distance.
    Deferred external candidates use a second compressed store with one file per
    worker; that store is released before final DTM compilation.
 
-8. **Compile the final DTM.** Each worker assembles a page-aligned batch of its
-   index range in a bounded, uncompressed paired-entry buffer initialized to
-   draws. It replays its existing compressed frontier streams from longest to
-   shortest distance, retaining shorter replacements for stale transpositions.
-   Completed WTM and BTM pages are compressed and written once, in index order
-   within each worker, without reading old pages. All-draw pages need no payload.
-   If a worker's range exceeds its buffer, it rereads its streams for each batch.
-   No extra partition files are created. This avoids random dirty-page evictions
-   and abandoned blocks during compilation; the normal reserved block slack
-   remains available for subsequent consistency repairs and is removed by final
-   compaction. Frontier files and the output DTM coexist until compilation ends.
+8. **Compile a compact temporary DTM.** Each worker assembles page-aligned
+   paired-entry buffers from its compressed frontier streams, replayed from
+   longest to shortest distance so shorter replacements win. It encodes WTM
+   and BTM pages separately and batches their compressed blocks into up to
+   4 MiB positional writes. A short mutex-protected offset reservation allocates
+   exactly the batch's byte count; compression and writes run outside the lock.
+   Blocks can interleave between workers, but directory offsets identify every
+   page. There is no reserved per-page padding and no abandoned batch tails.
+   Draw-only pages have no payload. Workers reread their streams if their range
+   exceeds the assembly buffer. No additional partition files are created.
+   All writers finish before the directory is flushed and verification starts.
 
-9. **Repair exact-DTM consistency.** The first snapshot pass recomputes both
-   side-to-move values for every legal position. Workers use a paired
-   sequential cursor over corresponding WTM and BTM pages for the scan and a
-   separate random-access successor view.
-   Corrections are merged and applied by one thread. Corrected positions and
-   their quiet predecessors/successors form the next sparse worklist; passes
-   continue until no correction remains. This remains a defensive check, not
-   an intended substitute for missing retrograde events. The corrected
-   frontier scheduler includes both terminal-zero and external-distance events.
+9. **Verify and collect statistics together.** The completed temporary file is
+   reopened read-only. If it fits the resident limit, it is checksum-verified
+   and decompressed in parallel into RAM; otherwise workers use separate
+   sequential and random-access cache views. One exhaustive parallel forward
+   check recomputes both side-to-move values for every position. During this
+   check workers collect WTM/BTM histograms (1 MiB per worker), exact maximum DTM,
+   and deterministic longest-win/loss and draw examples. These are merged for
+   the final output. The success path allocates no correction worklists or
+   verified-position bitmap and performs no separate statistics/example scan.
 
-10. **Maintain the maximum DTM without a database scan.** Each worker builds
-    a DTM histogram during the first consistency inspection (512 KiB/worker).
-    Applied corrections decrement the old bucket and increment the new bucket.
-    The nonempty buckets give the exact final maximum, even if repair removes
-    the last position at a formerly larger distance. `final DTM scan` is retained
-    in the timing summary as zero for the frontier generator; legacy paths still
-    perform their scan.
+10. **Repair only on a DTM mismatch.** I/O, checksum, codec and dependency-query
+    errors are fatal and do not trigger repair. A genuine value mismatch closes
+    the resident/read-only views, reopens the unpublished file writable, and
+    invokes the existing consistency repair algorithm. Exact-layout files
+    support in-place replacements that fit and append larger replacements.
+    Only this fallback runs checked block-copy compaction, followed by a fresh
+    full read-only verification that rebuilds histograms and examples. A second
+    mismatch is fatal. The legacy generation/repair APIs retain their existing
+    behavior for callers and regression comparisons.
 
-11. **Record verified positions.** The initial consistency pass also builds a
-    bitmap of positions already proved correct. Any correction and its quiet
-    predecessor closure are cleared from that bitmap. Final verification can
-    safely skip positions that remained verified.
+11. **Publish only a verified result.** Until success, the CLI uses
+    `<database>.dtm.incomplete`, never the final `.dtm` filename. After verifying
+    and collecting storage metadata it closes the backing, syncs the file,
+    renames it to the final name and syncs the parent directory. Successful runs
+    require no separate compaction, DTM scan or example scan. A failed complete
+    temporary database is retained for inspection; it is not advertised as a
+    valid DTM. An existing final database is not intentionally replaced.
 
-12. **Finalize and compact.** Dirty pages are flushed, the writable database is
-    closed, and live compressed blocks are copied without holes or recompression.
-    Every live page is decompressed and codec/CRC-validated before copying its
-    original compressed bytes. The compact file atomically replaces the working
-    file and is reopened read-only. Generation uses `egtb_compact_copy()`;
-    `egtb_compact(path, compression_level, cache_pages)` remains available for
-    explicit recompression at a requested level. File formats and the default
-    compression level are unchanged.
-
-13. **Verify the immutable result.** If the uncompressed database fits the
-    resident-memory limit, workers decompress disjoint pages into a shared flat
-    array using private Zstd contexts, `pread()`, and CRC32C validation. They
-    simultaneously build private DTM histograms, which are merged without a
-    separate statistics scan. Larger databases use a large read-only cache.
-    The final parallel consistency check is read-only and any mismatch is
+12. **Apply the same rule to slices.** Each slice must pass a full forward check
+    before it is durably published and recorded in the checksummed, durably
+    replaced manifest. Later slices therefore use only verified predecessors.
+    The full-index merge uses the compact writer too; its result is independently
+    verified before CLI publication. Normal WDL and GWD readers are unchanged.
     fatal.
 
 ## Memory, caches, and configuration
@@ -569,8 +566,9 @@ sixteen 64-bit bitmap words. Current production defaults are:
 |---|---:|
 | DTM page size (`EGTB_PAGE_SIZE`) | 2,048 bytes |
 | DTM Zstd compression (`EGTB_COMPRESSION_LEVEL`) | Level 1 |
-| Target writable cache | 1 GiB total |
+| Fresh compiled backing cache | One page; output uses batch buffers |
 | Frontier compilation assembly buffer | 1 GiB total, divided among workers |
+| Compact output batching | Up to 4 MiB plus 1 MiB record metadata per worker |
 | Dependency cache | 64 MiB per worker per opened dependency |
 | Ordinary read-only handle cache | 16 MiB |
 | Resident final-database limit | 32 GiB |
@@ -600,7 +598,7 @@ EGTB_COMPRESSION_LEVEL=6 EGTB_THREADS=16 ./3x2.sh
 The setting accepts positive levels from 1 through the linked Zstd library's
 maximum (currently 22), is printed at startup, and applies to new normal and
 sliced DTM files. Existing files retain their stored compression level, including
-completed slices when resuming a workspace. Final block-copy compaction preserves
+completed slices when resuming a workspace. Fallback block-copy compaction preserves
 the compressed blocks. Temporary frontier streams remain at level 1; WDL
 compression is independent and unchanged.
 
@@ -633,9 +631,12 @@ writes, storage ratios, and wall-clock time for each major phase.
 
 The detailed output below is a historical measurement, before revision 3.005.
 With terminal-zero propagation and deferred external loss candidates, this
-database now requires one consistency pass and zero corrections. Checked
-block-copy compaction replaces recompression, and the final DTM scan is folded
-into consistency histograms. An indicative single-run comparison on the same
+database requires one consistency pass and zero corrections. Revision 3.005
+replaced recompression with checked block-copy compaction and folded the final
+DTM scan into consistency histograms. Revision 3.102 goes further: direct compact
+compilation and one verification/statistics pass replace the normal repair,
+compaction and example-scan phases described in that historical output.
+An indicative single-run comparison on the same
 host (not a controlled scaling benchmark) gave:
 
 | Threads | Revision 3.004 total | Revision 3.005 total |

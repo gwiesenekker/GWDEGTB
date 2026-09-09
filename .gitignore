@@ -34,3 +34,4 @@
 /test_progress
 /test_8piece
 test_storage_safety
+test_compact_pipeline

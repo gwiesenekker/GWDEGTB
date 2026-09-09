@@ -77,6 +77,8 @@ struct Egtb {
     bool exact_layout;
     bool registered;
     unsigned references;
+    uint64_t compile_end;
+    bool compile_ready;
     unsigned view_count;
     unsigned writable_views;
     pthread_mutex_t mutex;
@@ -749,6 +751,165 @@ static bool store_page(Egtb *egtb, uint64_t page, const EgtbEntry *entries,
     return store_page_with_runtime(
         egtb, egtb->compressor, egtb->compressed,
         egtb->compressed_capacity, egtb->codec, page, entries, exact, false);
+}
+
+#define COMPILE_BATCH_BYTES (4u * 1024u * 1024u)
+struct EgtbPageWriter {
+    Egtb *database;
+    uint64_t next_page, end_page;
+    ZSTD_CCtx *compressor;
+    unsigned char *batch, *codec, *compressed;
+    int16_t *plane;
+    size_t used, records;
+    struct { uint64_t page; uint32_t offset; uint16_t length; } *record;
+};
+
+bool egtb_prepare_compact(Egtb *db)
+{
+    struct stat st;
+    if (db == NULL || db->readonly || db->view_count != 0 ||
+        db->format_version != EGTB_FORMAT_VERSION ||
+        fstat(fileno(db->file), &st) != 0 ||
+        (uint64_t)st.st_size != db->data_offset)
+        return fail("compact compiler requires a fresh v4 database");
+    for (uint64_t p = 0; p < db->page_count; ++p)
+        if (db->offsets[p] != 0 || db->lengths[p] != 0)
+            return fail("compact compiler requires an empty directory");
+    for (size_t i = 0; i < db->cache.capacity; ++i)
+        if (db->cache.entries[i].dirty)
+            return fail("compact compiler requires a clean cache");
+    db->exact_layout = true;
+    db->reserve_percent = 0;
+    db->compile_end = db->data_offset;
+    db->compile_ready = true;
+    return write_header(db);
+}
+
+static bool flush_compile_batch(EgtbPageWriter *w)
+{
+    Egtb *db = w->database;
+    if (w->used == 0) return true;
+    pthread_mutex_lock(&db->mutex);
+    uint64_t offset = db->compile_end;
+    bool fits = offset <= INT64_MAX - w->used;
+    if (fits) db->compile_end += w->used;
+    pthread_mutex_unlock(&db->mutex);
+    if (!fits) return fail("compiled file offset overflow");
+    /* write_at is an EINTR/short-write-safe positional writer. */
+    if (!write_at(db->file, offset, w->batch, w->used)) return false;
+    for (size_t i = 0; i < w->records; ++i) {
+        db->offsets[w->record[i].page] = offset + w->record[i].offset;
+        db->lengths[w->record[i].page] = w->record[i].length;
+    }
+    w->used = w->records = 0;
+    return true;
+}
+
+bool egtb_page_writer_create(EgtbPageWriter **out, Egtb *db,
+                             uint64_t first, uint64_t end)
+{
+    if (out == NULL) return fail("invalid page writer output");
+    *out = NULL;
+    if (db == NULL || db->readonly || !db->exact_layout ||
+        !db->compile_ready || first > end ||
+        end > db->side_page_count)
+        return fail("invalid compact writer range");
+    EgtbPageWriter *w = calloc(1, sizeof(*w));
+    if (w == NULL) return fail("cannot allocate compact writer");
+    w->database = db; w->next_page = first; w->end_page = end;
+    w->compressor = ZSTD_createCCtx();
+    w->batch = malloc(COMPILE_BATCH_BYTES);
+    w->codec = malloc(db->codec_capacity + db->memory_page_size);
+    w->compressed = malloc(db->compressed_capacity);
+    w->plane = malloc(db->memory_page_size);
+    w->record = malloc(65536 * sizeof(*w->record));
+    if (!w->compressor || !w->batch || !w->codec || !w->compressed ||
+        !w->plane || !w->record) {
+        w->end_page = first;
+        egtb_page_writer_close(w);
+        return fail("cannot allocate compact writer buffers");
+    }
+    *out = w;
+    return true;
+}
+
+bool egtb_page_writer_put(EgtbPageWriter *w, const EgtbEntry *entries, size_t count)
+{
+    if (w == NULL || entries == NULL || w->next_page >= w->end_page)
+        return fail("invalid compiled page");
+    Egtb *db = w->database;
+    uint64_t remaining = db->maximum_index + 1 - w->next_page * db->entries_per_page;
+    size_t expected = remaining < db->entries_per_page ? (size_t)remaining : db->entries_per_page;
+    if (count != expected) return fail("incorrect compiled page count");
+    for (unsigned side = 0; side < 2; ++side) {
+        bool draw = true;
+        for (size_t i = 0; i < db->entries_per_page; ++i) {
+            w->plane[i] = i >= count ? EGTB_STORED_DRAW :
+                side == 0 ? entries[i].white_to_move : entries[i].black_to_move;
+            if (w->plane[i] != EGTB_STORED_DRAW) draw = false;
+        }
+        if (draw) continue;
+        size_t encoded;
+        uint32_t checksum;
+        if (!encode_page(db, (EgtbEntry *)(void *)w->plane, w->codec, &encoded, &checksum)) return false;
+        size_t size = ZSTD_compressCCtx(w->compressor, w->compressed,
+                                      db->compressed_capacity, w->codec, encoded, db->compression_level);
+        if (ZSTD_isError(size) || size == 0 || size > UINT16_MAX)
+            return fail("cannot compress compiled page");
+        if ((w->used + 4 + size > COMPILE_BATCH_BYTES || w->records == 65536) &&
+            !flush_compile_batch(w)) return false;
+        w->record[w->records].page = w->next_page + side * db->side_page_count;
+        w->record[w->records].offset = (uint32_t)w->used;
+        w->record[w->records++].length = (uint16_t)size;
+        put_u32(w->batch + w->used, checksum);
+        memcpy(w->batch + w->used + 4, w->compressed, size);
+        w->used += 4 + size;
+    }
+    ++w->next_page;
+    return true;
+}
+
+bool egtb_page_writer_close(EgtbPageWriter *w)
+{
+    if (w == NULL) return true;
+    bool ok = w->next_page == w->end_page;
+    if (ok) ok = flush_compile_batch(w);
+    else fail("incomplete compact writer range");
+    ZSTD_freeCCtx(w->compressor); free(w->batch); free(w->codec);
+    free(w->compressed); free(w->plane); free(w->record); free(w);
+    return ok;
+}
+
+bool egtb_sync_parent(const char *path)
+{
+    if (path == NULL || *path == '\0') return fail("invalid parent path");
+    char *parent = strdup(path);
+    if (parent == NULL) return fail("cannot allocate parent path");
+    char *slash = strrchr(parent, '/');
+    if (slash == NULL) { free(parent); parent = strdup("."); }
+    else if (slash == parent) slash[1] = '\0';
+    else *slash = '\0';
+    if (parent == NULL) return fail("cannot allocate parent path");
+    int fd = open(parent, O_RDONLY | O_DIRECTORY);
+    free(parent);
+    if (fd < 0) return fail("cannot open parent directory: %s", strerror(errno));
+    bool ok = fsync(fd) == 0;
+    int saved = errno;
+    if (close(fd) != 0 && ok) { ok = false; saved = errno; }
+    return ok || fail("cannot sync parent directory: %s", strerror(saved));
+}
+
+bool egtb_publish(const char *temporary, const char *path)
+{
+    if (temporary == NULL || path == NULL) return fail("invalid publication paths");
+    int fd = open(temporary, O_RDONLY);
+    if (fd < 0) return fail("cannot open completed file: %s", strerror(errno));
+    bool ok = fsync(fd) == 0;
+    int saved = errno;
+    if (close(fd) != 0 && ok) { ok = false; saved = errno; }
+    if (!ok) return fail("cannot sync completed file: %s", strerror(saved));
+    if (rename(temporary, path) != 0) return fail("cannot publish file: %s", strerror(errno));
+    return egtb_sync_parent(path) && egtb_sync_parent(temporary);
 }
 
 static bool flush_cache_entry(Egtb *egtb, size_t index)
@@ -2335,7 +2496,7 @@ static bool compact_database(const char *path, int compression_level,
         fail("cannot replace compacted EGTB: %s", strerror(errno));
         goto done;
     }
-    ok = true;
+    ok = egtb_sync_parent(path);
 
 done:
     egtb_progress_end(ok);

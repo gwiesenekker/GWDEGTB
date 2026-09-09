@@ -39,6 +39,20 @@ typedef struct {
 typedef struct Egtb Egtb;
 typedef struct EgtbView EgtbView;
 typedef struct EgtbResident EgtbResident;
+typedef struct EgtbPageWriter EgtbPageWriter;
+
+/* Fresh-file compiler: prepare once before creating disjoint, ordered writers.
+ * Each writer must cover its full logical range exactly once. Close all writers
+ * before flushing or reading the backing. Batches reserve exact byte ranges. */
+bool egtb_prepare_compact(Egtb *database);
+bool egtb_page_writer_create(EgtbPageWriter **out, Egtb *database,
+                             uint64_t first_page, uint64_t end_page);
+bool egtb_page_writer_put(EgtbPageWriter *writer, const EgtbEntry *entries,
+                          size_t count);
+bool egtb_page_writer_close(EgtbPageWriter *writer);
+/* Durable publication; call only after validation and closing all handles. */
+bool egtb_publish(const char *temporary, const char *path);
+bool egtb_sync_parent(const char *path);
 
 /*
  * Forward-only paired-entry reader. The cache view must not be used by any

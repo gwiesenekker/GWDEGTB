@@ -113,7 +113,29 @@ typedef struct {
     EgtbCacheStatistics cache;
     /* Exact maximum after threaded repair, maintained through corrections. */
     uint16_t maximum_dtm;
+    /* Set only for a game-value mismatch, never for I/O/codec failures. */
+    bool mismatch;
 } EgtbConsistencyStatistics;
+
+/* Compile only into a fresh compact backing; caller MUST verify before use. */
+bool egtb_compile_threaded(Egtb *database, const EgIndexer *indexer,
+    EgtbExternalProbe probe, void *context, const EgtbThreadOptions *options,
+    EgtbGenerationStatistics *statistics);
+
+/* Full forward check with optional 2*65536 histogram and example outputs.
+ * Outputs are valid only on success; no verified-position skipping. */
+bool egtb_verify_summary(Egtb *database, const EgIndexer *indexer,
+    EgtbExternalProbe probe, void *context, const EgtbVerificationOptions *options,
+    EgtbConsistencyStatistics *statistics, uint64_t *histogram,
+    EgtbDtmExamples *examples);
+
+/* Close compiled backing, reopen read-only, verify; repair only value mismatches.
+ * Leaves a read-only backing on success, never publishes the path. */
+bool egtb_finish_compiled(Egtb **database, const char *path, const EgIndexer *indexer,
+    EgtbExternalProbe probe, void *context, const EgtbVerificationOptions *options,
+    uint64_t resident_limit, EgtbResident **resident,
+    EgtbConsistencyStatistics *verification, EgtbConsistencyStatistics *repair,
+    uint64_t *histogram, EgtbDtmExamples *examples);
 
 const char *egtb_generator_last_error(void);
 

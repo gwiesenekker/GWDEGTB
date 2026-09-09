@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <time.h>
 
 enum {
     SLICE_ROWS = 10,
@@ -138,7 +139,9 @@ done:
 
 static bool make_work_directory(char *buffer, size_t size, const char *path)
 {
-    int count = snprintf(buffer, size, "%s.work", path);
+    size_t length = strlen(path);
+    if (length >= 11 && strcmp(path + length - 11, ".incomplete") == 0) length -= 11;
+    int count = snprintf(buffer, size, "%.*s.work", (int)length, path);
     return count > 0 && (size_t)count < size;
 }
 
@@ -426,7 +429,7 @@ static bool write_manifest(const char *directory,
         sliced_fail("cannot commit slice manifest: %s", strerror(errno));
         goto done;
     }
-    if (rename(temporary, path) != 0) {
+    if (!egtb_publish(temporary, path)) {
         sliced_fail("cannot commit slice manifest: %s", strerror(errno));
         goto done;
     }
@@ -550,11 +553,10 @@ static bool generate_one_slice(const char *directory,
     char final_path[512], incomplete_path[512];
     EgIndexer indexer = {0};
     Egtb *database = NULL;
-    Bitmap verified = {0};
     EgtbGenerationStatistics generated = {0};
     EgtbConsistencyStatistics verification = {0};
     EgtbCreateOptions create_options = {
-        options->writable_cache_pages, options->reserve_percent,
+        1, options->reserve_percent,
         options->compression_level
     };
     bool ok = false;
@@ -591,11 +593,10 @@ static bool generate_one_slice(const char *directory,
     {
         EgtbThreadOptions thread_options = {
             options->thread_count, options->writable_cache_pages,
-            probe_contexts, &verified, options->compilation_buffer_bytes
+            probe_contexts, NULL, options->compilation_buffer_bytes
         };
-        if (!egtb_generate_threaded(
+        if (!egtb_compile_threaded(
                 database, &indexer, slice_probe, &contexts[0],
-                options->reporter, options->reporter_context,
                 &thread_options, &generated)) {
             const char *detail = "";
             for (unsigned i = 0; i < options->thread_count; ++i)
@@ -609,47 +610,35 @@ static bool generate_one_slice(const char *directory,
             goto done;
         }
     }
-    if (!egtb_close(database)) {
-        database = NULL;
-        sliced_fail("cannot close generated slice: %s", egtb_last_error());
+    EgtbVerificationOptions verify_options = {
+        options->thread_count, options->verification_cache_pages, probe_contexts, NULL
+    };
+    EgtbConsistencyStatistics repair = {0};
+    EgtbResident *resident = NULL;
+    struct timespec verify_start, verify_end;
+    clock_gettime(CLOCK_MONOTONIC, &verify_start);
+    if (!egtb_finish_compiled(&database, incomplete_path, &indexer,
+            slice_probe, &contexts[0], &verify_options, 0, &resident,
+            &verification, &repair, NULL, NULL)) {
+        sliced_fail("generated slice failed verification: %s", egtb_generator_last_error());
         goto done;
     }
-    database = NULL;
-    if (!egtb_compact_copy(incomplete_path,
-                           options->slice_read_cache_pages) ||
-        !egtb_open_readonly(&database, incomplete_path, 1)) {
-        sliced_fail("cannot compact generated slice: %s", egtb_last_error());
-        goto done;
-    }
-    {
-        EgtbVerificationOptions verify_options = {
-            options->thread_count, options->verification_cache_pages,
-            probe_contexts, NULL
-        };
-        if (!egtb_verify_consistent_threaded(
-                database, &indexer, slice_probe, &contexts[0],
-                &verify_options, verified.words != NULL ? &verified : NULL,
-                &verification)) {
-            const char *detail = "";
-            for (unsigned i = 0; i < options->thread_count; ++i)
-                if (contexts[i].error[0] != '\0') {
-                    detail = contexts[i].error;
-                    break;
-                }
-            sliced_fail("generated slice failed verification: %s%s%s",
-                        egtb_generator_last_error(), *detail ? ": " : "",
-                        detail);
-            goto done;
-        }
-    }
+    generated.consistency_passes = 1 + repair.passes;
+    generated.consistency_updates[0] = repair.updates[0];
+    generated.consistency_updates[1] = repair.updates[1];
+    generated.maximum_dtm = verification.maximum_dtm;
+    clock_gettime(CLOCK_MONOTONIC, &verify_end);
+    generated.consistency_seconds = (double)(verify_end.tv_sec - verify_start.tv_sec) +
+        (double)(verify_end.tv_nsec - verify_start.tv_nsec) / 1e9;
+    generated.total_seconds += generated.consistency_seconds;
     if (!egtb_close(database)) {
         database = NULL;
         sliced_fail("cannot close verified slice: %s", egtb_last_error());
         goto done;
     }
     database = NULL;
-    if (rename(incomplete_path, final_path) != 0) {
-        sliced_fail("cannot commit generated slice: %s", strerror(errno));
+    if (!egtb_publish(incomplete_path, final_path)) {
+        sliced_fail("cannot commit generated slice: %s", egtb_last_error());
         goto done;
     }
     *statistics = generated;
@@ -665,7 +654,6 @@ static bool generate_one_slice(const char *directory,
 done:
     if (database != NULL)
         egtb_close(database);
-    bitmap_destroy(&verified);
     for (unsigned i = 0; i < options->thread_count; ++i)
         close_probe_context(&contexts[i]);
     eg_indexer_destroy(&indexer);
@@ -755,6 +743,8 @@ static bool compile_slices(Egtb **out, const char *path,
     unsigned heap[81], heap_count = 0, slice_count = 0;
     char temporary[512];
     Egtb *output = NULL;
+    EgtbPageWriter *writer = NULL;
+    EgtbEntry *page_buffer = NULL;
     EgtbCreateOptions create_options = {64, 0, options->compression_level};
     uint64_t expected = 0, progress_pending = 0;
     int white_first = material->white_men == 0 ? -1 : 1;
@@ -804,16 +794,28 @@ static bool compile_slices(Egtb **out, const char *path,
         goto done;
     }
     egtb_progress_begin("slice merge", eg_position_count(full_indexer), "positions");
+    size_t per_page = egtb_positions_per_page(output), buffered = 0;
+    page_buffer = malloc(per_page * sizeof(*page_buffer));
+    if (page_buffer == NULL || !egtb_prepare_compact(output) ||
+        !egtb_page_writer_create(&writer, output, 0, egtb_page_count(output))) {
+        sliced_fail("cannot prepare compact slice merge: %s", egtb_last_error()); goto done;
+    }
     while (heap_count != 0) {
         unsigned selected = heap_pop(heap, &heap_count, slices);
         MergeSlice *slice = &slices[selected];
         if (slice->full_index != expected ||
-            !egtb_set_pair(output, expected, slice->white_to_move,
-                           slice->black_to_move)) {
+            !egtb_encode_dtm(slice->white_to_move, &page_buffer[buffered].white_to_move) ||
+            !egtb_encode_dtm(slice->black_to_move, &page_buffer[buffered].black_to_move)) {
             sliced_fail("slice merge index mismatch at %" PRIu64, expected);
             goto done;
         }
         ++expected;
+        if (++buffered == per_page || expected == eg_position_count(full_indexer)) {
+            if (!egtb_page_writer_put(writer, page_buffer, buffered)) {
+                sliced_fail("cannot write merged page: %s", egtb_last_error()); goto done;
+            }
+            buffered = 0;
+        }
         egtb_progress_tick(&progress_pending);
         if (slice->next_local < slice->count) {
             if (!load_merge_entry(slice, full_indexer))
@@ -826,6 +828,9 @@ static bool compile_slices(Egtb **out, const char *path,
                     " positions", expected, eg_position_count(full_indexer));
         goto done;
     }
+    bool writer_ok = egtb_page_writer_close(writer);
+    writer = NULL;
+    if (!writer_ok) { sliced_fail("cannot finish compact slice merge: %s", egtb_last_error()); goto done; }
     if (!egtb_close(output)) {
         output = NULL;
         sliced_fail("cannot close compiled full database: %s",
@@ -843,6 +848,8 @@ static bool compile_slices(Egtb **out, const char *path,
     output = NULL;
     ok = true;
 done:
+    if (writer != NULL) egtb_page_writer_close(writer);
+    free(page_buffer);
     egtb_progress_flush(&progress_pending);
     egtb_progress_end(ok);
     if (output != NULL)
