@@ -8,6 +8,9 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
+Current version: **3.3** (revision **3.301**).
+See [Version history](CHANGELOG.md) for changes in each tagged version.
+
 ## Highlights
 
 - Exact WTM and BTM distance-to-mate values in plies.
