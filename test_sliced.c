@@ -33,13 +33,17 @@ int main(int argc, char **argv)
     EgtbThreadOptions thread_options = {2, 64, NULL, &verified, 4096};
     EgtbSlicedOptions sliced_options = {
         2, 1024, 64, 4, 64, 20, 3,
-        draw_probe, NULL, NULL, NULL, NULL, true, 4096
+        draw_probe, NULL, NULL, NULL, NULL, true, 4096, 0
     };
     bool ok = false;
     uint32_t page_size = 1024;
-    if (argc == 2 && strcmp(argv[1], "2048") == 0)
+    if (argc >= 2 && strcmp(argv[1], "2048") == 0)
         page_size = 2048;
-    else if (argc != 1)
+    else if (argc >= 2 && strcmp(argv[1], "1024") != 0)
+        return EXIT_FAILURE;
+    if (argc == 3 && strcmp(argv[2], "resident") == 0)
+        sliced_options.resident_limit_bytes = 1048576;
+    else if (argc > 2)
         return EXIT_FAILURE;
     sliced_options.page_size = page_size;
     if (mkdtemp(directory) == NULL)
@@ -116,7 +120,12 @@ int main(int argc, char **argv)
     memset(&sliced_statistics, 0, sizeof(sliced_statistics));
     if (!egtb_generate_sliced(&sliced, sliced_path, &material, &indexer,
                               &sliced_options, &sliced_statistics) ||
-        sliced_statistics.retrograde_passes != first_sliced_passes)
+        sliced_statistics.retrograde_passes != first_sliced_passes ||
+        sliced_statistics.resumed_slices == 0 ||
+        sliced_statistics.initialization_seconds != 0 ||
+        sliced_statistics.backpropagation_seconds != 0 ||
+        sliced_statistics.compilation_seconds != 0 ||
+        sliced_statistics.consistency_seconds != 0)
         goto done;
     for (uint64_t index = 0; index < eg_position_count(&indexer); ++index)
         for (unsigned side = 0; side < 2; ++side) {

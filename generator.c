@@ -2543,8 +2543,9 @@ static void compile_frontier_range(FrontierWorker *worker)
             }
             for (unsigned side = 0; side < 2; ++side) {
                 worker->successor_side = (EgtbSide)side;
-                if (!frontier_store_visit(worker->frontiers, worker->owner,
+                if (!frontier_store_visit_range(worker->frontiers, worker->owner,
                                           (EgtbSide)side, value,
+                                          first, first + count,
                                           compile_frontier_entry, worker)) {
                     if (!worker->failed)
                         frontier_worker_error(worker,
@@ -3216,6 +3217,13 @@ static bool generate_threaded_impl(Egtb *database, const EgIndexer *indexer,
     phase_started = monotonic_seconds();
     frontier_store_destroy(deferred);
     deferred = NULL;
+    /* Backpropagation has joined all workers. Compilation only needs the
+     * frontier streams, not the outcome/candidate bitmaps. */
+    bitmap_destroy(&candidates);
+    bitmap_destroy(&lost[1]);
+    bitmap_destroy(&lost[0]);
+    bitmap_destroy(&won[1]);
+    bitmap_destroy(&won[0]);
     if (!frontier_store_finish(frontiers)) {
         fail("cannot finish frontier streams: %s", frontier_last_error());
         goto done;

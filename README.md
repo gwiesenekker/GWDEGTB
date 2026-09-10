@@ -67,6 +67,21 @@ make check-stats
 `make libgwdegtb.a` builds the static library used by GWD. Link it with Zstd
 and POSIX threads, for example `-L/path/to/GWDEGTB -lgwdegtb -lzstd -pthread`.
 
+### Retry an interrupted generation
+
+```sh
+./generate_egtb --restart -j 16 4 1 0 1
+./generate_egtb --restart --sliced -j 16 4 1 0 1
+```
+
+`--restart` deletes the target `.dtm` and leftover `.dtm.incomplete` before
+regeneration, without creating backups or acquiring locks. Run generation jobs
+serially; do not restart a database while another process is generating it.
+Slice checkpoints in `.dtm.work` are preserved for normal sliced-resume
+validation. Without `--restart`, existing outputs are not replaced. Family
+scripts pass `--restart` automatically. Old backups and lock files from earlier
+versions are left untouched and are no longer used.
+
 ### Verify a completed DTM
 
 `verify_dtm` opens a database strictly read-only and exhaustively checks both
@@ -362,11 +377,12 @@ For example:
 ```
 
 The accepted material range is 2..8 pieces, with at least one piece per side.
-The accepted thread count is 1..256. The target file must not already exist.
+The accepted thread count is 1..256. The target file must not already exist
+unless `--restart` is specified.
 Captures and promotions enter smaller or earlier material databases, so all
 dependencies must be present in the working directory. The supplied family
-scripts generate material in GWD order and remove each target immediately
-before regenerating it:
+scripts generate material in GWD order and use `--restart` to replace each
+target before regenerating it:
 
 ```sh
 EGTB_THREADS=16 ./1x1.sh
@@ -518,8 +534,19 @@ compressed database for every mate distance.
    exactly the batch's byte count; compression and writes run outside the lock.
    Blocks can interleave between workers, but directory offsets identify every
    page. There is no reserved per-page padding and no abandoned batch tails.
-   Draw-only pages have no payload. Workers reread their streams if their range
-   exceeds the assembly buffer. No additional partition files are created.
+   Each worker keeps its writer and ZSTD context across assembly buffers; no
+   worker waits for another worker's index range to finish. Compilation uses
+   the requested number of workers, without a separate compression pool.
+   Physical block order (and therefore file SHA-1) can differ between runs.
+   Compare decoded values for exact content equality, not whole-file hashes.
+   Draw-only pages have no payload. When a worker's range exceeds its assembly
+   buffer, it scans the frontier block directory for each buffer window, but
+   skips blocks outside that window before reading, decompressing or checking
+   their payload. Each block keeps minimum/maximum indices in RAM (16 extra
+   bytes per block); overlapping blocks retain record-level filtering and
+   checksum verification. This does not require sorted records.
+   The five outcome/candidate bitmaps are released before allocating assembly
+   buffers. No additional partition files are created.
    All writers finish before the directory is flushed and verification starts.
 
 9. **Verify and collect statistics together.** The completed temporary file is
@@ -622,10 +649,30 @@ paired logical pages, with a minimum of one such page per worker, and capped
 at each worker's position count. Sliced generation uses the same mechanism.
 
 Setting `EGTB_RESIDENT_LIMIT_GIB=0` disables the resident path. Resident
-loading is parallel. It is normally fastest when the complete four-byte-per-
+loading is parallel. This limit also applies separately to each newly generated
+slice: if its decoded size (four bytes per position for both sides) fits, the
+slice is loaded once and shared read-only by verification threads. Otherwise
+verification uses the cache budget from `EGTB_VERIFICATION_CACHE_GIB`.
+The resident slice is released before publication and before generating the
+next slice; previous-slice dependency caches remain separate. The log reports
+whether each slice used resident or cached verification. The resident limit
+is not a process-wide RAM cap, so leave room for dependencies and metadata.
+It is normally fastest when the complete four-byte-per-
 position database fits comfortably in physical RAM. The generator reports
 cache lookups, hits, misses, decompressions, dirty evictions, compressed
 writes, storage ratios, and wall-clock time for each major phase.
+
+The timing summary follows execution order: setup, initialization,
+backpropagation, frontier compilation, generation subtotal, verification plus
+statistics/fallback, storage metadata, durable publication, and total.
+The generation subtotal includes the generation phases above it; do not add it
+to them. Verification includes close/reopen and resident loading where enabled,
+plus any cold repair, compaction and reverification. Small administrative costs
+are included in the overall timing but are not all separate phase rows.
+For sliced generation, phase times are sums across newly generated slices,
+followed by slice verification/fallback and the full-index merge. Reused slice
+counts are reported, but their historic timings are excluded. The overall total
+is sampled before the optional post-publication slice-workspace cleanup.
 
 ## Example: 1 king + 1 man against 1 king + 1 man
 

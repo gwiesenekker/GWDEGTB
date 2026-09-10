@@ -69,6 +69,9 @@ typedef struct {
     double consistency_seconds;
     double final_scan_seconds;
     double total_seconds;
+    /* Current-invocation sliced timing; not persisted in slice manifests. */
+    double slice_merge_seconds;
+    uint64_t resumed_slices;
 } EgtbGenerationStatistics;
 
 typedef struct {

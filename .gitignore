@@ -27,6 +27,9 @@
 /libgwdegtb.a
 /revision.o
 /*.dtm
+/*.dtm.lock
+/*.dtm.incomplete
+/*.dtm.incomplete.failed.*
 /*.wdl
 /logs/
 /test_dtm16
@@ -35,3 +38,4 @@
 /test_8piece
 test_storage_safety
 test_compact_pipeline
+/test_frontier

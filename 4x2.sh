@@ -18,12 +18,10 @@ generate()
     black_kings=$3
     black_men=$4
     name="${white_kings}wX-${white_men}wO-${black_kings}bX-${black_men}bO"
-    database="$script_dir/$name.dtm"
     log="$log_dir/$name.log"
 
     printf 'Generating %s (log: %s)\n' "$name" "$log"
-    rm -f -- "$database"
-    if ./generate_egtb $sliced -j "$threads" "$white_kings" "$white_men" \
+    if ./generate_egtb --restart $sliced -j "$threads" "$white_kings" "$white_men" \
             "$black_kings" "$black_men" >"$log" 2>&1; then
         sed -n '/^generated /,$p' "$log"
     else

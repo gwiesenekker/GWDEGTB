@@ -19,6 +19,9 @@ typedef struct {
     void *reporter_context;
     bool quiet;
     size_t compilation_buffer_bytes;
+    /* Shared decoded current-slice data; zero disables resident verification.
+     * This is a per-slice limit, not multiplied by the number of threads. */
+    uint64_t resident_limit_bytes;
 } EgtbSlicedOptions;
 
 const char *egtb_sliced_last_error(void);

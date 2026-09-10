@@ -20,6 +20,12 @@ bool frontier_store_finish(FrontierStore *store);
 bool frontier_store_visit(FrontierStore *store, unsigned owner,
                           EgtbSide side, int16_t dtm,
                           FrontierVisitor visitor, void *context);
+/* Visit only indices in [first, end), skipping disjoint blocks before I/O.
+ * Records need not be sorted; visitation order is preserved. */
+bool frontier_store_visit_range(FrontierStore *store, unsigned owner,
+                                EgtbSide side, int16_t dtm,
+                                uint64_t first, uint64_t end,
+                                FrontierVisitor visitor, void *context);
 uint64_t frontier_store_count(const FrontierStore *store, EgtbSide side,
                               int16_t dtm);
 uint16_t frontier_store_maximum_distance(const FrontierStore *store);

@@ -52,21 +52,23 @@ static bool terminal(const DraughtsPosition *p, EgtbSide side, void *ctx, int16_
     *v = 0; return true;
 }
 
-static void pipeline(const char *directory, unsigned threads, bool resident_mode)
+static void pipeline(const char *directory, unsigned threads, bool resident_mode,
+                     uint32_t page_size)
 {
     char path[512], published[512];
     snprintf(path, sizeof(path), "%s/pipeline-%u-%u.incomplete", directory, threads, resident_mode);
     snprintf(published, sizeof(published), "%s/pipeline-%u-%u.dtm", directory, threads, resident_mode);
     EgIndexer idx = {0}; Egtb *db = NULL; EgtbResident *resident = NULL;
     EgtbCreateOptions create = {4, 20, 1};
-    EgtbThreadOptions genopt = {threads, 16, NULL, NULL, 4096};
+    /* One assembly page per worker forces repeated frontier replay. */
+    EgtbThreadOptions genopt = {threads, 16, NULL, NULL, 2 * page_size * threads};
     EgtbVerificationOptions verifyopt = {threads, 16, NULL, NULL};
     EgtbGenerationStatistics generated;
     EgtbConsistencyStatistics verification, repair;
     EgtbDtmExamples examples;
     uint64_t *histogram = calloc(2 * 65536, sizeof(*histogram)); REQUIRE(histogram);
     REQUIRE(eg_indexer_init(&idx, 0, 0, 1, 1));
-    REQUIRE(egtb_create(&db, path, eg_max_index(&idx), 2048, &create));
+    REQUIRE(egtb_create(&db, path, eg_max_index(&idx), page_size, &create));
     REQUIRE(egtb_compile_threaded(db, &idx, terminal, NULL, &genopt, &generated));
     REQUIRE(generated.consistency_passes == 0);
     REQUIRE(access(published, F_OK) != 0);
@@ -145,7 +147,8 @@ int main(void)
 {
     char directory[] = "/tmp/gwdegtb-pipeline-test-XXXXXX";
     REQUIRE(mkdtemp(directory));
-    pipeline(directory, 1, false); pipeline(directory, 4, true);
+    pipeline(directory, 1, false, 2048); pipeline(directory, 4, true, 2048);
+    pipeline(directory, 16, false, 128);
     batches(directory);
     REQUIRE(rmdir(directory) == 0);
     puts("compact pipeline: verification summaries, repair fallback, corruption rejection and batches PASS");

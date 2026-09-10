@@ -15,6 +15,8 @@
 
 typedef struct {
     uint64_t offset;
+    uint64_t minimum_index;
+    uint64_t maximum_index;
     uint32_t compressed_size;
     uint32_t checksum;
     uint16_t record_count;
@@ -181,6 +183,13 @@ static bool append_block(FrontierStore *store, unsigned owner_index,
     block->compressed_size = (uint32_t)compressed_size;
     block->checksum = checksum32(stream->pending, source_size);
     block->record_count = (uint16_t)stream->pending_count;
+    block->minimum_index = block->maximum_index = stream->pending[0];
+    for (unsigned i = 1; i < stream->pending_count; ++i) {
+        if (stream->pending[i] < block->minimum_index)
+            block->minimum_index = stream->pending[i];
+        if (stream->pending[i] > block->maximum_index)
+            block->maximum_index = stream->pending[i];
+    }
     owner->end_offset += compressed_size;
     stream->pending_count = 0;
     return true;
@@ -308,8 +317,9 @@ bool frontier_store_finish(FrontierStore *store)
     return true;
 }
 
-bool frontier_store_visit(FrontierStore *store, unsigned owner,
+static bool visit(FrontierStore *store, unsigned owner,
                           EgtbSide side, int16_t dtm,
+                          bool ranged, uint64_t first, uint64_t end,
                           FrontierVisitor visitor, void *context)
 {
     FrontierOwner *file;
@@ -317,7 +327,9 @@ bool frontier_store_visit(FrontierStore *store, unsigned owner,
     unsigned distance;
     size_t block_index;
     if (store == NULL || owner >= store->owner_count || visitor == NULL ||
-        !valid_frontier_dtm(dtm))
+        !valid_frontier_dtm(dtm) ||
+        (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE) ||
+        (ranged && first > end))
         return frontier_fail("invalid frontier visit");
     distance = distance_of(dtm);
     stream = get_stream(store, owner, side, distance);
@@ -329,6 +341,9 @@ bool frontier_store_visit(FrontierStore *store, unsigned owner,
         size_t output_size = block->record_count * sizeof(uint64_t);
         size_t decompressed;
         unsigned record;
+        if (ranged && (first == end || block->maximum_index < first ||
+                       block->minimum_index >= end))
+            continue;
         if (block->compressed_size > file->compressed_capacity ||
             !read_all_at(file->descriptor, block->offset, file->compressed,
                          block->compressed_size))
@@ -342,11 +357,30 @@ bool frontier_store_visit(FrontierStore *store, unsigned owner,
                                  ZSTD_getErrorName(decompressed));
         if (checksum32(file->records, output_size) != block->checksum)
             return frontier_fail("frontier block checksum mismatch");
-        for (record = 0; record < block->record_count; ++record)
+        for (record = 0; record < block->record_count; ++record) {
+            if (ranged && (file->records[record] < first ||
+                           file->records[record] >= end))
+                continue;
             if (!visitor(file->records[record], context))
                 return false;
+        }
     }
     return true;
+}
+
+bool frontier_store_visit(FrontierStore *store, unsigned owner,
+                          EgtbSide side, int16_t dtm,
+                          FrontierVisitor visitor, void *context)
+{
+    return visit(store, owner, side, dtm, false, 0, 0, visitor, context);
+}
+
+bool frontier_store_visit_range(FrontierStore *store, unsigned owner,
+                                EgtbSide side, int16_t dtm,
+                                uint64_t first, uint64_t end,
+                                FrontierVisitor visitor, void *context)
+{
+    return visit(store, owner, side, dtm, true, first, end, visitor, context);
 }
 
 uint64_t frontier_store_count(const FrontierStore *store, EgtbSide side,

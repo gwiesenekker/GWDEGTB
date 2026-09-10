@@ -18,6 +18,12 @@ all: test_dtm16 test_progress test_8piece
 all: test_storage_safety
 all: test_compact_pipeline
 
+test: generate_egtb
+
+.PHONY: test-restart
+test-restart: generate_egtb
+	sh ./test_restart.sh "$(CURDIR)/generate_egtb"
+
 test_compact_pipeline: test_compact_pipeline.o generator_padded.o frontier.o bitmap.o movegen.o libgwdegtb.a
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -131,7 +137,9 @@ benchmark_wdl3: benchmark_wdl3.o libgwdegtb.a
 
 test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_dtm16 test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap
 	./test_crc32c
+	./test_frontier
 	./test_compact_pipeline
+	sh ./test_restart.sh "$(CURDIR)/generate_egtb"
 	./test_progress
 	./test_8piece
 	./test_index
@@ -140,6 +148,8 @@ test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb
 	./test_slice_index
 	./test_sliced
 	./test_sliced 2048
+	./test_sliced 1024 resident
+	./test_sliced 2048 resident
 	./test_index 0 0 1 1
 	./test_index 1 1 1 0
 	./test_combinatorial_index
@@ -177,9 +187,13 @@ benchmark-tunstall: benchmark_tunstall
 benchmark-wdl3: benchmark_wdl3
 	@echo "usage: ./benchmark_wdl3 DIRECTORY DATABASE"
 
-test: test_progress test_8piece
+test_frontier: test_frontier.c frontier.c frontier.h
+	$(CC) $(CFLAGS) -o $@ test_frontier.c $(LDLIBS)
+
+test: test_progress test_8piece test_frontier
 
 clean:
+	$(RM) test_frontier
 	$(RM) test_compact_pipeline test_compact_pipeline.o
 	$(RM) test_storage_safety test_storage_safety.o
 	$(RM) test_crc32c test_crc32c.o

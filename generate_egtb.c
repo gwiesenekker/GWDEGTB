@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "egtb.h"
 #include "dtm_fen.h"
 #include "progress.h"
@@ -8,6 +9,7 @@
 #include "sliced.h"
 
 #include <errno.h>
+#include <sys/stat.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +21,48 @@
 #define GIBIBYTE (UINT64_C(1024) * 1024 * 1024)
 #define DEFAULT_RESIDENT_LIMIT_BYTES (UINT64_C(32) * GIBIBYTE)
 #define DEFAULT_VERIFICATION_CACHE_BYTES (UINT64_C(32) * GIBIBYTE)
+
+static bool prepare_restart(const char *path, const char *work_path, bool restart)
+{
+    struct stat st;
+    if (lstat(work_path, &st) == 0) {
+        if (!restart) {
+            fprintf(stderr, "unfinished database exists: %s; use --restart to remove it and retry\n", work_path);
+            return false;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            fprintf(stderr, "refusing to remove non-regular unfinished database: %s\n", work_path);
+            return false;
+        }
+        if (unlink(work_path) != 0) {
+            fprintf(stderr, "cannot remove %s for restart: %s\n", work_path, strerror(errno));
+            return false;
+        }
+        fprintf(stderr, "restart: removed unfinished database %s\n", work_path);
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "cannot inspect %s: %s\n", work_path, strerror(errno));
+        return false;
+    }
+    if (lstat(path, &st) == 0) {
+        if (!restart) {
+            fprintf(stderr, "database already exists: %s\n", path);
+            return false;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            fprintf(stderr, "refusing to remove non-regular database: %s\n", path);
+            return false;
+        }
+        if (unlink(path) != 0) {
+            fprintf(stderr, "cannot remove %s for restart: %s\n", path, strerror(errno));
+            return false;
+        }
+        fprintf(stderr, "restart: removed previous finished database %s\n", path);
+    } else if (errno != ENOENT) {
+        fprintf(stderr, "cannot inspect %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    return true;
+}
 
 enum {
     DEFAULT_GENERATION_PAGE_SIZE = 2048,
@@ -347,6 +391,7 @@ int main(int argc, char **argv)
     bool indexer_initialized = false;
     bool created = false;
     bool sliced = false;
+    bool restart = false;
     bool ok = false;
     unsigned thread_count = 1;
     int material_argument = 1;
@@ -402,6 +447,9 @@ int main(int argc, char **argv)
         if (strcmp(argv[material_argument], "--sliced") == 0) {
             sliced = true;
             ++material_argument;
+        } else if (strcmp(argv[material_argument], "--restart") == 0) {
+            restart = true;
+            ++material_argument;
         } else if (strcmp(argv[material_argument], "-j") == 0 &&
                    material_argument + 1 < argc) {
             if (!parse_thread_count(argv[material_argument + 1],
@@ -420,7 +468,7 @@ int main(int argc, char **argv)
         !parse_count(argv[material_argument + 1], &requested.white_men) ||
         !parse_count(argv[material_argument + 2], &requested.black_kings) ||
         !parse_count(argv[material_argument + 3], &requested.black_men)) {
-        fprintf(stderr, "usage: %s [--sliced] [-j THREADS] "
+        fprintf(stderr, "usage: %s [--restart] [--sliced] [-j THREADS] "
                         "NWHITE_KINGS NWHITE_MEN "
                         "NBLACK_KINGS NBLACK_MEN\n", argv[0]);
         return EXIT_FAILURE;
@@ -445,11 +493,8 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     indexer_initialized = true;
-    if (access(path, F_OK) == 0) {
-        fprintf(stderr, "database already exists: %s\n", path);
-        goto done;
-    }
     snprintf(work_path, sizeof(work_path), "%s.incomplete", path);
+    if (!prepare_restart(path, work_path, restart)) goto done;
     positions = eg_position_count(&indexer);
     catalogs = calloc(thread_count, sizeof(*catalogs));
     probe_contexts = calloc(thread_count, sizeof(*probe_contexts));
@@ -502,7 +547,7 @@ int main(int argc, char **argv)
             page_size,
             generation_cache_pages,
             readonly_cache_pages,
-            generation_cache_pages,
+            verification_cache_pages,
             0,
             options.compression_level,
             catalog_probe,
@@ -511,7 +556,8 @@ int main(int argc, char **argv)
             NULL,
             NULL,
             false,
-            (size_t)compilation_buffer_bytes
+            (size_t)compilation_buffer_bytes,
+            resident_limit_bytes
         };
         if (!egtb_generate_sliced(&database, work_path, &material, &indexer,
                                   &sliced_options, &generation)) {
@@ -679,24 +725,29 @@ int main(int argc, char **argv)
                (double)storage.file_bytes);
     total_seconds = wall_seconds() - program_started;
     printf("wall-clock timings:\n");
-    printf("  %-28s %10.3f s\n", "setup/create", setup_seconds);
+    if (sliced)
+        printf("  slice phases: sums for newly generated slices; %" PRIu64 " slices reused\n",
+               generation.resumed_slices);
+    printf("  %-28s %10.3f s\n", "setup", setup_seconds);
     printf("  %-28s %10.3f s\n", "initialization",
            generation.initialization_seconds);
     printf("  %-28s %10.3f s\n", "backpropagation",
            generation.backpropagation_seconds);
     printf("  %-28s %10.3f s\n", "frontier compilation",
            generation.compilation_seconds);
-    printf("  %-28s %10.3f s\n", "consistency repair",
-           generation.consistency_seconds);
-    printf("  %-28s %10.3f s\n", "final DTM scan",
-           generation.final_scan_seconds);
-    printf("  %-28s %10.3f s\n", "generator total", generation_seconds);
-    printf("  %-28s %10.3f s\n", "durable publication", finalize_seconds);
+    if (sliced) {
+        printf("  %-28s %10.3f s\n", "slice verification/fallback",
+               generation.consistency_seconds);
+        printf("  %-28s %10.3f s\n", "full-index merge",
+               generation.slice_merge_seconds);
+    }
+    printf("  %-28s %10.3f s\n", "generation subtotal", generation_seconds);
     printf("  %-28s %10.3f s\n", "verify + statistics/fallback",
            verification_seconds);
     printf("  %-28s %10.3f s\n",
            "storage metadata",
            statistics_seconds);
+    printf("  %-28s %10.3f s\n", "durable publication", finalize_seconds);
     printf("  %-28s %10.3f s\n", "total", total_seconds);
     ok = true;
     if (sliced && getenv("EGTB_KEEP_SLICES") == NULL &&

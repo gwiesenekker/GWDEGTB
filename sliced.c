@@ -554,6 +554,7 @@ static bool generate_one_slice(const char *directory,
     EgIndexer indexer = {0};
     Egtb *database = NULL;
     EgtbGenerationStatistics generated = {0};
+    EgtbResident *resident = NULL;
     EgtbConsistencyStatistics verification = {0};
     EgtbCreateOptions create_options = {
         1, options->reserve_percent,
@@ -614,11 +615,10 @@ static bool generate_one_slice(const char *directory,
         options->thread_count, options->verification_cache_pages, probe_contexts, NULL
     };
     EgtbConsistencyStatistics repair = {0};
-    EgtbResident *resident = NULL;
     struct timespec verify_start, verify_end;
     clock_gettime(CLOCK_MONOTONIC, &verify_start);
     if (!egtb_finish_compiled(&database, incomplete_path, &indexer,
-            slice_probe, &contexts[0], &verify_options, 0, &resident,
+            slice_probe, &contexts[0], &verify_options, options->resident_limit_bytes, &resident,
             &verification, &repair, NULL, NULL)) {
         sliced_fail("generated slice failed verification: %s", egtb_generator_last_error());
         goto done;
@@ -631,6 +631,16 @@ static bool generate_one_slice(const char *directory,
     generated.consistency_seconds = (double)(verify_end.tv_sec - verify_start.tv_sec) +
         (double)(verify_end.tv_nsec - verify_start.tv_nsec) / 1e9;
     generated.total_seconds += generated.consistency_seconds;
+    if (!options->quiet) {
+        if (resident != NULL)
+            egtb_progress_log("slice verification: resident=%" PRIu64 " bytes shared across %u threads\n",
+                              egtb_resident_bytes(resident), options->thread_count);
+        else
+            egtb_progress_log("slice verification: cached (resident limit=%" PRIu64 " bytes)\n",
+                              options->resident_limit_bytes);
+    }
+    egtb_resident_destroy(resident);
+    resident = NULL;
     if (!egtb_close(database)) {
         database = NULL;
         sliced_fail("cannot close verified slice: %s", egtb_last_error());
@@ -652,6 +662,7 @@ static bool generate_one_slice(const char *directory,
     }
     ok = true;
 done:
+    egtb_resident_destroy(resident);
     if (database != NULL)
         egtb_close(database);
     for (unsigned i = 0; i < options->thread_count; ++i)
@@ -873,6 +884,7 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
     SliceProbeContext *contexts = NULL;
     void **probe_contexts = NULL;
     EgtbGenerationStatistics total = {0};
+    struct timespec merge_start, merge_end;
     int white_first, white_last, black_first, black_last;
     bool ok = false;
     if (out == NULL || path == NULL || material == NULL ||
@@ -901,6 +913,7 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
         for (int black = black_first;; --black) {
             int ws = white < 0 ? 0 : white;
             int bs = black < 0 ? 0 : black;
+            bool resumed = completed[ws][bs];
             if (!completed[ws][bs]) {
                 EgtbGenerationStatistics generated = {0};
                 if (!generate_one_slice(directory, material, white, black,
@@ -919,7 +932,19 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
                        white < 0 ? 0 : white + 1,
                        black < 0 ? 0 : black + 1);
             }
-            add_generation_statistics(&total, &slice_statistics[ws][bs]);
+            EgtbGenerationStatistics current = slice_statistics[ws][bs];
+            if (resumed) {
+                /* Keep outcome/pass counts, but do not charge historic work
+                 * to this invocation's wall-clock timing. */
+                current.initialization_seconds = 0;
+                current.backpropagation_seconds = 0;
+                current.compilation_seconds = 0;
+                current.consistency_seconds = 0;
+                current.final_scan_seconds = 0;
+                current.total_seconds = 0;
+                ++total.resumed_slices;
+            }
+            add_generation_statistics(&total, &current);
             if (black == black_last)
                 break;
         }
@@ -930,8 +955,12 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
         egtb_progress_log("compiling completed slices into %s\n", path);
         fflush(stdout);
     }
+    clock_gettime(CLOCK_MONOTONIC, &merge_start);
     if (!compile_slices(out, path, directory, material, full_indexer, options))
         goto done;
+    clock_gettime(CLOCK_MONOTONIC, &merge_end);
+    total.slice_merge_seconds = (double)(merge_end.tv_sec - merge_start.tv_sec) +
+        (double)(merge_end.tv_nsec - merge_start.tv_nsec) / 1e9;
     if (statistics != NULL)
         *statistics = total;
     ok = true;
