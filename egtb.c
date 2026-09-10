@@ -989,7 +989,7 @@ static bool cached_page(Egtb *egtb, uint64_t page, size_t *result)
     if (!load_page(egtb, page, data))
         return false;
     entry->page_index = page;
-    entry->checksum = page_checksum(egtb, data);
+    entry->checksum = egtb->readonly ? 0 : page_checksum(egtb, data);
     entry->dirty = false;
     entry->valid = true;
     *result = index;
@@ -1428,7 +1428,6 @@ static bool view_load_page(EgtbView *view, uint64_t page, EgtbEntry *entries)
     Egtb *egtb = view->backing;
     uint64_t offset = egtb->offsets[page];
     uint16_t length = egtb->lengths[page];
-    unsigned char checksum_bytes[EGTB_BLOCK_HEADER_SIZE];
     uint32_t expected_checksum;
     int descriptor = fileno(egtb->file);
     if (offset == 0) {
@@ -1437,13 +1436,12 @@ static bool view_load_page(EgtbView *view, uint64_t page, EgtbEntry *entries)
     }
     if (descriptor < 0 || length > view->compressed_capacity)
         return fail("cannot read compressed page through cache view");
-    if (!pread_at(descriptor, offset, checksum_bytes,
-                  sizeof(checksum_bytes)) ||
-        !pread_at(descriptor, offset + EGTB_BLOCK_HEADER_SIZE,
-                  view->compressed, length))
+    if (!pread_at(descriptor, offset, view->compressed,
+                  EGTB_BLOCK_HEADER_SIZE + (size_t)length))
         return false;
-    expected_checksum = get_u32(checksum_bytes);
-    if (!decode_page(egtb, view->decompressor, view->compressed, length,
+    expected_checksum = get_u32(view->compressed);
+    if (!decode_page(egtb, view->decompressor,
+                      view->compressed + EGTB_BLOCK_HEADER_SIZE, length,
                       view->codec, entries, expected_checksum))
         return false;
     ++view->statistics.decompressions;
@@ -1513,7 +1511,7 @@ view_cache_miss(EgtbView *view, uint64_t page, size_t slot, EgtbEntry *data)
     if (!view_load_page(view, page, data))
         return NULL;
     entry->page_index = page;
-    entry->checksum = page_checksum(view->backing, data);
+    entry->checksum = view->writable ? page_checksum(view->backing, data) : 0;
     entry->valid = true;
     entry->dirty = false;
     return data;
@@ -1606,7 +1604,7 @@ bool egtb_view_create_range(EgtbView **out, Egtb *backing,
     view->compressed_capacity = ZSTD_compressBound(backing->codec_capacity);
     view->entries = calloc(cache_pages, sizeof(*view->entries));
     view->data = malloc(cache_pages * backing->memory_page_size);
-    view->compressed = malloc(view->compressed_capacity);
+    view->compressed = malloc(view->compressed_capacity + EGTB_BLOCK_HEADER_SIZE);
     view->codec = malloc(backing->codec_capacity + backing->memory_page_size);
     view->decompressor = ZSTD_createDCtx();
     if (writable)
@@ -1964,7 +1962,7 @@ static void *load_resident_pages(void *opaque)
     Egtb *egtb = worker->backing;
     ZSTD_DCtx *decompressor = ZSTD_createDCtx();
     size_t compressed_capacity = ZSTD_compressBound(egtb->codec_capacity);
-    unsigned char *compressed = malloc(compressed_capacity);
+    unsigned char *compressed = malloc(compressed_capacity + EGTB_BLOCK_HEADER_SIZE);
     unsigned char *decoded = malloc(egtb->memory_page_size);
     unsigned char *codec = malloc(egtb->codec_capacity + egtb->memory_page_size);
     uint64_t page;
@@ -1987,7 +1985,6 @@ static void *load_resident_pages(void *opaque)
         uint32_t valid_entries = remaining < egtb->entries_per_page
                                      ? (uint32_t)remaining
                                      : egtb->entries_per_page;
-        unsigned char checksum_bytes[EGTB_BLOCK_HEADER_SIZE];
         uint32_t expected_checksum;
             if (offset == 0) {
             fill_draw_page(egtb, destination);
@@ -2016,18 +2013,16 @@ static void *load_resident_pages(void *opaque)
             continue;
         }
         if (length > compressed_capacity ||
-            !pread_at(fileno(egtb->file), offset, checksum_bytes,
-                      sizeof(checksum_bytes)) ||
-            !pread_at(fileno(egtb->file),
-                      offset + EGTB_BLOCK_HEADER_SIZE,
-                      compressed, length)) {
+            !pread_at(fileno(egtb->file), offset, compressed,
+                      EGTB_BLOCK_HEADER_SIZE + (size_t)length)) {
             snprintf(worker->error, sizeof(worker->error), "%s",
                      egtb_last_error());
             worker->failed = true;
             break;
         }
-        expected_checksum = get_u32(checksum_bytes);
-        if (!decode_page(egtb, decompressor, compressed, length, codec,
+        expected_checksum = get_u32(compressed);
+        if (!decode_page(egtb, decompressor,
+                          compressed + EGTB_BLOCK_HEADER_SIZE, length, codec,
                           destination, expected_checksum)) {
             snprintf(worker->error, sizeof(worker->error),
                      "page %" PRIu64 ": %s", page, egtb_last_error());

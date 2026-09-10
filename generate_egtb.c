@@ -98,6 +98,7 @@ typedef struct {
     EgtbView *view;
     EgIndexer indexer;
     bool indexer_initialized;
+    EgtbCacheStatistics generation_statistics;
 } CatalogEntry;
 
 typedef struct {
@@ -204,6 +205,60 @@ static void print_cache_statistics(const char *label,
            statistics->dirty_evictions);
     printf("  %-22s %20" PRIu64 "\n", "Compressed writes",
            statistics->compressed_writes);
+}
+
+/* Private views remain warm; keep a generation snapshot for phase deltas. */
+static void snapshot_dependency_statistics(DatabaseCatalog *catalogs, unsigned n)
+{
+    for (unsigned t = 0; t < n; ++t)
+        for (unsigned wk = 0; wk <= EGTB_MAX_PIECES; ++wk)
+            for (unsigned wm = 0; wm <= EGTB_MAX_PIECES; ++wm)
+                for (unsigned bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
+                    for (unsigned bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
+                        CatalogEntry *e = &catalogs[t].entry[wk][wm][bk][bm];
+                        if (e->view != NULL)
+                            egtb_view_cache_statistics(e->view, &e->generation_statistics);
+                    }
+}
+
+static void print_dependency_statistics(const DatabaseCatalog *catalogs,
+                                         unsigned n, bool verification)
+{
+    printf("%s dependency caches by material (summed across workers):\n",
+           verification ? "final verification" : "generator");
+    printf("  %-27s %15s %15s %15s %8s %13s\n", "Database", "Lookups",
+           "Misses", "Decompressions", "Hit %", "Resident MiB");
+    for (unsigned wk = 0; wk <= EGTB_MAX_PIECES; ++wk)
+        for (unsigned wm = 0; wm <= EGTB_MAX_PIECES; ++wm)
+            for (unsigned bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
+                for (unsigned bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
+                    EgtbCacheStatistics sum = {0};
+                    uint64_t positions = 0;
+                    for (unsigned t = 0; t < n; ++t) {
+                        const CatalogEntry *e = &catalogs[t].entry[wk][wm][bk][bm];
+                        if (e->view == NULL) continue;
+                        EgtbCacheStatistics s = e->generation_statistics;
+                        if (verification) {
+                            egtb_view_cache_statistics(e->view, &s);
+                            s.lookups -= e->generation_statistics.lookups;
+                            s.hits -= e->generation_statistics.hits;
+                            s.misses -= e->generation_statistics.misses;
+                            s.decompressions -= e->generation_statistics.decompressions;
+                            s.dirty_evictions -= e->generation_statistics.dirty_evictions;
+                            s.compressed_writes -= e->generation_statistics.compressed_writes;
+                        }
+                        add_cache_statistics(&sum, &s);
+                        positions = egtb_maximum_index(e->database) + 1;
+                    }
+                    if (sum.lookups == 0) continue;
+                    char name[128];
+                    if (!egtb_material_filename(name, sizeof(name), wk, wm, bk, bm, "dtm"))
+                        continue;
+                    printf("  %-27s %15" PRIu64 " %15" PRIu64 " %15" PRIu64
+                           " %8.2f %13.2f\n", name, sum.lookups, sum.misses,
+                           sum.decompressions, 100.0 * (double)sum.hits / sum.lookups,
+                           (double)positions * sizeof(EgtbEntry) / (1024.0 * 1024.0));
+                }
 }
 
 static bool open_catalog_database(DatabaseCatalog *catalog,
@@ -597,6 +652,7 @@ int main(int argc, char **argv)
     generation_seconds = wall_seconds() - generation_started;
     catalog_cache_statistics(catalogs, thread_count,
                              &generation_dependencies);
+    snapshot_dependency_statistics(catalogs, thread_count);
     /* The first full forward pass also supplies every histogram and example.
      * The compact file remains unpublished throughout verification/repair. */
     finalize_seconds = 0.0;
@@ -673,6 +729,8 @@ int main(int argc, char **argv)
                            &final_verification.cache);
     print_cache_statistics("final verification dependency caches",
                            &verification_dependencies);
+    print_dependency_statistics(catalogs, thread_count, false);
+    print_dependency_statistics(catalogs, thread_count, true);
     for (unsigned side = 0; side < 2; ++side) {
         uint64_t wins = 0, losses = 0, draws = 0;
         for (int numeric = INT16_MIN; numeric <= INT16_MAX; ++numeric) {

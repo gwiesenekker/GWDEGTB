@@ -2,6 +2,17 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
+
+typedef struct { Bitmap *bitmap; uint64_t fresh; } Producer;
+static void *mark_all(void *opaque)
+{
+    Producer *p = opaque;
+    for (unsigned repeat = 0; repeat < 20; ++repeat)
+        for (uint64_t i = 0; i < p->bitmap->bit_count; ++i)
+            p->fresh += bitmap_set_new_atomic(p->bitmap, i);
+    return NULL;
+}
 
 #define CHECK(condition)                                                   \
     do {                                                                   \
@@ -30,6 +41,15 @@ int main(void)
         first = found + 1;
     }
     CHECK(!bitmap_find_next(&bitmap, first, &found));
+    for (uint64_t from = 0; from <= 300; ++from)
+        for (uint64_t end = from; end <= 300; ++end) {
+            uint64_t expected_index = from;
+            while (expected_index < end && !bitmap_test(&bitmap, expected_index))
+                ++expected_index;
+            bool have = bitmap_find_next_range(&bitmap, from, end, &found);
+            CHECK(have == (expected_index < end));
+            CHECK(!have || found == expected_index);
+        }
 
     bitmap_clear_range(&bitmap, 64, 256);
     CHECK(bitmap_test(&bitmap, 0));
@@ -52,6 +72,22 @@ int main(void)
     CHECK(bitmap_test(&bitmap, 299));
     bitmap_clear(&bitmap);
     CHECK(!bitmap_find_next(&bitmap, 0, &found));
+    CHECK(!bitmap_find_next_range(&bitmap, 0, 64, &found));
+    bitmap_set(&bitmap, 299);
+    CHECK(!bitmap_find_next_range(&bitmap, 0, 299, &found));
+    bitmap_clear(&bitmap);
+    Producer producers[8] = {0};
+    pthread_t threads[8];
+    for (unsigned t = 0; t < 8; ++t) {
+        producers[t].bitmap = &bitmap;
+        CHECK(pthread_create(&threads[t], NULL, mark_all, &producers[t]) == 0);
+    }
+    uint64_t fresh = 0;
+    for (unsigned t = 0; t < 8; ++t) {
+        CHECK(pthread_join(threads[t], NULL) == 0);
+        fresh += producers[t].fresh;
+    }
+    CHECK(fresh == 300);
     bitmap_destroy(&bitmap);
     puts("bitmap tests passed");
     return 0;

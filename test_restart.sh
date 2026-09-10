@@ -65,4 +65,27 @@ cmp sliced-original.dtm 0wX-1wO-0bX-1bO.dtm
 test -d 0wX-1wO-0bX-1bO.dtm.work
 grep -q '^  slice verification/fallback ' sliced.log
 grep -q '^  full-index merge ' sliced.log
+awk '
+ /^[^ ]/ {
+   mode=""
+   if ($0 == "generator dependency caches:") mode="g"
+   if ($0 == "final verification dependency caches:") mode="v"
+   if ($0 ~ /^generator dependency caches by material/) mode="gd"
+   if ($0 ~ /^final verification dependency caches by material/) mode="vd"
+ }
+ mode == "g" || mode == "v" {
+   if ($1 == "Lookups") expected[mode,1]=$2
+   if ($1 == "Misses") expected[mode,2]=$2
+   if ($1 == "Decompressions") expected[mode,3]=$2
+ }
+ (mode == "gd" || mode == "vd") && $1 ~ /[.]dtm$/ {
+   phase=substr(mode,1,1)
+   sum[phase,1]+=$2; sum[phase,2]+=$3; sum[phase,3]+=$4
+ }
+ END {
+   if (expected["g",1] == 0 || expected["v",1] == 0) exit 1
+   for (i=1;i<=3;i++)
+     if (sum["g",i] != expected["g",i] || sum["v",i] != expected["v",i]) exit 1
+ }
+' sliced.log
 printf 'Restart tests: PASS (replacement, no backups/locks, checkpoints, symlink refusal)\n'

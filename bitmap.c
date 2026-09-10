@@ -81,15 +81,23 @@ void bitmap_unset(Bitmap *bitmap, uint64_t index)
 
 void bitmap_set_atomic(Bitmap *bitmap, uint64_t index)
 {
+    (void)bitmap_set_new_atomic(bitmap, index);
+}
+
+bool bitmap_set_new_atomic(Bitmap *bitmap, uint64_t index)
+{
     uint64_t mask;
     assert(bitmap != NULL && bitmap->words != NULL);
     assert(index < bitmap->bit_count);
     mask = UINT64_C(1) << (index & 63u);
 #if defined(__GNUC__) || defined(__clang__)
-    __atomic_fetch_or(&bitmap->words[index >> 6], mask, __ATOMIC_RELAXED);
+    return (__atomic_fetch_or(&bitmap->words[index >> 6], mask,
+                               __ATOMIC_RELAXED) & mask) == 0;
 #else
     /* The threaded generator requires a compiler with atomic intrinsics. */
+    bool fresh = (bitmap->words[index >> 6] & mask) == 0;
     bitmap->words[index >> 6] |= mask;
+    return fresh;
 #endif
 }
 
@@ -103,15 +111,22 @@ bool bitmap_test(const Bitmap *bitmap, uint64_t index)
 
 bool bitmap_find_next(const Bitmap *bitmap, uint64_t first, uint64_t *found)
 {
+    return bitmap_find_next_range(bitmap, first, bitmap->bit_count, found);
+}
+
+bool bitmap_find_next_range(const Bitmap *bitmap, uint64_t first,
+                            uint64_t end, uint64_t *found)
+{
     size_t word_index;
     uint64_t word;
     assert(bitmap != NULL && bitmap->words != NULL && found != NULL);
-    if (first >= bitmap->bit_count)
+    assert(end <= bitmap->bit_count);
+    if (first >= end)
         return false;
     word_index = (size_t)(first >> 6);
     word = bitmap->words[word_index] & (UINT64_MAX << (first & 63u));
     while (word == 0) {
-        if (++word_index == bitmap->word_count)
+        if (++word_index == (size_t)((end + 63u) >> 6))
             return false;
         word = bitmap->words[word_index];
     }
@@ -128,5 +143,5 @@ bool bitmap_find_next(const Bitmap *bitmap, uint64_t first, uint64_t *found)
         *found = (uint64_t)word_index * 64u + bit;
     }
 #endif
-    return *found < bitmap->bit_count;
+    return *found < end;
 }

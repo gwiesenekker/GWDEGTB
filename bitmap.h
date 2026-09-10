@@ -19,7 +19,11 @@ void bitmap_set(Bitmap *bitmap, uint64_t index);
 void bitmap_unset(Bitmap *bitmap, uint64_t index);
 /* Thread-safe when several producers may set bits in the same word. */
 void bitmap_set_atomic(Bitmap *bitmap, uint64_t index);
+/* True only for the producer that changes the bit from zero to one. */
+bool bitmap_set_new_atomic(Bitmap *bitmap, uint64_t index);
 bool bitmap_test(const Bitmap *bitmap, uint64_t index);
 bool bitmap_find_next(const Bitmap *bitmap, uint64_t first, uint64_t *found);
+bool bitmap_find_next_range(const Bitmap *bitmap, uint64_t first,
+                            uint64_t end, uint64_t *found);
 
 #endif

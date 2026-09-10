@@ -1425,8 +1425,8 @@ static void *run_consistency_repair_worker_body(void *opaque)
         }
     } else {
         index = worker->first_index;
-        while (bitmap_find_next(worker->pending, index, &index) &&
-               index < worker->end_index) {
+        while (bitmap_find_next_range(worker->pending, index,
+                                       worker->end_index, &index)) {
             uint64_t current = index++;
             int16_t old_values[2];
             if (!egtb_view_get_pair(worker->scan_view, current,
@@ -2229,6 +2229,7 @@ typedef struct {
     int16_t distance;
     uint64_t source_count;
     uint64_t candidate_count;
+    uint64_t marked_candidates;
     uint64_t update_count;
     size_t compilation_entries;
     EgtbEntry *compilation_buffer;
@@ -2349,6 +2350,7 @@ static bool initialize_frontier_range(FrontierWorker *worker)
 typedef struct {
     const EgIndexer *indexer;
     Bitmap *candidates;
+    uint64_t *marked_candidates;
     bool failed;
 } FrontierCandidateContext;
 
@@ -2361,7 +2363,8 @@ static bool mark_frontier_candidate(const DraughtsPosition *predecessor,
     (void)forward_move;
     if (!position_index(context->indexer, predecessor, &index))
         return true;
-    bitmap_set_atomic(context->candidates, index);
+    if (bitmap_set_new_atomic(context->candidates, index))
+        ++*context->marked_candidates;
     return true;
 }
 
@@ -2403,6 +2406,7 @@ static bool process_frontier_source(uint64_t index, void *opaque)
     memset(&candidates, 0, sizeof(candidates));
     candidates.indexer = worker->indexer;
     candidates.candidates = worker->candidates;
+    candidates.marked_candidates = &worker->marked_candidates;
     if (!GENERATE_QUIET_PREDECESSORS(
             &position, worker->successor_side, mark_frontier_candidate,
             &candidates, &predecessor_count) || candidates.failed) {
@@ -2492,7 +2496,8 @@ static bool check_frontier_moves(const DraughtsPosition *position,
 static bool activate_deferred_candidate(uint64_t index, void *opaque)
 {
     FrontierWorker *worker = opaque;
-    bitmap_set_atomic(worker->candidates, index);
+    if (bitmap_set_new_atomic(worker->candidates, index))
+        ++worker->marked_candidates;
     return true;
 }
 
@@ -2610,8 +2615,8 @@ static void *run_frontier_worker_body(void *opaque)
         worker->work == FRONTIER_WORK_WIN_CANDIDATES) {
         uint64_t index = worker->first_index;
         EgtbSide mover = opposite_side(worker->successor_side);
-        while (bitmap_find_next(worker->candidates, index, &index) &&
-               index < worker->end_index) {
+        while (bitmap_find_next_range(worker->candidates, index,
+                                       worker->end_index, &index)) {
             uint64_t candidate = index++;
             ++worker->candidate_count;
             egtb_progress_tick(&worker->progress_pending);
@@ -2679,6 +2684,10 @@ static void *run_frontier_worker_body(void *opaque)
             }
             ++worker->update_count;
         }
+        /* All producers joined before evaluation. Each worker clears only
+         * its page/word-aligned range, ready for the next source stage. */
+        bitmap_clear_range(worker->candidates, worker->first_index,
+                            worker->end_index);
         return NULL;
     }
     if (worker->work == FRONTIER_WORK_COMPILE) {
@@ -2729,8 +2738,14 @@ static bool run_frontier_workers(FrontierWorker *workers, pthread_t *threads,
                     workers[0].work == FRONTIER_WORK_WON_SOURCES
                         ? workers[0].distance : -workers[0].distance);
     else
-        total = progress_bitmap_count(workers[0].candidates);
+        for (i = 0; i < thread_count; ++i)
+            total += workers[i].marked_candidates;
     egtb_progress_begin(label, total, "positions");
+    if ((workers[0].work == FRONTIER_WORK_LOSS_CANDIDATES ||
+         workers[0].work == FRONTIER_WORK_WIN_CANDIDATES) && total == 0) {
+        egtb_progress_end(true);
+        return true;
+    }
     for (i = 0; i < thread_count; ++i) {
         int error;
         workers[i].failed = false;
@@ -2802,12 +2817,14 @@ static bool frontier_backtrack_layer(
     uint64_t *update_count)
 {
     unsigned i;
-    bitmap_clear(candidates);
+    /* Starts zeroed; each completed evaluation clears its owned range. */
+    (void)candidates;
     for (i = 0; i < thread_count; ++i) {
         workers[i].successor_side = successor_side;
         workers[i].distance = distance;
         workers[i].source_count = 0;
         workers[i].candidate_count = 0;
+        workers[i].marked_candidates = 0;
         workers[i].update_count = 0;
         workers[i].work = won_sources ? FRONTIER_WORK_WON_SOURCES
                                       : FRONTIER_WORK_LOST_SOURCES;

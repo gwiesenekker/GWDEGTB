@@ -5,6 +5,17 @@ revision independently of individual commits; version 3.3 starts at 3.301.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
 
+## Unreleased — revision 3.302
+
+- Bound candidate and sparse repair searches to worker ranges. Count unique
+  candidate marks during production, skip empty evaluation, and clear owned
+  ranges in parallel after evaluation instead of serial full-bitmap clearing.
+- Omit writeback-only incremental checksums in read-only caches, retaining
+  disk CRC32C validation. Combine checksum/payload reads in cache views and
+  resident loading.
+- Report per-material dependency lookups, misses, decompressions, hit rate and
+  estimated shared resident-array size, separately for generation and verification.
+
 ## [3.3](https://github.com/gwiesenekker/GWDEGTB/tree/v3.3) — 2026-09-11
 
 ### Frontier compilation

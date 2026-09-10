@@ -8,8 +8,14 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.3** (revision **3.301**).
+Current version: **3.3** (working revision **3.302**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
+
+The summary includes per-material dependency cache statistics, summed across
+workers, separately for generation and final verification. `Resident MiB` is
+the estimated size of one shared, uncompressed paired 16-bit array, not memory
+currently allocated. Verification counters are phase deltas; dependency caches
+remain warm. Slice-internal cache traffic is not part of these material tables.
 
 ## Highlights
 
@@ -552,6 +558,10 @@ compressed database for every mate distance.
    checksum verification. This does not require sorted records.
    The five outcome/candidate bitmaps are released before allocating assembly
    buffers. No additional partition files are created.
+   Candidate searches stop at each worker's range boundary. Producers count
+   newly marked bits atomically, so progress totals need no full-bitmap scan.
+   Empty candidate evaluation is skipped; after evaluation workers clear their
+   own word-aligned ranges before the next source phase starts.
    All writers finish before the directory is flushed and verification starts.
 
 9. **Verify and collect statistics together.** The completed temporary file is
