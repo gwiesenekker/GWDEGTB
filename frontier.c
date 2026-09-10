@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "frontier.h"
+#include "crc32c.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -97,13 +98,7 @@ static const FrontierStream *get_const_stream(const FrontierStore *store,
 
 static uint32_t checksum32(const void *data, size_t size)
 {
-    const unsigned char *bytes = data;
-    uint32_t hash = UINT32_C(2166136261);
-    while (size-- != 0) {
-        hash ^= *bytes++;
-        hash *= UINT32_C(16777619);
-    }
-    return hash;
+    return crc32c(data, size);
 }
 
 static bool write_all_at(int descriptor, uint64_t offset, const void *data,

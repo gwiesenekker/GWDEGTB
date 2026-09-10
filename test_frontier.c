@@ -17,6 +17,7 @@ static bool cancel(uint64_t index, void *opaque)
 int main(void)
 {
     FrontierStore *store;
+    REQUIRE(checksum32("123456789", 9) == UINT32_C(0xe3069283));
     REQUIRE(frontier_store_create(&store, 2, 1));
     /* Reverse order, multiple blocks, duplicate, and partial tail. */
     for (unsigned i = 0; i < 1100; ++i)
@@ -38,6 +39,16 @@ int main(void)
                                          3, 0, 1100, cancel, NULL));
     REQUIRE(frontier_store_append(store, 1, EGTB_BLACK_TO_MOVE, 0, UINT64_MAX));
     REQUIRE(frontier_store_finish(store));
+    /* A bad checksum must reject an overlapping block, but disjoint blocks
+     * remain skippable without reading or validating their payload. */
+    FrontierStream *white = get_stream(store, 0, EGTB_WHITE_TO_MOVE, 3);
+    white->blocks[0].checksum ^= 1;
+    r = (Result){0, 1100, 0, 0};
+    REQUIRE(!frontier_store_visit(store, 0, EGTB_WHITE_TO_MOVE, 3, collect, &r));
+    REQUIRE(strstr(frontier_last_error(), "checksum mismatch") != NULL);
+    REQUIRE(frontier_store_visit_range(store, 0, EGTB_WHITE_TO_MOVE,
+                                        3, 1100, 2000, cancel, NULL));
+    white->blocks[0].checksum ^= 1;
     FrontierStream *s = get_stream(store, 1, EGTB_BLACK_TO_MOVE, 0);
     REQUIRE(s->blocks[0].minimum_index == UINT64_MAX);
     REQUIRE(s->blocks[0].maximum_index == UINT64_MAX);

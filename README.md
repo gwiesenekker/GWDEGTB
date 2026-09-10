@@ -518,7 +518,9 @@ compressed database for every mate distance.
    regenerated for this existential step. An existing shorter win is retained.
 
 7. **Store frontier streams.** Each worker writes 512-index blocks to one
-   checksummed Zstd-compressed append-only temporary file. Files are created as
+   CRC32C-checksummed Zstd-compressed append-only temporary file. Frontier
+   checksums use the same hardware-accelerated implementation and portable
+   fallback as DTM pages. Files are created as
    `.gwdegtb-frontier-*` in the working directory and immediately unlinked, so
    the filesystem reclaims them automatically when their descriptors close or
    the process exits. No global stream lock or collection of per-distance files

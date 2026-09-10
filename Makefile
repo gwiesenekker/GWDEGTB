@@ -187,7 +187,7 @@ benchmark-tunstall: benchmark_tunstall
 benchmark-wdl3: benchmark_wdl3
 	@echo "usage: ./benchmark_wdl3 DIRECTORY DATABASE"
 
-test_frontier: test_frontier.c frontier.c frontier.h
+test_frontier: test_frontier.c frontier.c frontier.h crc32c.h
 	$(CC) $(CFLAGS) -o $@ test_frontier.c $(LDLIBS)
 
 test: test_progress test_8piece test_frontier
