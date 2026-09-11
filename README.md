@@ -8,7 +8,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.3** (working revision **3.302**).
+Current version: **3.3** (working revision **3.303**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 The summary includes per-material dependency cache statistics, summed across
@@ -440,7 +440,16 @@ the normal full-index count. Empty slices are omitted: six or more men cannot
 fit behind a frontier on their final single row. After every nonempty slice
 is verified, an up-to-9- or up-to-81-way
 monotonic merge reranks its positions with the unchanged full index and writes
-the standard DTM. Missing, duplicate, or out-of-order full indices are fatal.
+the standard DTM. The merge uses the requested thread count, capped by the
+number of output pages. Workers own contiguous, page-aligned output ranges;
+binary searches locate the corresponding local ranges in every slice.
+Input files and immutable indexers are shared, while sequential readers,
+caches, compression contexts and batch writers are private. Compressed batches
+are written in unordered, hole-free layout, as in frontier compilation.
+Boundary postconditions, input/output coverage, and missing, duplicate or
+out-of-order full indices are checked in production. Checkpoints and file
+formats are unchanged; existing verified slices can be resumed and merged
+with a different thread count.
 The completed full database then undergoes exhaustive read-only consistency
 verification before publication, so GWD and WDL compilation require no
 special handling.

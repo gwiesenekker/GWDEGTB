@@ -14,6 +14,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 enum {
     SLICE_ROWS = 10,
@@ -54,6 +56,18 @@ typedef struct {
     int16_t black_to_move;
     bool has_previous;
 } MergeSlice;
+
+typedef struct {
+    MergeSlice *sources;
+    unsigned slice_count;
+    const EgIndexer *full_indexer;
+    Egtb *output;
+    uint64_t first_page, end_page, begin, end, consumed;
+    uint64_t local_begin[81], local_end[81];
+    atomic_bool *cancelled;
+    bool ok;
+    char error[256];
+} MergeWorker;
 
 static _Thread_local char sliced_error[256];
 
@@ -744,6 +758,113 @@ static void close_merge_slices(MergeSlice *slices, unsigned count)
     }
 }
 
+static bool merge_full_index(const MergeSlice *slice,
+                             const EgIndexer *full, uint64_t local,
+                             uint64_t *index)
+{
+    EgPosition position;
+    return eg_index_to_position(&slice->indexer, local, &position) &&
+           eg_position_to_index(full, &position, index);
+}
+
+/* A slice restricts the full indexer's ordered enumeration. Check both
+ * neighbours even in production: an invalid boundary must never omit data. */
+static bool merge_lower_bound(const MergeSlice *slice, const EgIndexer *full,
+                              uint64_t target, uint64_t *result)
+{
+    uint64_t lo = 0, hi = slice->count, index;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        if (!merge_full_index(slice, full, mid, &index))
+            return sliced_fail("cannot rank slice merge boundary");
+        if (index < target) lo = mid + 1;
+        else hi = mid;
+    }
+    if ((lo > 0 && (!merge_full_index(slice, full, lo - 1, &index) ||
+                    index >= target)) ||
+        (lo < slice->count && (!merge_full_index(slice, full, lo, &index) ||
+                              index < target)))
+        return sliced_fail("invalid slice merge lower bound");
+    *result = lo;
+    return true;
+}
+
+static void *merge_worker_main(void *argument)
+{
+    MergeWorker *worker = argument;
+    /* Shallow indexer copies borrow immutable tables from sources. Only
+     * private views are closed here; the coordinator owns the backings. */
+    MergeSlice slices[81] = {0};
+    unsigned heap[81], heap_count = 0;
+    uint64_t expected = worker->begin, pending = 0;
+    size_t per_page = egtb_positions_per_page(worker->output), buffered = 0;
+    EgtbEntry *buffer = malloc(per_page * sizeof(*buffer));
+    EgtbPageWriter *writer = NULL;
+    sliced_error[0] = '\0';
+    if (!buffer || !egtb_page_writer_create(&writer, worker->output,
+                                             worker->first_page, worker->end_page)) {
+        sliced_fail("cannot prepare merge worker: %s", egtb_last_error());
+        goto done;
+    }
+    for (unsigned i = 0; i < worker->slice_count; ++i) {
+        if (worker->local_begin[i] == worker->local_end[i]) continue;
+        slices[i] = worker->sources[i];
+        slices[i].next_local = worker->local_begin[i];
+        slices[i].count = worker->local_end[i];
+        if (!egtb_view_create(&slices[i].view, slices[i].database, 1, false) ||
+            !egtb_sequential_reader_init(&slices[i].reader, slices[i].view,
+                                         slices[i].next_local, slices[i].count) ||
+            !load_merge_entry(&slices[i], worker->full_indexer)) {
+            sliced_fail("cannot read merge input: %s", egtb_last_error());
+            goto done;
+        }
+        heap_push(heap, &heap_count, i, slices);
+    }
+    while (heap_count && !atomic_load_explicit(worker->cancelled, memory_order_relaxed)) {
+        unsigned selected = heap_pop(heap, &heap_count, slices);
+        MergeSlice *slice = &slices[selected];
+        if (expected >= worker->end || slice->full_index != expected ||
+            !egtb_encode_dtm(slice->white_to_move, &buffer[buffered].white_to_move) ||
+            !egtb_encode_dtm(slice->black_to_move, &buffer[buffered].black_to_move)) {
+            sliced_fail("slice merge index mismatch at %" PRIu64, expected);
+            goto done;
+        }
+        ++expected;
+        if (++buffered == per_page || expected == worker->end) {
+            if (!egtb_page_writer_put(writer, buffer, buffered)) {
+                sliced_fail("cannot write merged page: %s", egtb_last_error());
+                goto done;
+            }
+            buffered = 0;
+        }
+        egtb_progress_tick(&pending);
+        if (slice->next_local < slice->count) {
+            if (!load_merge_entry(slice, worker->full_indexer)) goto done;
+            heap_push(heap, &heap_count, selected, slices);
+        }
+    }
+    if (expected != worker->end) {
+        sliced_fail("slice merge incomplete or cancelled at %" PRIu64, expected);
+        goto done;
+    }
+    worker->consumed = expected - worker->begin;
+    worker->ok = true;
+done:
+    if (writer && !egtb_page_writer_close(writer)) {
+        if (worker->ok) sliced_fail("cannot finish merge writer: %s", egtb_last_error());
+        worker->ok = false;
+    }
+    if (!worker->ok) {
+        snprintf(worker->error, sizeof(worker->error), "%s", sliced_error);
+        atomic_store_explicit(worker->cancelled, true, memory_order_relaxed);
+    }
+    for (unsigned i = 0; i < worker->slice_count; ++i)
+        if (slices[i].view) egtb_view_close(slices[i].view);
+    free(buffer);
+    egtb_progress_flush(&pending);
+    return NULL;
+}
+
 static bool compile_slices(Egtb **out, const char *path,
                            const char *directory,
                            const EgtbMaterial *material,
@@ -751,13 +872,13 @@ static bool compile_slices(Egtb **out, const char *path,
                            const EgtbSlicedOptions *options)
 {
     MergeSlice slices[81];
-    unsigned heap[81], heap_count = 0, slice_count = 0;
+    unsigned slice_count = 0, worker_count = 0, started = 0;
     char temporary[512];
     Egtb *output = NULL;
-    EgtbPageWriter *writer = NULL;
-    EgtbEntry *page_buffer = NULL;
+    MergeWorker *workers = NULL;
+    pthread_t *threads = NULL;
+    atomic_bool cancelled = ATOMIC_VAR_INIT(false);
     EgtbCreateOptions create_options = {64, 0, options->compression_level};
-    uint64_t expected = 0, progress_pending = 0;
     int white_first = material->white_men == 0 ? -1 : 1;
     int white_last = last_white_slice_row(material);
     int black_first = material->black_men == 0 ? -1 : 8;
@@ -779,18 +900,12 @@ static bool compile_slices(Egtb **out, const char *path,
                                           white, black) ||
                 !egtb_open_readonly(&slice->database, slice_path, 1) ||
                 egtb_maximum_index(slice->database) !=
-                    eg_max_index(&slice->indexer) ||
-                !egtb_view_create(&slice->view, slice->database, 1, false)) {
+                    eg_max_index(&slice->indexer)) {
                 sliced_fail("cannot open slice for compilation: %s",
                             egtb_last_error());
                 goto done;
             }
             slice->count = eg_position_count(&slice->indexer);
-            if (!egtb_sequential_reader_init(&slice->reader, slice->view,
-                                             0, slice->count) ||
-                !load_merge_entry(slice, full_indexer))
-                goto done;
-            heap_push(heap, &heap_count, slice_index, slices);
             if (black == black_last)
                 break;
         }
@@ -805,43 +920,70 @@ static bool compile_slices(Egtb **out, const char *path,
         goto done;
     }
     egtb_progress_begin("slice merge", eg_position_count(full_indexer), "positions");
-    size_t per_page = egtb_positions_per_page(output), buffered = 0;
-    page_buffer = malloc(per_page * sizeof(*page_buffer));
-    if (page_buffer == NULL || !egtb_prepare_compact(output) ||
-        !egtb_page_writer_create(&writer, output, 0, egtb_page_count(output))) {
+    uint64_t positions = eg_position_count(full_indexer);
+    size_t per_page = egtb_positions_per_page(output);
+    uint64_t pages = (positions + per_page - 1) / per_page;
+    worker_count = options->thread_count;
+    if (worker_count > pages) worker_count = (unsigned)pages;
+    workers = calloc(worker_count, sizeof(*workers));
+    threads = calloc(worker_count, sizeof(*threads));
+    if (!workers || !threads || !egtb_prepare_compact(output)) {
         sliced_fail("cannot prepare compact slice merge: %s", egtb_last_error()); goto done;
     }
-    while (heap_count != 0) {
-        unsigned selected = heap_pop(heap, &heap_count, slices);
-        MergeSlice *slice = &slices[selected];
-        if (slice->full_index != expected ||
-            !egtb_encode_dtm(slice->white_to_move, &page_buffer[buffered].white_to_move) ||
-            !egtb_encode_dtm(slice->black_to_move, &page_buffer[buffered].black_to_move)) {
-            sliced_fail("slice merge index mismatch at %" PRIu64, expected);
+    for (unsigned t = 0; t < worker_count; ++t) {
+        MergeWorker *w = &workers[t];
+        w->sources = slices; w->slice_count = slice_count;
+        w->full_indexer = full_indexer; w->output = output;
+        w->cancelled = &cancelled;
+        w->first_page = pages / worker_count * t +
+            (t < pages % worker_count ? t : pages % worker_count);
+        unsigned next = t + 1;
+        w->end_page = pages / worker_count * next +
+            (next < pages % worker_count ? next : pages % worker_count);
+        w->begin = w->first_page * per_page;
+        w->end = w->end_page == pages ? positions : w->end_page * per_page;
+        uint64_t covered = 0;
+        for (unsigned s = 0; s < slice_count; ++s) {
+            if (!merge_lower_bound(&slices[s], full_indexer, w->begin, &w->local_begin[s]) ||
+                !merge_lower_bound(&slices[s], full_indexer, w->end, &w->local_end[s]))
+                goto done;
+            if (w->local_begin[s] != (t ? workers[t - 1].local_end[s] : 0) ||
+                w->local_end[s] < w->local_begin[s] ||
+                (next == worker_count && w->local_end[s] != slices[s].count)) {
+                sliced_fail("slice merge input partition mismatch"); goto done;
+            }
+            uint64_t length = w->local_end[s] - w->local_begin[s];
+            if (length > w->end - w->begin - covered) {
+                sliced_fail("slice merge range coverage overflow"); goto done;
+            }
+            covered += length;
+        }
+        if (covered != w->end - w->begin) {
+            sliced_fail("slice merge range coverage mismatch"); goto done;
+        }
+    }
+    for (unsigned t = 0; t < worker_count; ++t) {
+        int error = pthread_create(&threads[t], NULL, merge_worker_main, &workers[t]);
+        if (error) {
+            atomic_store_explicit(&cancelled, true, memory_order_relaxed);
+            sliced_fail("cannot start merge worker: %s", strerror(error));
             goto done;
         }
-        ++expected;
-        if (++buffered == per_page || expected == eg_position_count(full_indexer)) {
-            if (!egtb_page_writer_put(writer, page_buffer, buffered)) {
-                sliced_fail("cannot write merged page: %s", egtb_last_error()); goto done;
-            }
-            buffered = 0;
-        }
-        egtb_progress_tick(&progress_pending);
-        if (slice->next_local < slice->count) {
-            if (!load_merge_entry(slice, full_indexer))
-                goto done;
-            heap_push(heap, &heap_count, selected, slices);
-        }
+        ++started;
     }
-    if (expected != eg_position_count(full_indexer)) {
-        sliced_fail("slice merge produced %" PRIu64 " of %" PRIu64
-                    " positions", expected, eg_position_count(full_indexer));
+    for (unsigned t = 0; t < started; ++t) pthread_join(threads[t], NULL);
+    started = 0;
+    uint64_t consumed = 0;
+    for (unsigned t = 0; t < worker_count; ++t) {
+        if (!workers[t].ok) {
+            sliced_fail("merge worker %u failed: %s", t, workers[t].error); goto done;
+        }
+        consumed += workers[t].consumed;
+    }
+    if (consumed != positions) {
+        sliced_fail("slice merge total coverage mismatch");
         goto done;
     }
-    bool writer_ok = egtb_page_writer_close(writer);
-    writer = NULL;
-    if (!writer_ok) { sliced_fail("cannot finish compact slice merge: %s", egtb_last_error()); goto done; }
     if (!egtb_close(output)) {
         output = NULL;
         sliced_fail("cannot close compiled full database: %s",
@@ -859,9 +1001,9 @@ static bool compile_slices(Egtb **out, const char *path,
     output = NULL;
     ok = true;
 done:
-    if (writer != NULL) egtb_page_writer_close(writer);
-    free(page_buffer);
-    egtb_progress_flush(&progress_pending);
+    for (unsigned t = 0; t < started; ++t) pthread_join(threads[t], NULL);
+    free(threads);
+    free(workers);
     egtb_progress_end(ok);
     if (output != NULL)
         egtb_close(output);

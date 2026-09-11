@@ -150,6 +150,9 @@ test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb
 	./test_sliced 2048
 	./test_sliced 1024 resident
 	./test_sliced 2048 resident
+	./test_sliced 1024 cached nine
+	./test_sliced 2048 resident wide-nine
+	./test_sliced 1024 cached wide-81
 	./test_index 0 0 1 1
 	./test_index 1 1 1 0
 	./test_combinatorial_index

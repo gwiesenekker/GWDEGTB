@@ -41,9 +41,19 @@ int main(int argc, char **argv)
         page_size = 2048;
     else if (argc >= 2 && strcmp(argv[1], "1024") != 0)
         return EXIT_FAILURE;
-    if (argc == 3 && strcmp(argv[2], "resident") == 0)
+    if (argc >= 3 && strcmp(argv[2], "resident") == 0)
         sliced_options.resident_limit_bytes = 1048576;
-    else if (argc > 2)
+    else if (argc >= 3 && strcmp(argv[2], "cached") != 0)
+        return EXIT_FAILURE;
+    if (argc == 4 && strcmp(argv[3], "nine") == 0)
+        material = (EgtbMaterial){1, 0, 0, 1};
+    else if (argc == 4 && strcmp(argv[3], "wide-nine") == 0)
+        material = (EgtbMaterial){2, 0, 0, 1};
+    else if (argc == 4 && strcmp(argv[3], "wide-81") == 0)
+        material = (EgtbMaterial){1, 1, 0, 1};
+    else if (argc == 4 && strcmp(argv[3], "benchmark") == 0)
+        material = (EgtbMaterial){1, 1, 1, 1};
+    else if (argc > 3)
         return EXIT_FAILURE;
     sliced_options.page_size = page_size;
     if (mkdtemp(directory) == NULL)
@@ -53,7 +63,8 @@ int main(int argc, char **argv)
     snprintf(sliced_path, sizeof(sliced_path), "%s/sliced.dtm", directory);
     snprintf(manifest_path, sizeof(manifest_path), "%s.work/manifest",
              sliced_path);
-    if (!eg_indexer_init(&indexer, 1, 1, 0, 0) ||
+    if (!eg_indexer_init(&indexer, material.white_men, material.black_men,
+                         material.white_kings, material.black_kings) ||
         !egtb_create(&unsliced, unsliced_path,
                      eg_position_count(&indexer) - 1, page_size,
                      &create_options) ||
@@ -117,24 +128,33 @@ int main(int argc, char **argv)
             fputc(original, manifest) == EOF || fclose(manifest) != 0)
             goto done;
     }
-    memset(&sliced_statistics, 0, sizeof(sliced_statistics));
-    if (!egtb_generate_sliced(&sliced, sliced_path, &material, &indexer,
-                              &sliced_options, &sliced_statistics) ||
-        sliced_statistics.retrograde_passes != first_sliced_passes ||
-        sliced_statistics.resumed_slices == 0 ||
-        sliced_statistics.initialization_seconds != 0 ||
-        sliced_statistics.backpropagation_seconds != 0 ||
-        sliced_statistics.compilation_seconds != 0 ||
-        sliced_statistics.consistency_seconds != 0)
-        goto done;
-    for (uint64_t index = 0; index < eg_position_count(&indexer); ++index)
-        for (unsigned side = 0; side < 2; ++side) {
-            int16_t expected = 0, actual = 0;
-            if (!egtb_get(unsliced, index, (EgtbSide)side, &expected) ||
-                !egtb_get(sliced, index, (EgtbSide)side, &actual) ||
-                expected != actual)
-                goto done;
-        }
+    const unsigned merge_threads[] = {1, 2, 4, 8, 16};
+    for (unsigned run = 0; run < sizeof(merge_threads) / sizeof(merge_threads[0]); ++run) {
+        sliced_options.thread_count = merge_threads[run];
+        memset(&sliced_statistics, 0, sizeof(sliced_statistics));
+        if (!egtb_generate_sliced(&sliced, sliced_path, &material, &indexer,
+                                  &sliced_options, &sliced_statistics) ||
+            sliced_statistics.retrograde_passes != first_sliced_passes ||
+            sliced_statistics.resumed_slices == 0 ||
+            sliced_statistics.initialization_seconds != 0 ||
+            sliced_statistics.backpropagation_seconds != 0 ||
+            sliced_statistics.compilation_seconds != 0 ||
+            sliced_statistics.consistency_seconds != 0)
+            goto done;
+        for (uint64_t index = 0; index < eg_position_count(&indexer); ++index)
+            for (unsigned side = 0; side < 2; ++side) {
+                int16_t expected = 0, actual = 0;
+                if (!egtb_get(unsliced, index, (EgtbSide)side, &expected) ||
+                    !egtb_get(sliced, index, (EgtbSide)side, &actual) ||
+                    expected != actual)
+                    goto done;
+            }
+        printf("sliced merge: threads=%u seconds=%.6f\n", merge_threads[run],
+               sliced_statistics.slice_merge_seconds);
+        if (!egtb_close(sliced)) goto done;
+        sliced = NULL;
+        if (unlink(sliced_path) != 0) goto done;
+    }
     printf("sliced generation regression: PASS (%llu positions, %llu passes)\n",
            (unsigned long long)eg_position_count(&indexer),
            (unsigned long long)sliced_statistics.retrograde_passes);

@@ -5,7 +5,16 @@ revision independently of individual commits; version 3.3 starts at 3.301.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
 
-## Unreleased — revision 3.302
+## Unreleased — revision 3.303
+
+- Parallelize the final slice merge by page-aligned full-index ranges, with
+  private sequential readers and compact batch writers over shared inputs.
+  Validate binary-search boundaries and complete input/output coverage in
+  production. Preserve checkpoint compatibility and final full verification.
+- Compare 9- and 81-slice merges entry-for-entry with unsliced generation at
+  1, 2, 4, 8 and 16 threads, including more threads than output pages.
+
+### Revision 3.302
 
 - Bound candidate and sparse repair searches to worker ranges. Count unique
   candidate marks during production, skip empty evaluation, and clear owned
