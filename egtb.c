@@ -1952,6 +1952,7 @@ typedef struct {
     uint64_t first_page;
     uint64_t end_page;
     uint64_t stored_histogram[2][65536];
+    bool report_progress;
     bool failed;
     char error[256];
 } ResidentLoadWorker;
@@ -2009,7 +2010,7 @@ static void *load_resident_pages(void *opaque)
                                         [(uint16_t)EGTB_STORED_DRAW] +=
                     valid_entries;
             }
-            egtb_progress_add(1);
+            if (worker->report_progress) egtb_progress_add(1);
             continue;
         }
         if (length > compressed_capacity ||
@@ -2049,7 +2050,7 @@ static void *load_resident_pages(void *opaque)
         if (!egtb->planar)
             memcpy(&worker->entries[first_index], destination,
                    valid_entries * sizeof(EgtbEntry));
-        egtb_progress_add(1);
+        if (worker->report_progress) egtb_progress_add(1);
     }
 done:
     free(codec);
@@ -2059,8 +2060,8 @@ done:
     return NULL;
 }
 
-bool egtb_resident_load(EgtbResident **out, Egtb *backing,
-                        unsigned thread_count)
+static bool resident_load_impl(EgtbResident **out, Egtb *backing,
+                                unsigned thread_count, bool report_progress)
 {
     EgtbResident *resident = NULL;
     ResidentLoadWorker *workers = NULL;
@@ -2080,7 +2081,7 @@ bool egtb_resident_load(EgtbResident **out, Egtb *backing,
         return fail("resident EGTB does not fit in address space");
     if (backing->page_count < thread_count)
         thread_count = (unsigned)backing->page_count;
-    egtb_progress_begin("resident load", backing->page_count, "pages");
+    if (report_progress) egtb_progress_begin("resident load", backing->page_count, "pages");
     resident = calloc(1, sizeof(*resident));
     workers = calloc(thread_count, sizeof(*workers));
     threads = calloc(thread_count, sizeof(*threads));
@@ -2097,11 +2098,16 @@ bool egtb_resident_load(EgtbResident **out, Egtb *backing,
         uint64_t first_page = i * pages_per_worker +
                               (i < extra_pages ? i : extra_pages);
         workers[i].backing = backing;
+        workers[i].report_progress = report_progress;
         workers[i].entries = resident->entries;
         workers[i].first_page = first_page;
         workers[i].end_page = first_page + pages_per_worker +
                               (i < extra_pages);
-        {
+        if (thread_count == 1) {
+            load_resident_pages(&workers[i]);
+            ++created_threads;
+            break;
+        } else {
             int error = pthread_create(&threads[i], NULL,
                                        load_resident_pages, &workers[i]);
             if (error != 0) {
@@ -2112,7 +2118,7 @@ bool egtb_resident_load(EgtbResident **out, Egtb *backing,
         }
         ++created_threads;
     }
-    for (i = 0; i < created_threads; ++i) {
+    for (i = 0; thread_count > 1 && i < created_threads; ++i) {
         int error = pthread_join(threads[i], NULL);
         if (error != 0) {
             fail("cannot join resident loader %u: %s", i, strerror(error));
@@ -2135,7 +2141,7 @@ bool egtb_resident_load(EgtbResident **out, Egtb *backing,
     resident = NULL;
     ok = true;
 done:
-    egtb_progress_end(ok);
+    if (report_progress) egtb_progress_end(ok);
     if (resident != NULL) {
         free(resident->entries);
         free(resident);
@@ -2143,6 +2149,16 @@ done:
     free(threads);
     free(workers);
     return ok;
+}
+
+bool egtb_resident_load(EgtbResident **out, Egtb *backing, unsigned threads)
+{
+    return resident_load_impl(out, backing, threads, true);
+}
+
+bool egtb_resident_load_quiet(EgtbResident **out, Egtb *backing)
+{
+    return resident_load_impl(out, backing, 1, false);
 }
 
 void egtb_resident_destroy(EgtbResident *resident)

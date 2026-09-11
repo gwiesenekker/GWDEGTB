@@ -5,7 +5,16 @@ revision independently of individual commits; version 3.3 starts at 3.301.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
 
-## Unreleased — revision 3.303
+## Unreleased — revision 3.304
+
+- Share immutable, checksum-verified dependency DTMs across workers in
+  generation and standalone verification. Default admission limits: 2 GiB
+  total and 256 MiB per database; configurable with cache-only fallback.
+- Report actual resident/cached mode per material and shared-pool usage.
+- Add quiet caller-thread resident loading, concurrent admission, budget,
+  wide-DTM and corruption regression tests. Public GWD APIs are unchanged.
+
+### Revision 3.303
 
 - Parallelize the final slice merge by page-aligned full-index ranges, with
   private sequential readers and compact batch writers over shared inputs.

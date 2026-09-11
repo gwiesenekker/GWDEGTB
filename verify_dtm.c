@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "egtb.h"
+#include "dependency_resident.h"
 #include "endgame_index.h"
 #include "generator.h"
 #include "material.h"
@@ -24,6 +25,8 @@ typedef struct {
     EgtbMaterial canonical;
     Egtb *database;
     EgtbView *view;
+    const EgtbResident *resident;
+    uint64_t resident_lookups;
     EgIndexer indexer;
     bool indexer_initialized;
 } CatalogEntry;
@@ -32,6 +35,7 @@ typedef struct {
     CatalogEntry entry[EGTB_MAX_PIECES + 1][EGTB_MAX_PIECES + 1]
                       [EGTB_MAX_PIECES + 1][EGTB_MAX_PIECES + 1];
     size_t cache_bytes;
+    DependencyResidentPool *resident_pool;
     char error[256];
 } DatabaseCatalog;
 
@@ -42,10 +46,12 @@ static CatalogEntry *catalog_entry(DatabaseCatalog *catalog,
                           [material->black_kings][material->black_men];
 }
 
-static void initialize_catalog(DatabaseCatalog *catalog, size_t cache_bytes)
+static void initialize_catalog(DatabaseCatalog *catalog, size_t cache_bytes,
+                                DependencyResidentPool *pool)
 {
     memset(catalog, 0, sizeof(*catalog));
     catalog->cache_bytes = cache_bytes;
+    catalog->resident_pool = pool;
     for (unsigned wk = 0; wk <= EGTB_MAX_PIECES; ++wk)
         for (unsigned wm = 0; wm <= EGTB_MAX_PIECES; ++wm)
             for (unsigned bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
@@ -78,8 +84,9 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
 {
     char path[128];
     size_t pages;
-    if (entry->database != NULL)
+    if (entry->resident != NULL || entry->view != NULL)
         return true;
+    if (entry->database != NULL) return false;
     if (!egtb_material_filename(
             path, sizeof(path), entry->canonical.white_kings,
             entry->canonical.white_men, entry->canonical.black_kings,
@@ -101,16 +108,23 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
     }
     pages = catalog->cache_bytes /
             egtb_cache_page_size(entry->database);
+    if (egtb_maximum_index(entry->database) != eg_max_index(&entry->indexer)) {
+        snprintf(catalog->error, sizeof(catalog->error),
+                 "dependency %s has the wrong maximum index", path);
+        return false;
+    }
+    if (!dependency_resident_acquire(catalog->resident_pool, entry->database,
+                                      &entry->resident)) {
+        snprintf(catalog->error, sizeof(catalog->error), "dependency %.100s: %.100s",
+                 path, dependency_resident_error());
+        return false;
+    }
+    if (entry->resident) return true;
     if (!egtb_view_create(&entry->view, entry->database,
                           pages == 0 ? 1 : pages, false)) {
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot create dependency view for %.100s: %.100s", path,
                  egtb_last_error());
-        return false;
-    }
-    if (egtb_maximum_index(entry->database) != eg_max_index(&entry->indexer)) {
-        snprintf(catalog->error, sizeof(catalog->error),
-                 "dependency %s has the wrong maximum index", path);
         return false;
     }
     return true;
@@ -158,11 +172,13 @@ static bool catalog_probe(const DraughtsPosition *position, EgtbSide side,
     indexed.white_kings = transformed.white_kings;
     indexed.black_kings = transformed.black_kings;
     if (!eg_position_to_index(&entry->indexer, &indexed, &index) ||
-        !egtb_view_get(entry->view, index, side, value)) {
+        !(entry->resident ? egtb_resident_get(entry->resident, index, side, value)
+                           : egtb_view_get(entry->view, index, side, value))) {
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot query dependency: %.200s", egtb_last_error());
         return false;
     }
+    if (entry->resident) ++entry->resident_lookups;
     return true;
 }
 
@@ -190,9 +206,11 @@ static void catalog_cache_statistics(const DatabaseCatalog *catalogs,
                         const CatalogEntry *entry =
                             &catalogs[catalog].entry[wk][wm][bk][bm];
                         EgtbCacheStatistics part;
-                        if (entry->view == NULL)
+                        if (entry->database == NULL)
                             continue;
                         egtb_view_cache_statistics(entry->view, &part);
+                        part.lookups += entry->resident_lookups;
+                        part.hits += entry->resident_lookups;
                         add_cache_statistics(statistics, &part);
                     }
 }
@@ -258,6 +276,7 @@ int main(int argc, char **argv)
     Egtb *database = NULL;
     EgtbResident *resident = NULL;
     DatabaseCatalog *catalogs = NULL;
+    DependencyResidentPool *dependency_pool = NULL;
     void **contexts = NULL;
     EgtbConsistencyStatistics verification = {0};
     EgtbCacheStatistics dependency_statistics = {0};
@@ -380,8 +399,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "cannot allocate verification catalogs\n");
         goto done;
     }
+    if (!dependency_resident_configure(&dependency_pool)) {
+        fprintf(stderr, "%s\n", dependency_resident_error());
+        goto done;
+    }
     for (unsigned worker = 0; worker < thread_count; ++worker) {
-        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES);
+        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES, dependency_pool);
         contexts[worker] = &catalogs[worker];
     }
     {
@@ -412,10 +435,12 @@ int main(int argc, char **argv)
            resident != NULL ? "resident" : "disk-cache");
     print_cache_statistics("current-DTM cache", &verification.cache);
     print_cache_statistics("dependency-DTM caches", &dependency_statistics);
+    dependency_resident_report(dependency_pool);
     ok = true;
 
 done:
     egtb_progress_stop();
+    dependency_resident_destroy(dependency_pool);
     if (catalogs != NULL) {
         for (unsigned worker = 0; worker < thread_count; ++worker)
             close_catalog(&catalogs[worker]);

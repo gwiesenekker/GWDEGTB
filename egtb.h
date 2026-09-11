@@ -158,6 +158,9 @@ void egtb_view_cache_statistics(const EgtbView *view,
 /* Parallel, checksum-verifying decompression into a flat read-only array. */
 bool egtb_resident_load(EgtbResident **out, Egtb *backing,
                         unsigned thread_count);
+/* For lazy dependency loading inside an active progress phase. Runs in the
+ * caller, without spawning threads or changing progress counters. */
+bool egtb_resident_load_quiet(EgtbResident **out, Egtb *backing);
 void egtb_resident_destroy(EgtbResident *resident);
 bool egtb_resident_get(const EgtbResident *resident, uint64_t index,
                        EgtbSide side, int16_t *value);

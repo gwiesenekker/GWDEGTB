@@ -8,13 +8,16 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.3** (working revision **3.303**).
+Current version: **3.3** (working revision **3.304**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 The summary includes per-material dependency cache statistics, summed across
-workers, separately for generation and final verification. `Resident MiB` is
-the estimated size of one shared, uncompressed paired 16-bit array, not memory
-currently allocated. Verification counters are phase deltas; dependency caches
+workers, separately for generation and final verification. `Full MiB` is the
+size of one shared, uncompressed paired 16-bit array; `Mode` says whether that
+dependency is actually `resident` or `cached`. Resident reads count as hits,
+not page decompressions; initial resident loading is not included in these
+cache counters. The shared-pool summary reports loaded/cached database counts
+and resident array bytes. Verification counters are phase deltas; dependencies
 remain warm. Slice-internal cache traffic is not part of these material tables.
 
 ## Highlights
@@ -655,7 +658,47 @@ compression is independent and unchanged.
 
 The dependency-cache figure is potentially multiplied by both the worker
 count and the number of dependency databases actually opened. Cache metadata
-and page directories are additional. Configure final handling with:
+and page directories are additional.
+
+### Shared resident dependencies
+
+`generate_egtb` and `verify_dtm` share immutable dependency arrays across all
+workers. Defaults are **2 GiB total** and **256 MiB per dependency**. A canonical
+dependency is loaded and checksum-verified once on first use. Other workers
+wait for that load, then retain a pointer and probe without locks. Resident
+dependencies do not allocate per-worker page caches. Arrays remain available
+through final verification and are freed after all workers finish.
+
+```sh
+# Defaults, stated explicitly:
+EGTB_DEPENDENCY_RESIDENT_GIB=2 EGTB_DEPENDENCY_RESIDENT_MAX_MIB=256 \
+  ./generate_egtb -j 16 3 0 2 1
+# Permit larger dependencies within an 8 GiB total budget:
+EGTB_DEPENDENCY_RESIDENT_GIB=8 EGTB_DEPENDENCY_RESIDENT_MAX_MIB=2048 \
+  ./generate_egtb -j 16 3 0 2 1
+# Cache-only comparison:
+EGTB_DEPENDENCY_RESIDENT_GIB=0 ./generate_egtb -j 16 3 0 2 1
+```
+
+Both settings accept nonnegative whole numbers; zero disables admission.
+Admission is first-use among eligible databases, not an adaptive ranking of
+hotness. The per-database cap prevents a single large, potentially cold
+dependency from occupying the whole budget. Dependencies exceeding either
+limit retain the existing private caches; there is no eviction or promotion
+during a run. Corruption, I/O or allocation failures while loading an admitted
+database are fatal, not silently treated as draws or cache misses.
+
+Budgets count paired 16-bit array payloads (four bytes per position), not all
+process memory. Allow additional space for directories, approximately 1 MiB
+of histogram metadata per resident database, loader workspaces, fallback
+caches, current-database residency and generation bitmaps. Bitmaps are already
+allocated during initialization. A load runs on the requesting worker without
+spawning extra threads or disturbing phase progress; distinct dependencies
+can load concurrently. The pool also serves external material dependencies
+during sliced generation, but completed-slice caches remain unchanged.
+GWD's public lookup APIs are unchanged.
+
+Configure current-database final handling separately with:
 
 ```sh
 EGTB_RESIDENT_LIMIT_GIB=0 ./generate_egtb -j 16 3 0 3 0
@@ -672,7 +715,7 @@ zero reuses the writable-cache byte budget. Buffers are rounded down to complete
 paired logical pages, with a minimum of one such page per worker, and capped
 at each worker's position count. Sliced generation uses the same mechanism.
 
-Setting `EGTB_RESIDENT_LIMIT_GIB=0` disables the resident path. Resident
+Setting `EGTB_RESIDENT_LIMIT_GIB=0` disables current-database residency. Resident
 loading is parallel. This limit also applies separately to each newly generated
 slice: if its decoded size (four bytes per position for both sides) fits, the
 slice is loaded once and shared read-only by verification threads. Otherwise

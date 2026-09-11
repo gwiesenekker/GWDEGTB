@@ -20,6 +20,13 @@ all: test_compact_pipeline
 
 test: generate_egtb
 
+generate_egtb generate_egtb_padded generate_egtb_table verify_dtm: dependency_resident.o
+
+test_dependency_resident: test_dependency_resident.o dependency_resident.o egtb.o progress.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+all test: test_dependency_resident
+
 .PHONY: test-restart
 test-restart: generate_egtb
 	sh ./test_restart.sh "$(CURDIR)/generate_egtb"
@@ -136,6 +143,7 @@ benchmark_wdl3: benchmark_wdl3.o libgwdegtb.a
 	$(CC) $(BENCH_CFLAGS) -o $@ $^ $(LDLIBS)
 
 test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_dtm16 test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap
+	./test_dependency_resident
 	./test_crc32c
 	./test_frontier
 	./test_compact_pipeline
@@ -196,6 +204,7 @@ test_frontier: test_frontier.c frontier.c frontier.h crc32c.h
 test: test_progress test_8piece test_frontier
 
 clean:
+	$(RM) test_dependency_resident test_dependency_resident.o dependency_resident.o
 	$(RM) test_frontier
 	$(RM) test_compact_pipeline test_compact_pipeline.o
 	$(RM) test_storage_safety test_storage_safety.o

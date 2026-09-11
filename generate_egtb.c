@@ -7,6 +7,7 @@
 #include "material.h"
 #include "revision.h"
 #include "sliced.h"
+#include "dependency_resident.h"
 
 #include <errno.h>
 #include <sys/stat.h>
@@ -96,6 +97,8 @@ typedef struct {
     EgtbMaterial canonical;
     Egtb *database;
     EgtbView *view;
+    const EgtbResident *resident;
+    uint64_t resident_lookups;
     EgIndexer indexer;
     bool indexer_initialized;
     EgtbCacheStatistics generation_statistics;
@@ -105,6 +108,7 @@ typedef struct {
     CatalogEntry entry[EGTB_MAX_PIECES + 1][EGTB_MAX_PIECES + 1]
                       [EGTB_MAX_PIECES + 1][EGTB_MAX_PIECES + 1];
     size_t cache_bytes;
+    DependencyResidentPool *resident_pool;
     char error[256];
 } DatabaseCatalog;
 
@@ -115,11 +119,13 @@ static CatalogEntry *catalog_entry(DatabaseCatalog *catalog,
                           [material->black_kings][material->black_men];
 }
 
-static void initialize_catalog(DatabaseCatalog *catalog, size_t cache_bytes)
+static void initialize_catalog(DatabaseCatalog *catalog, size_t cache_bytes,
+                                DependencyResidentPool *pool)
 {
     unsigned wk, wm, bk, bm;
     memset(catalog, 0, sizeof(*catalog));
     catalog->cache_bytes = cache_bytes;
+    catalog->resident_pool = pool;
     for (wk = 0; wk <= EGTB_MAX_PIECES; ++wk)
         for (wm = 0; wm <= EGTB_MAX_PIECES; ++wm)
             for (bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
@@ -165,6 +171,15 @@ static void add_cache_statistics(EgtbCacheStatistics *total,
     total->compressed_writes += part->compressed_writes;
 }
 
+/* Resident reads count as hits, but never as page decompressions. Initial
+ * checksum-verified resident loading is reported by the pool separately. */
+static void entry_statistics(const CatalogEntry *e, EgtbCacheStatistics *s)
+{
+    egtb_view_cache_statistics(e->view, s);
+    s->lookups += e->resident_lookups;
+    s->hits += e->resident_lookups;
+}
+
 static void catalog_cache_statistics(const DatabaseCatalog *catalogs,
                                      unsigned catalog_count,
                                      EgtbCacheStatistics *statistics)
@@ -179,9 +194,9 @@ static void catalog_cache_statistics(const DatabaseCatalog *catalogs,
                         const CatalogEntry *entry =
                             &catalogs[catalog_index].entry[wk][wm][bk][bm];
                         EgtbCacheStatistics part;
-                        if (entry->view == NULL)
+                        if (entry->database == NULL)
                             continue;
-                        egtb_view_cache_statistics(entry->view, &part);
+                        entry_statistics(entry, &part);
                         add_cache_statistics(statistics, &part);
                     }
 }
@@ -216,8 +231,8 @@ static void snapshot_dependency_statistics(DatabaseCatalog *catalogs, unsigned n
                 for (unsigned bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
                     for (unsigned bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
                         CatalogEntry *e = &catalogs[t].entry[wk][wm][bk][bm];
-                        if (e->view != NULL)
-                            egtb_view_cache_statistics(e->view, &e->generation_statistics);
+                        if (e->database != NULL)
+                            entry_statistics(e, &e->generation_statistics);
                     }
 }
 
@@ -226,20 +241,22 @@ static void print_dependency_statistics(const DatabaseCatalog *catalogs,
 {
     printf("%s dependency caches by material (summed across workers):\n",
            verification ? "final verification" : "generator");
-    printf("  %-27s %15s %15s %15s %8s %13s\n", "Database", "Lookups",
-           "Misses", "Decompressions", "Hit %", "Resident MiB");
+    printf("  %-27s %15s %15s %15s %8s %13s %s\n", "Database", "Lookups",
+           "Misses", "Decompressions", "Hit %", "Full MiB", "Mode");
     for (unsigned wk = 0; wk <= EGTB_MAX_PIECES; ++wk)
         for (unsigned wm = 0; wm <= EGTB_MAX_PIECES; ++wm)
             for (unsigned bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
                 for (unsigned bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
                     EgtbCacheStatistics sum = {0};
                     uint64_t positions = 0;
+                    bool resident = false;
                     for (unsigned t = 0; t < n; ++t) {
                         const CatalogEntry *e = &catalogs[t].entry[wk][wm][bk][bm];
-                        if (e->view == NULL) continue;
+                        if (e->database == NULL) continue;
+                        resident = e->resident != NULL;
                         EgtbCacheStatistics s = e->generation_statistics;
                         if (verification) {
-                            egtb_view_cache_statistics(e->view, &s);
+                            entry_statistics(e, &s);
                             s.lookups -= e->generation_statistics.lookups;
                             s.hits -= e->generation_statistics.hits;
                             s.misses -= e->generation_statistics.misses;
@@ -255,9 +272,10 @@ static void print_dependency_statistics(const DatabaseCatalog *catalogs,
                     if (!egtb_material_filename(name, sizeof(name), wk, wm, bk, bm, "dtm"))
                         continue;
                     printf("  %-27s %15" PRIu64 " %15" PRIu64 " %15" PRIu64
-                           " %8.2f %13.2f\n", name, sum.lookups, sum.misses,
+                           " %8.2f %13.2f %s\n", name, sum.lookups, sum.misses,
                            sum.decompressions, 100.0 * (double)sum.hits / sum.lookups,
-                           (double)positions * sizeof(EgtbEntry) / (1024.0 * 1024.0));
+                           (double)positions * sizeof(EgtbEntry) / (1024.0 * 1024.0),
+                           resident ? "resident" : "cached");
                 }
 }
 
@@ -265,8 +283,9 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
                                   CatalogEntry *entry)
 {
     char path[128];
-    if (entry->database != NULL)
+    if (entry->resident != NULL || entry->view != NULL)
         return true;
+    if (entry->database != NULL) return false; /* Earlier open/load failed. */
     if (!egtb_material_filename(
             path, sizeof(path), entry->canonical.white_kings,
             entry->canonical.white_men, entry->canonical.black_kings,
@@ -286,6 +305,18 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
                  egtb_last_error());
         return false;
     }
+    if (egtb_maximum_index(entry->database) != eg_max_index(&entry->indexer)) {
+        snprintf(catalog->error, sizeof(catalog->error),
+                 "dependency %s has the wrong maximum index", path);
+        return false;
+    }
+    if (!dependency_resident_acquire(catalog->resident_pool, entry->database,
+                                      &entry->resident)) {
+        snprintf(catalog->error, sizeof(catalog->error), "dependency %.100s: %.100s",
+                 path, dependency_resident_error());
+        return false;
+    }
+    if (entry->resident != NULL) return true;
     size_t pages = catalog->cache_bytes /
                    egtb_cache_page_size(entry->database);
     if (!egtb_view_create(&entry->view, entry->database,
@@ -293,11 +324,6 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot create dependency view for %.100s: %.100s", path,
                  egtb_last_error());
-        return false;
-    }
-    if (egtb_maximum_index(entry->database) != eg_max_index(&entry->indexer)) {
-        snprintf(catalog->error, sizeof(catalog->error),
-                 "dependency %s has the wrong maximum index", path);
         return false;
     }
     return true;
@@ -345,11 +371,13 @@ static bool catalog_probe(const DraughtsPosition *position, EgtbSide side,
     indexed.white_kings = transformed.white_kings;
     indexed.black_kings = transformed.black_kings;
     if (!eg_position_to_index(&entry->indexer, &indexed, &index) ||
-        !egtb_view_get(entry->view, index, side, value)) {
+        !(entry->resident ? egtb_resident_get(entry->resident, index, side, value)
+                           : egtb_view_get(entry->view, index, side, value))) {
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot query dependency: %.200s", egtb_last_error());
         return false;
     }
+    if (entry->resident) ++entry->resident_lookups;
     return true;
 }
 
@@ -432,6 +460,7 @@ int main(int argc, char **argv)
     EgtbCacheStatistics generation_dependencies = {0};
     EgtbCacheStatistics verification_dependencies = {0};
     DatabaseCatalog *catalogs = NULL;
+    DependencyResidentPool *dependency_pool = NULL;
     void **probe_contexts = NULL;
     EgIndexer indexer;
     Egtb *database = NULL;
@@ -551,6 +580,10 @@ int main(int argc, char **argv)
     snprintf(work_path, sizeof(work_path), "%s.incomplete", path);
     if (!prepare_restart(path, work_path, restart)) goto done;
     positions = eg_position_count(&indexer);
+    if (!dependency_resident_configure(&dependency_pool)) {
+        fprintf(stderr, "%s\n", dependency_resident_error());
+        goto done;
+    }
     catalogs = calloc(thread_count, sizeof(*catalogs));
     probe_contexts = calloc(thread_count, sizeof(*probe_contexts));
     if (catalogs == NULL || probe_contexts == NULL) {
@@ -558,7 +591,7 @@ int main(int argc, char **argv)
         goto done;
     }
     for (unsigned worker = 0; worker < thread_count; ++worker) {
-        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES);
+        initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES, dependency_pool);
         probe_contexts[worker] = &catalogs[worker];
     }
     if (sliced && material.white_men == 0 && material.black_men == 0) {
@@ -574,6 +607,7 @@ int main(int argc, char **argv)
     printf("DTM pages: %u bytes (%u positions per side)\n",
            page_size, page_size / (unsigned)sizeof(int16_t));
     printf("DTM compression: Zstd level %d\n", options.compression_level);
+    dependency_resident_report(dependency_pool);
     printf("frontier compilation: %" PRIu64 " MiB assembly buffer total\n",
            compilation_buffer_bytes / (1024 * 1024));
     fflush(stdout);
@@ -731,6 +765,7 @@ int main(int argc, char **argv)
                            &verification_dependencies);
     print_dependency_statistics(catalogs, thread_count, false);
     print_dependency_statistics(catalogs, thread_count, true);
+    dependency_resident_report(dependency_pool);
     for (unsigned side = 0; side < 2; ++side) {
         uint64_t wins = 0, losses = 0, draws = 0;
         for (int numeric = INT16_MIN; numeric <= INT16_MAX; ++numeric) {
@@ -817,6 +852,7 @@ done:
     egtb_progress_end(ok);
     egtb_progress_stop();
     egtb_resident_destroy(resident);
+    dependency_resident_destroy(dependency_pool);
     if (database != NULL && !egtb_close(database))
         ok = false;
     if (catalogs != NULL) {
