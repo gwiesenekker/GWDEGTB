@@ -105,6 +105,7 @@ typedef struct EgtbSharedProbe EgtbSharedProbe;
 typedef struct {
     EgtbCacheStatistics cache;
     uint64_t busy_reads, invalidated_reads, publication_conflicts, publications;
+    uint64_t timed_decodes, decode_nanoseconds;
 } EgtbSharedStatistics;
 bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes);
 void egtb_shared_cache_destroy(EgtbSharedCache *cache);
@@ -117,6 +118,7 @@ uint64_t egtb_shared_cache_planned_allocation(Egtb *backing, size_t payload_byte
 bool egtb_shared_cache_dense(const EgtbSharedCache *cache);
 bool egtb_shared_cache_grow(EgtbSharedCache *cache, size_t payload_bytes);
 void egtb_shared_cache_statistics(EgtbSharedCache *cache, EgtbCacheStatistics *stats);
+void egtb_shared_cache_timing(EgtbSharedCache *cache, uint64_t *samples, uint64_t *nanoseconds);
 bool egtb_shared_probe_create(EgtbSharedProbe **out, EgtbSharedCache *cache);
 void egtb_shared_probe_destroy(EgtbSharedProbe *probe);
 bool egtb_shared_probe_get(EgtbSharedProbe *probe, uint64_t index,

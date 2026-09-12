@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -1830,6 +1831,18 @@ uint64_t egtb_shared_cache_allocation(const EgtbSharedCache *c)
 
 bool egtb_shared_cache_dense(const EgtbSharedCache *c) { return c && c->dense; }
 
+void egtb_shared_cache_timing(EgtbSharedCache *c, uint64_t *samples, uint64_t *ns)
+{
+    *samples = *ns = 0;
+    /* Same quiescent lifetime requirement as cache_statistics. */
+    pthread_mutex_lock(&c->probes_mutex);
+    for (EgtbSharedProbe *p = c->probes; p; p = p->next) {
+        *samples += p->statistics.timed_decodes;
+        *ns += p->statistics.decode_nanoseconds;
+    }
+    pthread_mutex_unlock(&c->probes_mutex);
+}
+
 void egtb_shared_cache_statistics(EgtbSharedCache *c, EgtbCacheStatistics *stats)
 {
     memset(stats, 0, sizeof(*stats));
@@ -1923,8 +1936,23 @@ static bool EGTB_COLD_NOINLINE shared_probe_miss(EgtbSharedProbe *p,
     Egtb *db = c->backing;
     EgtbEntry *data = (EgtbEntry *)(void *)p->scratch->data;
     ++p->statistics.cache.misses;
+    /* Clock only one in 256 misses. No timing or shared counters on hits.
+     * This includes file reads, CRC and decoding, not just Zstd CPU time. */
+    struct timespec begin, end;
+    bool timed = (p->statistics.cache.misses & 255) == 1 &&
+                 clock_gettime(CLOCK_MONOTONIC, &begin) == 0;
+    uint64_t decoded_before = p->scratch->statistics.decompressions;
     /* Never let Zstd or memcpy write shared atomic storage. */
     if (!view_load_page(p->scratch, physical, data)) return false;
+    if (timed && p->scratch->statistics.decompressions > decoded_before &&
+        clock_gettime(CLOCK_MONOTONIC, &end) == 0) {
+        int64_t ns = (int64_t)(end.tv_sec - begin.tv_sec) * INT64_C(1000000000) +
+                     end.tv_nsec - begin.tv_nsec;
+        if (ns >= 0) {
+            ++p->statistics.timed_decodes;
+            p->statistics.decode_nanoseconds += (uint64_t)ns;
+        }
+    }
     *value = egtb_decode_dtm(stored_value(db, data, entry, side));
     SharedSlot *s = &c->slots[slot];
     uint64_t seq = atomic_load_explicit(&s->sequence, memory_order_acquire);

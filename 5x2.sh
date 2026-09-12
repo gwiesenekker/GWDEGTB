@@ -18,7 +18,13 @@ generate()
     black_kings=$3
     black_men=$4
     name="${white_kings}wX-${white_men}wO-${black_kings}bX-${black_men}bO"
-    log="$log_dir/$name.log"
+    revision=$(./generate_egtb --revision)
+    revision=${revision##* }
+    case "$revision" in
+        ''|*[!0-9.]*) printf 'Invalid generator revision: %s\n' "$revision" >&2; exit 1 ;;
+    esac
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    log="$log_dir/$name-rev$revision-$stamp-$$.log"
 
     printf 'Generating %s (log: %s)\n' "$name" "$log"
     if ./generate_egtb --restart $sliced -j "$threads" "$white_kings" "$white_men" \

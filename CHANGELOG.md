@@ -5,7 +5,27 @@ revision independently of individual commits; version 3.3 starts at 3.301.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
 
-## Unreleased — revision 3.307
+## Unreleased — revision 3.309
+
+- Smooth decompression pressure with elapsed-time weighting, retaining burst
+  evidence across quiet windows while decaying stale pressure. Compare two
+  pre-growth windows with two post-growth windows instead of a single baseline.
+- Measure complete growth stalls and sample one in 256 shared-cache miss loads
+  (I/O, CRC and decode); no timing on cache hits. Cost estimates are diagnostic.
+- Family-script log names include executable revision, UTC timestamp and PID,
+  preserving logs from earlier revisions and repeat runs.
+
+### Revision 3.308
+
+- Add growth-only hysteresis: two consecutive pressure samples, a discarded
+  post-growth warm-up interval, and two measurement windows before regrowth.
+  Less than 10% observed improvement in decompressions per million lookups adds
+  two cooldown windows followed by fresh qualification; growth is not disabled.
+- Quiet/idle windows break pressure streaks. Tests cover transient spikes,
+  cooldown, later growth through dense addressing, and competing dependencies.
+  Shrinking/reclamation remain unimplemented; allocation budgets are unchanged.
+
+### Revision 3.307
 
 - Rank adaptive shared-cache growth by recent decompressions per second per
   additional MiB, including metadata, instead of the 95% hit-rate cutoff.

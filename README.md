@@ -8,7 +8,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.3** (working revision **3.307**).
+Current version: **3.3** (working revision **3.309**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 The summary includes per-material dependency cache statistics, summed across
@@ -161,7 +161,8 @@ Stages without a measurable work count report elapsed time and `ETA=unknown`.
 EGTB_PROGRESS_SECONDS=30 ./generate_egtb -j 16 1 1 1 1
 
 # Job scripts redirect output: follow their log while generation is running.
-tail -f logs/2x2/1wX-1wO-1bX-1bO.log
+# Use the exact log path printed by the family script:
+tail -f logs/2x2/1wX-1wO-1bX-1bO-rev3.309-20260912T120000Z-12345.log
 ```
 
 Timestamps use local time with a UTC offset. Durations and ETA use the
@@ -412,7 +413,10 @@ generation. An unset value, or any value other than the exact string
 EGTB_THREADS=16 EGTB_SLICED=--sliced ./4x3.sh
 ```
 
-Logs are written below `logs/<family>/`. Generation order sorts by total piece
+Logs are written below `logs/<family>/` (or `EGTB_LOG_DIR`). Names include
+`<material>-rev<executable-revision>-<UTC-timestamp>-<PID>.log`; the revision is
+queried from the executable before each job, not read from the source tree.
+Earlier logs are left untouched. Generation order sorts by total piece
 count, larger White side first, then White kings descending and Black kings
 descending. This matches the historical GWD order and ensures promotion
 targets are available.
@@ -748,10 +752,14 @@ dependency admission still has priority and its budget is separate.
 
 At a quiescent checkpoint, the coordinator samples private probe counters.
 It discards the first nonempty interval (and the first interval after growth)
-as warm-up, then requires at least 100,000 lookups and 1,000 actual
-decompressions in a sample. There is no hit-rate cutoff: a busy dependency
+as warm-up. Complete samples require at least 100,000 lookups. Growth requires
+two observations with at least 1,000 actual decompressions (not necessarily
+consecutive), and a smoothed pressure of at least 1,000 decompressions/second.
+Pressure uses a time-aware weighted average with a 5-second time constant:
+`weight = elapsed / (5 + elapsed)`. Quiet windows and idle checkpoints decay
+the pressure instead of immediately forgetting bursts. There is no hit-rate cutoff: a busy dependency
 with 99.9% hits can still benefit. The eligible dependency with the highest
-**decompressions/second per additional MiB** is doubled (additional allocation
+**smoothed decompressions/second per additional MiB** is doubled (additional allocation
 includes slot metadata). Rates use monotonic elapsed time between checkpoints;
 these measure workload pressure, not decompression CPU time or guaranteed savings.
 Implicit-draw misses do not count. An idle checkpoint resets the sample clock.
@@ -767,12 +775,24 @@ All workers join before maintenance and the next round starts afterwards.
 Backtracking also checks between worker batches; repair checks between passes.
 Progress remains one continuous phase. This adds occasional thread-launch/join
 overhead but no maintenance checks, shared counter updates or locks per probe.
-Growth messages report size, mode, decompressions/second and pressure.
-After growth, one active interval is discarded as a cooldown/warm-up, then the
-next sufficiently large sample reports before/after decompressions/second and
-decompressions per million lookups. Workloads can change between samples, so
+Growth messages report size, mode, decompressions/second, smoothed pressure and
+elapsed allocation/initialization/migration time. The summary reports total
+growth stalls. One in 256 shared-cache misses is timed with a monotonic clock;
+only successful actual decompressions contribute samples. Timed page loading
+includes I/O, CRC and decode, not only Zstd CPU time. Growth logs report a
+smoothed sampled load cost and estimated summed worker elapsed load-seconds
+per wall second (not CPU utilization). These are observational diagnostics,
+not yet an admission threshold or a promise of savings. Hits perform no timing.
+After growth, one active interval is discarded as warm-up, then two complete
+samples are collected before another resize can qualify. Their combined counts
+and elapsed time report before/after decompressions/second and decompressions
+per million lookups; the baseline likewise aggregates the last two complete
+pre-growth windows. If the latter improves by less than 10%, the cache waits
+two additional complete samples before reconsidering smoothed pressure.
+This bounded cooldown does not permanently disable growth: further doubling
+may still help, especially near dense addressing. Workloads can change between samples, so
 these are observational comparisons, not measured causal speedups. This first
-policy only grows caches; shrinking, reclamation and grow/shrink hysteresis
+policy only grows caches; shrinking, reclamation and bidirectional hysteresis
 remain future work.
 
 The total budget includes shared page payload, 64-byte slot metadata, **and
@@ -782,6 +802,33 @@ cannot obtain their initial allocation fall back to private caches; those
 caches, codec workspaces, resident arrays, bitmaps and directories are outside
 this budget. Allocation failure during growth retains the old working cache.
 This is not a whole-process RAM limit.
+
+Cache-policy benchmark, 2026-09-12: Ryzen 9 5950X, two workers, ext4 `/tmp`,
+`1 2 2 0` (51,369,120 positions), Zstd level 1, 2,048-byte pages,
+dependency residency disabled, 1 GiB adaptive shared-cache budget and 1 GiB
+compilation/current-residency/verification budgets. One unmeasured warm-up,
+then three repetitions per configuration with alternating old/new order.
+Median total seconds (including exhaustive verification):
+
+| Shared-cache configuration | Revision 3.308 | Revision 3.309 | Change |
+|---|---:|---:|---:|
+| Fixed 64 MiB | 35.071 | 35.482 | +1.2% |
+| Adaptive, initial 64 MiB | 35.696 | 35.923 | +0.6% |
+| Adaptive, initial 1 MiB | 48.646 | 49.438 | +1.6% |
+
+These measurements demonstrate no speedup for this workload. With 64 MiB
+initial caches, 3.309 grew the 218 MiB dependency to a 128 MiB cache, whereas
+3.308 never grew it. The measured growth pause was 0.071–0.072 seconds.
+Starting at 1 MiB caused 13 growths in 3.309 with only 0.036–0.037 seconds of
+combined growth pauses: its much slower initialization is not explained by
+allocation time alone. All runs passed exhaustive verification and matched
+histograms, examples and storage statistics; the final output also matched all
+51,369,120 paired values in the existing reference database. This five-piece
+benchmark does not establish performance for multi-GiB growth or eight pieces.
+
+Reproduce with `sh benchmark_cache_policy.sh OLD_BINARY NEW_BINARY DEPENDENCY_DIRECTORY 3`
+(absolute paths, on an idle host). Raw logs for this run were retained in
+`/tmp/gwdegtb-policy-0wrMTx/`; temporary files are not part of the repository.
 
 `make test-adaptive` generates a private-cache baseline and an adaptive
 `1 1 1 1` database, compares every paired value and runs standalone verification

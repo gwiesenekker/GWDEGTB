@@ -139,16 +139,19 @@ static void adaptive(Egtb *db)
         CHECK(egtb_shared_cache_bytes(c) == 256);
     }
     /* More than 99% hits must still qualify when decompression pressure is high. */
-    egtb_shared_probe_statistics(p, &before);
-    for (unsigned j=0; j<2000000; ++j)
-        CHECK(egtb_shared_probe_get(p, (j%1000 == 0) ? 64 : 0, EGTB_WHITE_TO_MOVE, &v));
-    egtb_shared_probe_statistics(p, &after);
-    CHECK(after.cache.misses - before.cache.misses < 20000);
-    CHECK(after.cache.decompressions - before.cache.decompressions >= 1000);
-    dependency_shared_maintain_at(pool, ++now);
+    for (unsigned sample=0; sample<2; ++sample) {
+        egtb_shared_probe_statistics(p, &before);
+        for (unsigned j=0; j<2000000; ++j)
+            CHECK(egtb_shared_probe_get(p, (j%1000 == 0) ? 64 : 0, EGTB_WHITE_TO_MOVE, &v));
+        egtb_shared_probe_statistics(p, &after);
+        CHECK(after.cache.misses - before.cache.misses < 20000);
+        CHECK(after.cache.decompressions - before.cache.decompressions >= 1000);
+        dependency_shared_maintain_at(pool, ++now);
+        if (!sample) CHECK(egtb_shared_cache_bytes(c) == 256);
+    }
     CHECK(egtb_shared_cache_bytes(c) == 512);
-    bool cooldown = true;
-    for (unsigned pass=0; pass<20 && !egtb_shared_cache_dense(c); ++pass) {
+    unsigned since_growth = 0;
+    for (unsigned pass=0; pass<60 && !egtb_shared_cache_dense(c); ++pass) {
         uint64_t old_allocation = egtb_shared_cache_allocation(c);
         uint64_t old_payload = egtb_shared_cache_bytes(c);
         for (unsigned j=0; j<100001; ++j) {
@@ -157,8 +160,14 @@ static void adaptive(Egtb *db)
             CHECK(v == expected(index, j&1));
         }
         dependency_shared_maintain_at(pool, ++now);
-        if (cooldown) CHECK(egtb_shared_cache_bytes(c) == old_payload);
-        cooldown = egtb_shared_cache_bytes(c) > old_payload;
+        ++since_growth;
+        /* First post-grow workload is worse; subsequent ones are unchanged.
+         * Warm-up + 2 assessment + 2 extra cooldown + decision window. */
+        if (since_growth < 6) CHECK(egtb_shared_cache_bytes(c) == old_payload);
+        if (egtb_shared_cache_bytes(c) > old_payload) {
+            CHECK(since_growth == 6);
+            since_growth = 0;
+        }
         if (egtb_shared_cache_bytes(c) > old_payload)
             CHECK(old_allocation + egtb_shared_cache_allocation(c) <= 50000);
     }
@@ -196,13 +205,13 @@ static void pressure_priority(Egtb *a, Egtb *b)
     }
     /* Grow A first, then compare unequal growth costs at the same checkpoint.
      * A has more decompressions, B has more decompressions per additional MiB. */
-    for (unsigned pass=0; pass<4; ++pass) {
+    for (unsigned pass=0; pass<6; ++pass) {
         uint64_t decoded[2];
         for (unsigned k=0; k<2; ++k) {
             EgtbSharedStatistics before, after;
             egtb_shared_probe_statistics(p[k], &before);
-            unsigned churn = pass == 1 && k == 0 ? 20000 :
-                             pass == 3 ? (k == 0 ? 12000 : 8000) : 0;
+            unsigned churn = (pass == 1 || pass == 2) && k == 0 ? 20000 :
+                             pass >= 4 ? (k == 0 ? 12000 : 8000) : 0;
             for (unsigned j=0; j<100001; ++j) {
                 uint64_t index = j < churn && (j&1) ? N-1 : 0;
                 int16_t value;
@@ -212,17 +221,52 @@ static void pressure_priority(Egtb *a, Egtb *b)
             egtb_shared_probe_statistics(p[k], &after);
             decoded[k] = after.cache.decompressions - before.cache.decompressions;
         }
-        if (pass == 3) {
+        if (pass == 5) {
             CHECK(decoded[0] > decoded[1]);
             CHECK(decoded[0] < 2 * decoded[1]);
         }
         dependency_shared_maintain_at(pool, pass + 1);
-        CHECK(egtb_shared_cache_bytes(c[0]) == (pass ? 512 : 256));
-        CHECK(egtb_shared_cache_bytes(c[1]) == (pass == 3 ? 512 : 256));
+        CHECK(egtb_shared_cache_bytes(c[0]) == (pass >= 2 ? 512 : 256));
+        CHECK(egtb_shared_cache_bytes(c[1]) == (pass == 5 ? 512 : 256));
     }
     for (unsigned k=0; k<2; ++k) egtb_shared_probe_destroy(p[k]);
     dependency_resident_destroy(pool);
     puts("decompression pressure per additional MiB priority test passed");
+}
+
+static void burst_pressure(Egtb *db)
+{
+    for (unsigned idle=0; idle<2; ++idle) {
+        DependencyResidentPool *pool; const EgtbResident *r;
+        EgtbSharedCache *c; EgtbSharedProbe *p;
+        CHECK(dependency_resident_create(&pool, 0, 0));
+        CHECK(dependency_shared_configure(pool, 256, 50000));
+        CHECK(dependency_resident_acquire(pool, db, &r) && !r);
+        CHECK(dependency_shared_acquire(pool, db, &c) && c);
+        CHECK(egtb_shared_probe_create(&p, c));
+        double now=0;
+        for (unsigned pass=0; pass<4; ++pass) {
+            unsigned churn = pass == 1 ? 100000 : pass == 3 ? (idle ? 2000 : 100000) : 0;
+            for (unsigned j=0; j<100001; ++j) {
+                int16_t value;
+                CHECK(egtb_shared_probe_get(p, j < churn && (j&1) ? N-1 : 0,
+                                           EGTB_WHITE_TO_MOVE, &value));
+            }
+            dependency_shared_maintain_at(pool, ++now);
+            if (pass < 3 || idle) CHECK(egtb_shared_cache_bytes(c) == 256);
+            if (pass == 1 && idle) {
+                now += 1000;
+                dependency_shared_maintain_at(pool, now);
+            }
+        }
+        CHECK(egtb_shared_cache_bytes(c) == (idle ? 256 : 512));
+        uint64_t samples, ns;
+        egtb_shared_cache_timing(c, &samples, &ns);
+        CHECK(samples > 0 && ns > 0);
+        egtb_shared_probe_destroy(p);
+        dependency_resident_destroy(pool);
+    }
+    puts("bursty pressure, idle decay and sampled load timing tests passed");
 }
 
 int main(void)
@@ -240,6 +284,7 @@ int main(void)
     CHECK(egtb_close(db));
     CHECK(egtb_open_readonly(&db, path, 1));
     adaptive(db);
+    burst_pressure(db);
     char alias[256]; Egtb *other;
     snprintf(alias, sizeof(alias), "%s/./test.dtm", dir);
     CHECK(egtb_open_readonly(&other, alias, 1));

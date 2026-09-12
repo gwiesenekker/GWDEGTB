@@ -18,6 +18,12 @@ typedef struct ResidentEntry {
     uint64_t previous_lookups, previous_decompressions;
     double previous_time, before_growth_rate, before_growth_density;
     bool pending_measurement;
+    unsigned pressure_windows, measurement_windows, cooldown_windows;
+    uint64_t measured_lookups, measured_decompressions;
+    double measured_seconds;
+    double pressure_rate, last_window_seconds, decode_ns;
+    uint64_t last_window_lookups, last_window_decompressions;
+    uint64_t previous_samples, previous_ns;
     char error[256];
     struct ResidentEntry *next;
 } ResidentEntry;
@@ -31,10 +37,16 @@ struct DependencyResidentPool {
     unsigned shared_count;
     uint64_t shared_budget, shared_allocated;
     unsigned growths;
+    double growth_seconds;
     ResidentEntry *entries;
 };
 
 static _Thread_local char error_text[256];
+static double monotonic_seconds(void)
+{
+    struct timespec t;
+    return clock_gettime(CLOCK_MONOTONIC, &t) ? 0 : (double)t.tv_sec + t.tv_nsec * 1e-9;
+}
 const char *dependency_resident_error(void) { return error_text; }
 
 bool dependency_resident_create(DependencyResidentPool **out,
@@ -182,6 +194,9 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             e->sampled = false;
             e->previous_lookups = 0; e->previous_decompressions = 0;
             e->pending_measurement = false;
+            e->pressure_windows = e->cooldown_windows = 0;
+            e->pressure_rate = e->last_window_seconds = 0;
+            e->last_window_lookups = e->last_window_decompressions = 0;
         }
         if (!e->sampled) {
             /* First interval is warm-up, also after a resize. */
@@ -193,22 +208,64 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
         }
         uint64_t lookups = s.lookups - e->previous_lookups;
         uint64_t decompressions = s.decompressions - e->previous_decompressions;
-        if (!lookups) { e->previous_time = now; continue; }
         double elapsed = now - e->previous_time;
+        if (!lookups) {
+            if (elapsed > 0) e->pressure_rate *= 5.0 / (5.0 + elapsed);
+            e->previous_time = now;
+            continue;
+        }
         if (lookups < 100000 || !(elapsed > 0)) continue;
         double rate = (double)decompressions / elapsed;
-        double density = (double)decompressions * 1000000 / (double)lookups;
+        /* Time-aware exponential smoothing approximation (5-second time constant).
+         * Quiet windows decay history rather than deleting a burst immediately. */
+        double weight = elapsed / (5.0 + elapsed);
+        e->pressure_rate = e->pressure_windows ?
+            e->pressure_rate + weight * (rate - e->pressure_rate) : rate;
+        double before_rate = (double)(decompressions + e->last_window_decompressions) /
+                             (elapsed + e->last_window_seconds);
+        double before_density = (double)(decompressions + e->last_window_decompressions) * 1000000 /
+                                (lookups + e->last_window_lookups);
+        e->last_window_seconds = elapsed;
+        e->last_window_lookups = lookups;
+        e->last_window_decompressions = decompressions;
         e->previous_lookups = s.lookups; e->previous_decompressions = s.decompressions;
         e->previous_time = now;
+        /* Two substantial observations, not necessarily adjacent. Smoothing
+         * retains bursts across quiet windows; the rate floor rejects old ones. */
+        if (decompressions >= 1000 && e->pressure_windows < 2) ++e->pressure_windows;
+        uint64_t samples, ns;
+        egtb_shared_cache_timing(e->shared, &samples, &ns);
+        if (samples > e->previous_samples && ns >= e->previous_ns) {
+            double cost = (double)(ns - e->previous_ns) / (samples - e->previous_samples);
+            e->decode_ns = e->decode_ns ? e->decode_ns + weight * (cost - e->decode_ns) : cost;
+        }
+        e->previous_samples = samples; e->previous_ns = ns;
         if (e->pending_measurement) {
+            e->measured_lookups += lookups;
+            e->measured_decompressions += decompressions;
+            e->measured_seconds += elapsed;
+            if (++e->measurement_windows < 2) continue;
+            double measured_rate = e->measured_decompressions / e->measured_seconds;
+            double measured_density = (double)e->measured_decompressions * 1000000 / e->measured_lookups;
+            bool weak = measured_density > e->before_growth_density * 0.90 &&
+                        !egtb_shared_cache_dense(e->shared);
             egtb_progress_log("shared dependency cache measurement: maximum-index=%" PRIu64
-                " decompressions/s=%.0f -> %.0f; decompressions/million-lookups=%.1f -> %.1f (observed, workload may differ)\n",
-                egtb_maximum_index(e->backing), e->before_growth_rate, rate,
-                e->before_growth_density, density);
+                " decompressions/s=%.0f -> %.0f; decompressions/million-lookups=%.1f -> %.1f; extra-cooldown=%u windows (observed, workload may differ)\n",
+                egtb_maximum_index(e->backing), e->before_growth_rate, measured_rate,
+                e->before_growth_density, measured_density, weak ? 2u : 0u);
             e->pending_measurement = false;
+            if (weak) {
+                e->cooldown_windows = 2;
+                continue;
+            }
+        }
+        if (e->cooldown_windows) {
+            --e->cooldown_windows;
+            continue;
         }
         /* Ignore small/cold samples and implicit-draw misses, regardless of hit rate. */
-        if (decompressions < 1000 || egtb_shared_cache_dense(e->shared)) continue;
+        if (e->pressure_windows < 2 || e->pressure_rate < 1000 ||
+            egtb_shared_cache_dense(e->shared)) continue;
         uint64_t payload = egtb_shared_cache_bytes(e->shared);
         if (payload > SIZE_MAX / 2) continue;
         payload *= 2;
@@ -217,28 +274,38 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
         if (allocation <= old_allocation) continue;
         /* Both old and new storage coexist during migration. */
         if (allocation > p->shared_budget - p->shared_allocated) continue;
-        double score = rate / ((double)(allocation - old_allocation) / 1048576);
+        double score = e->pressure_rate / ((double)(allocation - old_allocation) / 1048576);
         if (score > best_score) {
             best = e; best_score = score; best_payload = payload;
-            best_allocation = allocation; best_rate = rate; best_density = density;
+            best_allocation = allocation; best_rate = before_rate; best_density = before_density;
         }
     }
     if (best) {
         uint64_t old = egtb_shared_cache_bytes(best->shared);
         uint64_t old_allocation = egtb_shared_cache_allocation(best->shared);
+        double started = monotonic_seconds();
         if (egtb_shared_cache_grow(best->shared, (size_t)best_payload)) {
+            double growth_seconds = monotonic_seconds() - started;
+            if (growth_seconds < 0) growth_seconds = 0;
+            p->growth_seconds += growth_seconds;
             uint64_t actual = egtb_shared_cache_bytes(best->shared);
             p->shared_used += actual - old;
             p->shared_allocated += best_allocation - old_allocation;
             ++p->growths; best->sampled = false;
             best->pending_measurement = true;
+            best->pressure_windows = best->measurement_windows = best->cooldown_windows = 0;
+            best->measured_lookups = best->measured_decompressions = 0;
+            best->measured_seconds = 0;
+            best->last_window_lookups = best->last_window_decompressions = 0;
+            best->last_window_seconds = 0;
             best->before_growth_rate = best_rate;
             best->before_growth_density = best_density;
-            egtb_progress_log("shared dependency cache: maximum-index=%" PRIu64 " grew %.2f -> %.2f MiB; mode=%s; decompressions/s=%.0f; pressure=%.1f decompressions/s/additional-MiB\n",
+            egtb_progress_log("shared dependency cache: maximum-index=%" PRIu64 " grew %.2f -> %.2f MiB; mode=%s; decompressions/s=%.0f; pressure=%.1f decompressions/s/additional-MiB; grow-seconds=%.6f; sampled-load-us=%.3f; estimated-load-worker-seconds/s=%.3f\n",
                 egtb_maximum_index(best->backing),
                 (double)old / 1048576, (double)actual / 1048576,
                 egtb_shared_cache_dense(best->shared) ? "dense (lazy)" : "cached",
-                best_rate, best_score);
+                best_rate, best_score, growth_seconds, best->decode_ns / 1000,
+                best->pressure_rate * best->decode_ns / 1e9);
         } else {
             best->stopped = true; /* Preserve old cache; allocation failure is recoverable. */
             egtb_progress_log("shared dependency cache growth skipped: %s\n", egtb_last_error());
@@ -325,6 +392,8 @@ void dependency_resident_report(DependencyResidentPool *p)
     if (p->shared_budget)
         printf("adaptive shared-cache budget: %" PRIu64 " MiB allocated=%.2f MiB growths=%u (metadata included)\n",
                p->shared_budget / 1048576, (double)p->shared_allocated / 1048576, p->growths);
+    if (p->shared_budget)
+        printf("shared-cache growth stalls: %.6f s total\n", p->growth_seconds);
     pthread_mutex_unlock(&p->mutex);
 }
 

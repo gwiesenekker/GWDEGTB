@@ -182,6 +182,7 @@ test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb
 	./test_generator_padded
 	./test_material
 	./test_bitmap
+	sh ./test_family_logs.sh
 
 check-stats: check_stats
 	./check_stats 7piece-stats.txt
