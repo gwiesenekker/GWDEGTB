@@ -1,16 +1,23 @@
 #define _POSIX_C_SOURCE 200809L
 #include "dependency_resident.h"
+#include "progress.h"
 #include <pthread.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct ResidentEntry {
     Egtb *backing;
     EgtbResident *resident;
+    EgtbSharedCache *shared;
     bool loading, failed;
+    bool shared_decided, sampled, stopped;
+    uint64_t previous_lookups, previous_decompressions;
+    double previous_time, before_growth_rate, before_growth_density;
+    bool pending_measurement;
     char error[256];
     struct ResidentEntry *next;
 } ResidentEntry;
@@ -20,6 +27,10 @@ struct DependencyResidentPool {
     pthread_cond_t changed;
     uint64_t budget, maximum_database, used;
     unsigned loaded, cached;
+    uint64_t shared_bytes, shared_used;
+    unsigned shared_count;
+    uint64_t shared_budget, shared_allocated;
+    unsigned growths;
     ResidentEntry *entries;
 };
 
@@ -63,11 +74,177 @@ static bool setting(const char *name, uint64_t unit, uint64_t fallback, uint64_t
 bool dependency_resident_configure(DependencyResidentPool **out)
 {
     const uint64_t mib = UINT64_C(1024) * 1024;
-    uint64_t budget, maximum;
+    uint64_t budget, maximum, shared, shared_budget;
     if (!setting("EGTB_DEPENDENCY_RESIDENT_GIB", 1024 * mib, 2048 * mib, &budget) ||
-        !setting("EGTB_DEPENDENCY_RESIDENT_MAX_MIB", mib, 256 * mib, &maximum))
+        !setting("EGTB_DEPENDENCY_RESIDENT_MAX_MIB", mib, 256 * mib, &maximum) ||
+        !setting("EGTB_DEPENDENCY_SHARED_CACHE_MIB", mib, 0, &shared) ||
+        !setting("EGTB_DEPENDENCY_SHARED_CACHE_GIB", 1024 * mib, 0, &shared_budget))
         return false;
-    return dependency_resident_create(out, budget, maximum);
+    if (shared > SIZE_MAX) {
+        snprintf(error_text, sizeof(error_text), "shared cache exceeds address space");
+        return false;
+    }
+    if (!dependency_resident_create(out, budget, maximum)) return false;
+    dependency_shared_configure(*out, (size_t)shared, shared_budget);
+    return true;
+}
+
+bool dependency_shared_configure(DependencyResidentPool *p, size_t initial, uint64_t total)
+{
+    if (!p || p->entries) {
+        snprintf(error_text, sizeof(error_text), "configure shared caches before opening dependencies");
+        return false;
+    }
+    p->shared_bytes = initial; p->shared_budget = total;
+    return true;
+}
+
+bool dependency_shared_acquire(DependencyResidentPool *p, Egtb *backing,
+                               EgtbSharedCache **out)
+{
+    if (!p || !backing || !out) {
+        snprintf(error_text, sizeof(error_text), "invalid shared dependency request");
+        return false;
+    }
+    *out = NULL;
+    if (!p->shared_bytes) return true;
+    pthread_mutex_lock(&p->mutex);
+    ResidentEntry *e;
+    for (e = p->entries; e && e->backing != backing; e = e->next) {}
+    if (!e) {
+        pthread_mutex_unlock(&p->mutex);
+        snprintf(error_text, sizeof(error_text), "resident admission must precede shared cache admission");
+        return false;
+    }
+    while (e->loading) pthread_cond_wait(&p->changed, &p->mutex);
+    if (e->failed || e->resident || e->shared_decided) {
+        bool ok = !e->failed;
+        if (!ok) snprintf(error_text, sizeof(error_text), "%s", e->error);
+        *out = e->shared;
+        pthread_mutex_unlock(&p->mutex);
+        return ok;
+    }
+    e->shared_decided = true;
+    uint64_t allocation = egtb_shared_cache_planned_allocation(backing, (size_t)p->shared_bytes);
+    if (p->shared_budget && allocation > p->shared_budget - p->shared_allocated) {
+        pthread_mutex_unlock(&p->mutex);
+        return true; /* Explicit private-cache fallback when admission cannot fit. */
+    }
+    p->shared_allocated += allocation; /* Reserve before concurrent allocation. */
+    e->loading = true;
+    pthread_mutex_unlock(&p->mutex);
+    EgtbSharedCache *shared = NULL;
+    bool ok = egtb_shared_cache_create(&shared, backing, (size_t)p->shared_bytes);
+    char message[256] = "";
+    if (!ok) snprintf(message, sizeof(message), "%s", egtb_last_error());
+    pthread_mutex_lock(&p->mutex);
+    e->loading = false; e->failed = !ok; e->shared = shared;
+    if (ok) { ++p->shared_count; p->shared_used += egtb_shared_cache_bytes(shared); }
+    else {
+        p->shared_allocated -= allocation;
+        snprintf(e->error, sizeof(e->error), "%s", message);
+        snprintf(error_text, sizeof(error_text), "%s", message);
+    }
+    pthread_cond_broadcast(&p->changed);
+    *out = shared;
+    pthread_mutex_unlock(&p->mutex);
+    return ok;
+}
+
+bool dependency_shared_adaptive(DependencyResidentPool *p)
+{
+    return p && p->shared_bytes && p->shared_budget;
+}
+
+/* Called by the coordinator with all dependency probes quiescent. No mutex,
+ * counter write, clock query or resize check is added to the lookup path. */
+void dependency_shared_maintain(void *context)
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
+    dependency_shared_maintain_at(context, (double)now.tv_sec + now.tv_nsec * 1e-9);
+}
+
+void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
+{
+    if (!dependency_shared_adaptive(p)) return;
+    pthread_mutex_lock(&p->mutex);
+    ResidentEntry *best = NULL;
+    uint64_t best_payload = 0, best_allocation = 0;
+    double best_score = 0, best_rate = 0, best_density = 0;
+    for (ResidentEntry *e = p->entries; e; e = e->next) {
+        if (!e->shared || e->stopped ||
+            (egtb_shared_cache_dense(e->shared) && !e->pending_measurement)) continue;
+        EgtbCacheStatistics s;
+        egtb_shared_cache_statistics(e->shared, &s);
+        if (s.lookups < e->previous_lookups || s.decompressions < e->previous_decompressions ||
+            (e->sampled && now < e->previous_time)) {
+            e->sampled = false;
+            e->previous_lookups = 0; e->previous_decompressions = 0;
+            e->pending_measurement = false;
+        }
+        if (!e->sampled) {
+            /* First interval is warm-up, also after a resize. */
+            if (s.lookups == e->previous_lookups) continue;
+            e->previous_lookups = s.lookups; e->previous_decompressions = s.decompressions;
+            e->previous_time = now;
+            e->sampled = true;
+            continue;
+        }
+        uint64_t lookups = s.lookups - e->previous_lookups;
+        uint64_t decompressions = s.decompressions - e->previous_decompressions;
+        if (!lookups) { e->previous_time = now; continue; }
+        double elapsed = now - e->previous_time;
+        if (lookups < 100000 || !(elapsed > 0)) continue;
+        double rate = (double)decompressions / elapsed;
+        double density = (double)decompressions * 1000000 / (double)lookups;
+        e->previous_lookups = s.lookups; e->previous_decompressions = s.decompressions;
+        e->previous_time = now;
+        if (e->pending_measurement) {
+            egtb_progress_log("shared dependency cache measurement: maximum-index=%" PRIu64
+                " decompressions/s=%.0f -> %.0f; decompressions/million-lookups=%.1f -> %.1f (observed, workload may differ)\n",
+                egtb_maximum_index(e->backing), e->before_growth_rate, rate,
+                e->before_growth_density, density);
+            e->pending_measurement = false;
+        }
+        /* Ignore small/cold samples and implicit-draw misses, regardless of hit rate. */
+        if (decompressions < 1000 || egtb_shared_cache_dense(e->shared)) continue;
+        uint64_t payload = egtb_shared_cache_bytes(e->shared);
+        if (payload > SIZE_MAX / 2) continue;
+        payload *= 2;
+        uint64_t allocation = egtb_shared_cache_planned_allocation(e->backing, (size_t)payload);
+        uint64_t old_allocation = egtb_shared_cache_allocation(e->shared);
+        if (allocation <= old_allocation) continue;
+        /* Both old and new storage coexist during migration. */
+        if (allocation > p->shared_budget - p->shared_allocated) continue;
+        double score = rate / ((double)(allocation - old_allocation) / 1048576);
+        if (score > best_score) {
+            best = e; best_score = score; best_payload = payload;
+            best_allocation = allocation; best_rate = rate; best_density = density;
+        }
+    }
+    if (best) {
+        uint64_t old = egtb_shared_cache_bytes(best->shared);
+        uint64_t old_allocation = egtb_shared_cache_allocation(best->shared);
+        if (egtb_shared_cache_grow(best->shared, (size_t)best_payload)) {
+            uint64_t actual = egtb_shared_cache_bytes(best->shared);
+            p->shared_used += actual - old;
+            p->shared_allocated += best_allocation - old_allocation;
+            ++p->growths; best->sampled = false;
+            best->pending_measurement = true;
+            best->before_growth_rate = best_rate;
+            best->before_growth_density = best_density;
+            egtb_progress_log("shared dependency cache: maximum-index=%" PRIu64 " grew %.2f -> %.2f MiB; mode=%s; decompressions/s=%.0f; pressure=%.1f decompressions/s/additional-MiB\n",
+                egtb_maximum_index(best->backing),
+                (double)old / 1048576, (double)actual / 1048576,
+                egtb_shared_cache_dense(best->shared) ? "dense (lazy)" : "cached",
+                best_rate, best_score);
+        } else {
+            best->stopped = true; /* Preserve old cache; allocation failure is recoverable. */
+            egtb_progress_log("shared dependency cache growth skipped: %s\n", egtb_last_error());
+        }
+    }
+    pthread_mutex_unlock(&p->mutex);
 }
 
 bool dependency_resident_acquire(DependencyResidentPool *p, Egtb *backing,
@@ -140,6 +317,14 @@ void dependency_resident_report(DependencyResidentPool *p)
            " MiB used=%.2f MiB loaded=%u cached=%u\n",
            p->budget / 1048576, p->maximum_database / 1048576,
            (double)p->used / 1048576, p->loaded, p->cached);
+    if (p->shared_bytes)
+        printf("optimistic dependency caches: %s=%" PRIu64
+               " MiB used=%.2f MiB databases=%u\n",
+               p->shared_budget ? "initial-database" : "maximum-database", p->shared_bytes / 1048576,
+               (double)p->shared_used / 1048576, p->shared_count);
+    if (p->shared_budget)
+        printf("adaptive shared-cache budget: %" PRIu64 " MiB allocated=%.2f MiB growths=%u (metadata included)\n",
+               p->shared_budget / 1048576, (double)p->shared_allocated / 1048576, p->growths);
     pthread_mutex_unlock(&p->mutex);
 }
 
@@ -148,7 +333,8 @@ void dependency_resident_destroy(DependencyResidentPool *p)
     if (!p) return;
     while (p->entries) {
         ResidentEntry *e = p->entries; p->entries = e->next;
-        egtb_resident_destroy(e->resident); free(e);
+        egtb_resident_destroy(e->resident);
+        egtb_shared_cache_destroy(e->shared); free(e);
     }
     pthread_cond_destroy(&p->changed);
     pthread_mutex_destroy(&p->mutex);

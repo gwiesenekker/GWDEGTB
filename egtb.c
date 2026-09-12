@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1718,6 +1719,279 @@ bool egtb_view_get(EgtbView *view, uint64_t index, EgtbSide side,
     *value = egtb_decode_dtm(
         stored_value(egtb, entries, entry_index, side));
     return true;
+}
+
+/* Separate control cache lines: readers never write them. Every payload word
+ * is atomic too; a sequence check does not legalize racing ordinary accesses. */
+typedef struct {
+    _Atomic uint64_t sequence, tag;
+    unsigned char padding[48];
+} SharedSlot;
+_Static_assert(sizeof(SharedSlot) == 64, "shared slot must occupy one cache line");
+_Static_assert(sizeof(_Atomic uint64_t) == 8, "shared payload uses 64-bit words");
+
+struct EgtbSharedCache {
+    Egtb *backing;
+    SharedSlot *slots;
+    _Atomic uint64_t *words;
+    size_t per_side, capacity, words_per_page;
+    bool dense;
+    pthread_mutex_t probes_mutex;
+    EgtbSharedProbe *probes;
+};
+
+struct EgtbSharedProbe {
+    EgtbSharedCache *cache;
+    EgtbView *scratch;
+    EgtbSharedStatistics statistics;
+    EgtbSharedProbe *next;
+};
+
+static size_t shared_per_side(Egtb *backing, size_t bytes)
+{
+    size_t n = bytes / backing->memory_page_size / (backing->planar ? 2 : 1);
+    if (n >= backing->side_page_count) return (size_t)backing->side_page_count;
+    if (!n) return 0;
+    size_t power = 1;
+    while (power <= n / 2) power *= 2;
+    return power;
+}
+
+uint64_t egtb_shared_cache_planned_allocation(Egtb *backing, size_t bytes)
+{
+    if (!backing) return 0;
+    uint64_t n = shared_per_side(backing, bytes) * (backing->planar ? 2u : 1u);
+    uint64_t unit = backing->memory_page_size + (uint64_t)sizeof(SharedSlot);
+    return n > UINT64_MAX / unit ? UINT64_MAX : n * unit;
+}
+
+bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes)
+{
+    if (!out) return fail("invalid shared cache output");
+    *out = NULL;
+    if (!backing || !backing->readonly || backing->memory_page_size % 8)
+        return fail("optimistic cache requires a read-only DTM backing");
+    _Atomic uint64_t example = 0;
+    if (!atomic_is_lock_free(&example))
+        return fail("optimistic cache requires lock-free 64-bit atomics");
+    size_t sides = backing->planar ? 2 : 1;
+    size_t per_side = shared_per_side(backing, bytes);
+    if (!per_side) return fail("shared cache budget is smaller than one logical page");
+    bool dense = per_side >= backing->side_page_count;
+    if (dense) per_side = (size_t)backing->side_page_count;
+    else {
+        size_t power = 1;
+        while (power <= per_side / 2) power *= 2;
+        per_side = power;
+    }
+    size_t capacity = per_side * sides;
+    if (capacity > SIZE_MAX / sizeof(SharedSlot))
+        return fail("shared cache metadata size overflow");
+    EgtbSharedCache *c = calloc(1, sizeof(*c));
+    if (!c) return fail("cannot allocate shared cache");
+    if (pthread_mutex_init(&c->probes_mutex, NULL)) {
+        free(c); return fail("cannot initialize shared cache registry");
+    }
+    c->backing = backing; c->per_side = per_side; c->capacity = capacity;
+    c->dense = dense; c->words_per_page = backing->memory_page_size / 8;
+    c->slots = aligned_alloc(64, capacity * sizeof(SharedSlot));
+    c->words = malloc(capacity * backing->memory_page_size);
+    if (!c->slots || !c->words) {
+        egtb_shared_cache_destroy(c);
+        return fail("cannot allocate optimistic cache storage");
+    }
+    for (size_t i = 0; i < capacity; ++i) {
+        atomic_init(&c->slots[i].sequence, 0);
+        atomic_init(&c->slots[i].tag, UINT64_MAX);
+    }
+    for (size_t i = 0; i < capacity * c->words_per_page; ++i)
+        atomic_init(&c->words[i], 0);
+    *out = c;
+    return true;
+}
+
+void egtb_shared_cache_destroy(EgtbSharedCache *c)
+{
+    if (!c) return;
+    for (EgtbSharedProbe *p = c->probes; p; p = p->next) p->cache = NULL;
+    pthread_mutex_destroy(&c->probes_mutex);
+    free(c->words); free(c->slots); free(c);
+}
+
+uint64_t egtb_shared_cache_bytes(const EgtbSharedCache *c)
+{
+    return c ? (uint64_t)c->capacity * c->words_per_page * 8 : 0;
+}
+
+uint64_t egtb_shared_cache_allocation(const EgtbSharedCache *c)
+{
+    return c ? egtb_shared_cache_bytes(c) + (uint64_t)c->capacity * sizeof(SharedSlot) : 0;
+}
+
+bool egtb_shared_cache_dense(const EgtbSharedCache *c) { return c && c->dense; }
+
+void egtb_shared_cache_statistics(EgtbSharedCache *c, EgtbCacheStatistics *stats)
+{
+    memset(stats, 0, sizeof(*stats));
+    /* No lookup is active; registry mutex only protects create/destroy. */
+    pthread_mutex_lock(&c->probes_mutex);
+    for (EgtbSharedProbe *p = c->probes; p; p = p->next) {
+        stats->lookups += p->statistics.cache.lookups;
+        stats->hits += p->statistics.cache.hits;
+        stats->misses += p->statistics.cache.misses;
+        stats->decompressions += p->scratch->statistics.decompressions;
+    }
+    pthread_mutex_unlock(&c->probes_mutex);
+}
+
+bool egtb_shared_cache_grow(EgtbSharedCache *c, size_t bytes)
+{
+    if (!c) return fail("invalid shared cache growth");
+    if (shared_per_side(c->backing, bytes) <= c->per_side) return true;
+    EgtbSharedCache *next;
+    if (!egtb_shared_cache_create(&next, c->backing, bytes)) return false;
+    for (size_t old = 0; old < c->capacity; ++old) {
+        uint64_t tag = atomic_load_explicit(&c->slots[old].tag, memory_order_relaxed);
+        if (tag == UINT64_MAX) continue;
+        size_t side = c->backing->planar && tag >= c->backing->side_page_count;
+        uint64_t page = tag - side * c->backing->side_page_count;
+        size_t slot = (next->dense ? (size_t)page : (size_t)page & (next->per_side - 1))
+                      + side * next->per_side;
+        /* Doubling the mask, or switching to direct addressing, cannot merge
+         * two previously distinct slots. No I/O or decompression is needed. */
+        for (size_t w = 0; w < c->words_per_page; ++w)
+            atomic_store_explicit(&next->words[slot * c->words_per_page + w],
+                atomic_load_explicit(&c->words[old * c->words_per_page + w],
+                                     memory_order_relaxed), memory_order_relaxed);
+        atomic_store_explicit(&next->slots[slot].tag, tag, memory_order_relaxed);
+        atomic_store_explicit(&next->slots[slot].sequence, 2, memory_order_relaxed);
+    }
+    SharedSlot *old_slots = c->slots;
+    _Atomic uint64_t *old_words = c->words;
+    c->slots = next->slots; c->words = next->words;
+    c->per_side = next->per_side; c->capacity = next->capacity; c->dense = next->dense;
+    next->slots = old_slots; next->words = old_words;
+    egtb_shared_cache_destroy(next);
+    return true;
+}
+
+bool egtb_shared_probe_create(EgtbSharedProbe **out, EgtbSharedCache *cache)
+{
+    if (!out || !cache) return fail("invalid shared probe request");
+    *out = NULL;
+    EgtbSharedProbe *p = calloc(1, sizeof(*p));
+    if (!p) return fail("cannot allocate shared probe");
+    p->cache = cache;
+    /* Private Zstd/codec buffers and a decoded page. Never accessed through
+     * the private cache lookup path; view_load_page retains CRC validation. */
+    if (!egtb_view_create(&p->scratch, cache->backing, 1, false)) {
+        free(p); return false;
+    }
+    pthread_mutex_lock(&cache->probes_mutex);
+    p->next = cache->probes; cache->probes = p;
+    pthread_mutex_unlock(&cache->probes_mutex);
+    *out = p;
+    return true;
+}
+
+void egtb_shared_probe_destroy(EgtbSharedProbe *p)
+{
+    if (!p) return;
+    EgtbSharedCache *c = p->cache;
+    if (c) {
+        pthread_mutex_lock(&c->probes_mutex);
+        EgtbSharedProbe **link = &c->probes;
+        while (*link && *link != p) link = &(*link)->next;
+        if (*link) *link = p->next;
+        pthread_mutex_unlock(&c->probes_mutex);
+    }
+    egtb_view_close(p->scratch); free(p);
+}
+
+void egtb_shared_probe_statistics(const EgtbSharedProbe *p, EgtbSharedStatistics *s)
+{
+    if (!s) return;
+    if (!p) { memset(s, 0, sizeof(*s)); return; }
+    *s = p->statistics;
+    s->cache.decompressions = p->scratch->statistics.decompressions;
+}
+
+static bool EGTB_COLD_NOINLINE shared_probe_miss(EgtbSharedProbe *p,
+    uint64_t physical, size_t slot, uint32_t entry, EgtbSide side, int16_t *value)
+{
+    EgtbSharedCache *c = p->cache;
+    Egtb *db = c->backing;
+    EgtbEntry *data = (EgtbEntry *)(void *)p->scratch->data;
+    ++p->statistics.cache.misses;
+    /* Never let Zstd or memcpy write shared atomic storage. */
+    if (!view_load_page(p->scratch, physical, data)) return false;
+    *value = egtb_decode_dtm(stored_value(db, data, entry, side));
+    SharedSlot *s = &c->slots[slot];
+    uint64_t seq = atomic_load_explicit(&s->sequence, memory_order_acquire);
+    /* Saturate rather than wrap: a suspended reader can never see an ABA. */
+    if ((seq & 1) || seq >= UINT64_MAX - 1 ||
+        !atomic_compare_exchange_strong_explicit(&s->sequence, &seq, seq + 1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_relaxed)) {
+        ++p->statistics.publication_conflicts;
+        return true; /* Our privately decoded value is still valid. */
+    }
+    /* If a reader observes any replacement word/tag, this release fence
+     * synchronizes with its trailing acquire fence. The odd seq therefore
+     * happens-before its final seq load, which cannot accept the old even seq.
+     * The final release store publishes the entire page for later readers. */
+    atomic_thread_fence(memory_order_release);
+    for (size_t i = 0; i < c->words_per_page; ++i) {
+        uint64_t word;
+        memcpy(&word, (unsigned char *)(void *)data + 8 * i, 8);
+        atomic_store_explicit(&c->words[slot * c->words_per_page + i], word,
+                              memory_order_relaxed);
+    }
+    atomic_store_explicit(&s->tag, physical, memory_order_relaxed);
+    atomic_store_explicit(&s->sequence, seq + 2, memory_order_release);
+    ++p->statistics.publications;
+    return true;
+}
+
+bool egtb_shared_probe_get(EgtbSharedProbe *p, uint64_t index,
+                           EgtbSide side, int16_t *value)
+{
+#ifndef NDEBUG
+    if (!p || !value || index > p->cache->backing->maximum_index ||
+        (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
+        return fail("invalid optimistic cache lookup");
+#endif
+    EgtbSharedCache *c = p->cache;
+    Egtb *db = c->backing;
+    uint64_t page; uint32_t entry;
+    split_entry_index(db, index, &page, &entry);
+    size_t slot = c->dense ? (size_t)page : (size_t)page & (c->per_side - 1);
+    uint64_t physical = page;
+    size_t byte = (size_t)entry * (db->planar ? 2 : 4);
+    if (db->planar) {
+        slot += (size_t)side * c->per_side;
+        physical += (uint64_t)side * db->side_page_count;
+    } else byte += (size_t)side * 2;
+    ++p->statistics.cache.lookups;
+    SharedSlot *s = &c->slots[slot];
+    uint64_t before = atomic_load_explicit(&s->sequence, memory_order_acquire);
+    if (before & 1) ++p->statistics.busy_reads;
+    else if (atomic_load_explicit(&s->tag, memory_order_relaxed) == physical) {
+        uint64_t word = atomic_load_explicit(
+            &c->words[slot * c->words_per_page + byte / 8], memory_order_relaxed);
+        atomic_thread_fence(memory_order_acquire);
+        uint64_t after = atomic_load_explicit(&s->sequence, memory_order_relaxed);
+        if (before == after) {
+            int16_t stored;
+            memcpy(&stored, (unsigned char *)&word + byte % 8, sizeof(stored));
+            *value = egtb_decode_dtm(stored);
+            ++p->statistics.cache.hits;
+            return true;
+        }
+        ++p->statistics.invalidated_reads;
+    }
+    /* One optimistic attempt only: replacement cannot starve a reader. */
+    return shared_probe_miss(p, physical, slot, entry, side, value);
 }
 
 bool egtb_view_get_pair(EgtbView *view, uint64_t index,

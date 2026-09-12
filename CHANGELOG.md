@@ -5,7 +5,37 @@ revision independently of individual commits; version 3.3 starts at 3.301.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
 
-## Unreleased — revision 3.304
+## Unreleased — revision 3.307
+
+- Rank adaptive shared-cache growth by recent decompressions per second per
+  additional MiB, including metadata, instead of the 95% hit-rate cutoff.
+  Ignore implicit-draw misses and small samples; retain quiescent doubling,
+  post-growth warm-up and the old-plus-new allocation budget.
+- Log before/after decompression pressure and decompressions per million
+  lookups. No shrinking or reclamation yet; no new work on the probe hit path.
+
+### Revision 3.306
+
+- Optional adaptive shared-cache doubling under a combined allocation budget.
+  Migrate loaded pages without I/O; switch to collision-free, lazily populated
+  dense addressing when the entire dependency fits. Budget includes old/new
+  overlap and slot metadata. Resident admission stays separate.
+- Sample after worker joins, discarding warm-up and requiring 100,000 lookups
+  with hit rate below 95%. Adaptive initialization/verification use bounded scan
+  rounds; no resize bookkeeping or synchronization on the probe hit path.
+- Test growth, retained pages/probes, dense transitions and migration budget limits.
+
+### Revision 3.305
+
+- Added an opt-in optimistic shared cache for nonresident read-only dependency
+  DTMs in generation and standalone verification, configured with
+  `EGTB_DEPENDENCY_SHARED_CACHE_MIB` (per database, default disabled).
+  Atomic tags and payload words, bounded private fallback, CRC-before-publication,
+  saturation against sequence wrap, and worker-private diagnostic counters.
+- Added concurrent cache replacement, shared admission, dense-cache, wide-DTM,
+  tail/draw-page and corruption regression tests.
+
+### Revision 3.304
 
 - Share immutable, checksum-verified dependency DTMs across workers in
   generation and standalone verification. Default admission limits: 2 GiB

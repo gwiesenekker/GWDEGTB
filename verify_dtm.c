@@ -26,6 +26,7 @@ typedef struct {
     Egtb *database;
     EgtbView *view;
     const EgtbResident *resident;
+    EgtbSharedProbe *shared_probe;
     uint64_t resident_lookups;
     EgIndexer indexer;
     bool indexer_initialized;
@@ -63,6 +64,31 @@ static void initialize_catalog(DatabaseCatalog *catalog, size_t cache_bytes,
                 }
 }
 
+static void print_shared_statistics(const DatabaseCatalog *catalogs, unsigned count)
+{
+    uint64_t busy=0, invalidated=0, conflicts=0, published=0;
+    unsigned probes=0;
+    for (unsigned c=0; c<count; ++c)
+        for (unsigned wk=0; wk<=EGTB_MAX_PIECES; ++wk)
+            for (unsigned wm=0; wm<=EGTB_MAX_PIECES; ++wm)
+                for (unsigned bk=0; bk<=EGTB_MAX_PIECES; ++bk)
+                    for (unsigned bm=0; bm<=EGTB_MAX_PIECES; ++bm) {
+                        EgtbSharedProbe *p = catalogs[c].entry[wk][wm][bk][bm].shared_probe;
+                        if (!p) continue;
+                        EgtbSharedStatistics s;
+                        egtb_shared_probe_statistics(p, &s);
+                        ++probes; busy += s.busy_reads; invalidated += s.invalidated_reads;
+                        conflicts += s.publication_conflicts; published += s.publications;
+                    }
+    if (probes)
+        printf("optimistic dependency cache activity (whole run):\n"
+               "  Busy reads              %20" PRIu64 "\n"
+               "  Invalidated reads       %20" PRIu64 "\n"
+               "  Publication conflicts   %20" PRIu64 "\n"
+               "  Pages published         %20" PRIu64 "\n",
+               busy, invalidated, conflicts, published);
+}
+
 static void close_catalog(DatabaseCatalog *catalog)
 {
     for (unsigned wk = 0; wk <= EGTB_MAX_PIECES; ++wk)
@@ -70,6 +96,8 @@ static void close_catalog(DatabaseCatalog *catalog)
             for (unsigned bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
                 for (unsigned bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
                     CatalogEntry *entry = &catalog->entry[wk][wm][bk][bm];
+                    egtb_shared_probe_destroy(entry->shared_probe);
+                    entry->shared_probe = NULL;
                     if (entry->view != NULL)
                         egtb_view_close(entry->view);
                     if (entry->database != NULL)
@@ -84,7 +112,7 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
 {
     char path[128];
     size_t pages;
-    if (entry->resident != NULL || entry->view != NULL)
+    if (entry->resident != NULL || entry->view != NULL || entry->shared_probe != NULL)
         return true;
     if (entry->database != NULL) return false;
     if (!egtb_material_filename(
@@ -120,6 +148,16 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
         return false;
     }
     if (entry->resident) return true;
+    EgtbSharedCache *shared = NULL;
+    if (!dependency_shared_acquire(catalog->resident_pool, entry->database, &shared)) {
+        snprintf(catalog->error, sizeof(catalog->error), "%s", dependency_resident_error());
+        return false;
+    }
+    if (shared) {
+        if (egtb_shared_probe_create(&entry->shared_probe, shared)) return true;
+        snprintf(catalog->error, sizeof(catalog->error), "%s", egtb_last_error());
+        return false;
+    }
     if (!egtb_view_create(&entry->view, entry->database,
                           pages == 0 ? 1 : pages, false)) {
         snprintf(catalog->error, sizeof(catalog->error),
@@ -173,6 +211,7 @@ static bool catalog_probe(const DraughtsPosition *position, EgtbSide side,
     indexed.black_kings = transformed.black_kings;
     if (!eg_position_to_index(&entry->indexer, &indexed, &index) ||
         !(entry->resident ? egtb_resident_get(entry->resident, index, side, value)
+                           : entry->shared_probe ? egtb_shared_probe_get(entry->shared_probe, index, side, value)
                            : egtb_view_get(entry->view, index, side, value))) {
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot query dependency: %.200s", egtb_last_error());
@@ -209,6 +248,11 @@ static void catalog_cache_statistics(const DatabaseCatalog *catalogs,
                         if (entry->database == NULL)
                             continue;
                         egtb_view_cache_statistics(entry->view, &part);
+                        if (entry->shared_probe) {
+                            EgtbSharedStatistics shared;
+                            egtb_shared_probe_statistics(entry->shared_probe, &shared);
+                            part = shared.cache;
+                        }
                         part.lookups += entry->resident_lookups;
                         part.hits += entry->resident_lookups;
                         add_cache_statistics(statistics, &part);
@@ -403,6 +447,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s\n", dependency_resident_error());
         goto done;
     }
+    if (dependency_shared_adaptive(dependency_pool))
+        egtb_generator_quiescent_hook(dependency_shared_maintain, dependency_pool);
     for (unsigned worker = 0; worker < thread_count; ++worker) {
         initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES, dependency_pool);
         contexts[worker] = &catalogs[worker];
@@ -434,11 +480,13 @@ int main(int argc, char **argv)
            verification.positions_checked, thread_count,
            resident != NULL ? "resident" : "disk-cache");
     print_cache_statistics("current-DTM cache", &verification.cache);
+    print_shared_statistics(catalogs, thread_count);
     print_cache_statistics("dependency-DTM caches", &dependency_statistics);
     dependency_resident_report(dependency_pool);
     ok = true;
 
 done:
+    egtb_generator_quiescent_hook(NULL, NULL);
     egtb_progress_stop();
     dependency_resident_destroy(dependency_pool);
     if (catalogs != NULL) {

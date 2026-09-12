@@ -8,7 +8,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.3** (working revision **3.304**).
+Current version: **3.3** (working revision **3.307**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 The summary includes per-material dependency cache statistics, summed across
@@ -684,8 +684,8 @@ Both settings accept nonnegative whole numbers; zero disables admission.
 Admission is first-use among eligible databases, not an adaptive ranking of
 hotness. The per-database cap prevents a single large, potentially cold
 dependency from occupying the whole budget. Dependencies exceeding either
-limit retain the existing private caches; there is no eviction or promotion
-during a run. Corruption, I/O or allocation failures while loading an admitted
+limit use page caches (private by default); there is no residency eviction or
+promotion during a run. Corruption, I/O or allocation failures while loading an admitted
 database are fatal, not silently treated as draws or cache misses.
 
 Budgets count paired 16-bit array payloads (four bytes per position), not all
@@ -697,6 +697,95 @@ spawning extra threads or disturbing phase progress; distinct dependencies
 can load concurrently. The pool also serves external material dependencies
 during sliced generation, but completed-slice caches remain unchanged.
 GWD's public lookup APIs are unchanged.
+
+### Experimental optimistic shared dependency cache
+
+Set `EGTB_DEPENDENCY_SHARED_CACHE_MIB` to enable a shared read-only page cache
+for each dependency which is not admitted to residency. Default **0** retains
+the existing private caches. This setting is a **per-database payload budget
+shared by all workers**, not a total memory limit.
+
+```sh
+# Compare with 16 workers each using the default 64 MiB private cache:
+EGTB_DEPENDENCY_RESIDENT_GIB=0 EGTB_DEPENDENCY_SHARED_CACHE_MIB=1024 \
+  ./generate_egtb -j 16 3 0 2 1
+```
+
+Resident dependencies still take priority. A cache that holds all pages uses
+collision-free addressing; otherwise each side uses a power-of-two number of
+slots rounded down to fit the budget. Actual allocation is reported, with
+another 64 bytes of metadata per physical slot and private codec/scratch
+workspaces per worker. Multiply by the number of nonresident dependencies
+opened when planning RAM.
+
+Hits optimistically read a sequence counter, atomic page tag and atomic
+64-bit payload word, then validate the sequence. They do not acquire locks
+or write shared state. On a miss or concurrent replacement, the worker
+decompresses and checksum-validates into private scratch memory. It then
+tries once to publish with a compare-and-exchange and atomic word stores;
+if another worker is publishing, it returns its private result without waiting.
+Duplicate decompressions are possible. Sequence counters saturate rather than
+wrap. The shared data is never passed directly to Zstd.
+
+Both `generate_egtb` and `verify_dtm` support this option. Writable databases,
+current-database verification caches, completed-slice caches and GWD's API
+are unchanged. This remains opt-in pending representative performance tests.
+`test_shared_cache` exercises concurrent replacement, dense-cache hits,
+shared admission, wide DTM values, partial/draw pages and corruption rejection.
+
+#### Adaptive doubling and lazy dense mode
+
+To enable growth, also set a **total** shared-cache budget:
+
+```sh
+export EGTB_DEPENDENCY_SHARED_CACHE_MIB=64  # Initial payload per cached dependency
+export EGTB_DEPENDENCY_SHARED_CACHE_GIB=8   # Combined shared-cache allocation budget
+```
+
+The total defaults to **0**, retaining fixed-size behavior. The initial MIB
+setting must also be nonzero to enable shared caches. Existing resident
+dependency admission still has priority and its budget is separate.
+
+At a quiescent checkpoint, the coordinator samples private probe counters.
+It discards the first nonempty interval (and the first interval after growth)
+as warm-up, then requires at least 100,000 lookups and 1,000 actual
+decompressions in a sample. There is no hit-rate cutoff: a busy dependency
+with 99.9% hits can still benefit. The eligible dependency with the highest
+**decompressions/second per additional MiB** is doubled (additional allocation
+includes slot metadata). Rates use monotonic elapsed time between checkpoints;
+these measure workload pressure, not decompression CPU time or guaranteed savings.
+Implicit-draw misses do not count. An idle checkpoint resets the sample clock.
+If the doubled size
+would hold every page, allocation is capped to the exact page count and
+addressing becomes dense. Loaded pages are migrated without disk reads;
+remaining pages load on demand. Dense caches never evict and do not grow again,
+but retain the optimistic sequence checks for concurrent first loads.
+
+Initialization and final verification use rounds of up to 1,048,576 positions
+per worker when adaptive mode is enabled, keeping ownership ranges unchanged.
+All workers join before maintenance and the next round starts afterwards.
+Backtracking also checks between worker batches; repair checks between passes.
+Progress remains one continuous phase. This adds occasional thread-launch/join
+overhead but no maintenance checks, shared counter updates or locks per probe.
+Growth messages report size, mode, decompressions/second and pressure.
+After growth, one active interval is discarded as a cooldown/warm-up, then the
+next sufficiently large sample reports before/after decompressions/second and
+decompressions per million lookups. Workloads can change between samples, so
+these are observational comparisons, not measured causal speedups. This first
+policy only grows caches; shrinking, reclamation and grow/shrink hysteresis
+remain future work.
+
+The total budget includes shared page payload, 64-byte slot metadata, **and
+old/new allocation overlap during migration**. Therefore growth may stop before
+the final allocation alone would consume the budget. New dependencies that
+cannot obtain their initial allocation fall back to private caches; those
+caches, codec workspaces, resident arrays, bitmaps and directories are outside
+this budget. Allocation failure during growth retains the old working cache.
+This is not a whole-process RAM limit.
+
+`make test-adaptive` generates a private-cache baseline and an adaptive
+`1 1 1 1` database, compares every paired value and runs standalone verification
+across multiple scan rounds.
 
 Configure current-database final handling separately with:
 

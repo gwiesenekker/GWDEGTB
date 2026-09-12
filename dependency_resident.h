@@ -15,6 +15,22 @@ bool dependency_resident_configure(DependencyResidentPool **out);
  * A returned array is immutable and may be queried without synchronization. */
 bool dependency_resident_acquire(DependencyResidentPool *pool, Egtb *backing,
                                   const EgtbResident **out);
+/* After resident admission returns NULL. Experimental, disabled by default;
+ * EGTB_DEPENDENCY_SHARED_CACHE_MIB sets payload budget per cached database. */
+bool dependency_shared_acquire(DependencyResidentPool *pool, Egtb *backing,
+                               EgtbSharedCache **out);
+/* A nonzero SHARED_CACHE_GIB enables doubling, bounds combined allocations
+ * including migration/slot metadata; MIB remains the initial per-DB size.
+ * Maintain must run on the coordinator with ALL probes quiescent. */
+bool dependency_shared_adaptive(DependencyResidentPool *pool);
+/* Configure before any acquisitions. Useful for embedding/tests; zero total
+ * keeps fixed-size mode. Total includes slot metadata and migration storage. */
+bool dependency_shared_configure(DependencyResidentPool *pool,
+                                  size_t initial_bytes, uint64_t total_bytes);
+void dependency_shared_maintain(void *pool);
+/* Same quiescent maintenance with an explicit monotonic time in seconds,
+ * for deterministic policy tests. Do not mix clock domains within a pool. */
+void dependency_shared_maintain_at(DependencyResidentPool *pool, double now);
 void dependency_resident_destroy(DependencyResidentPool *pool);
 void dependency_resident_report(DependencyResidentPool *pool);
 uint64_t dependency_resident_used(DependencyResidentPool *pool);

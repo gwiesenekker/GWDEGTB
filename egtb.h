@@ -95,6 +95,35 @@ typedef struct {
 
 const char *egtb_last_error(void);
 
+/* Experimental read-only optimistic page cache. One cache per shared backing,
+ * one probe per worker. No queries may be active during destruction; destroy
+ * probes before their backing. The backing must remain open during queries.
+ * Cache destruction itself needs no backing access.
+ * Counters are worker-private; read them after joining that worker. */
+typedef struct EgtbSharedCache EgtbSharedCache;
+typedef struct EgtbSharedProbe EgtbSharedProbe;
+typedef struct {
+    EgtbCacheStatistics cache;
+    uint64_t busy_reads, invalidated_reads, publication_conflicts, publications;
+} EgtbSharedStatistics;
+bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes);
+void egtb_shared_cache_destroy(EgtbSharedCache *cache);
+uint64_t egtb_shared_cache_bytes(const EgtbSharedCache *cache);
+/* The following maintenance operations require ALL probes to be quiescent.
+ * Growth preserves the cache object/probe pointers and migrates loaded pages.
+ * Allocation bytes include slot metadata, but not per-probe codec workspaces. */
+uint64_t egtb_shared_cache_allocation(const EgtbSharedCache *cache);
+uint64_t egtb_shared_cache_planned_allocation(Egtb *backing, size_t payload_bytes);
+bool egtb_shared_cache_dense(const EgtbSharedCache *cache);
+bool egtb_shared_cache_grow(EgtbSharedCache *cache, size_t payload_bytes);
+void egtb_shared_cache_statistics(EgtbSharedCache *cache, EgtbCacheStatistics *stats);
+bool egtb_shared_probe_create(EgtbSharedProbe **out, EgtbSharedCache *cache);
+void egtb_shared_probe_destroy(EgtbSharedProbe *probe);
+bool egtb_shared_probe_get(EgtbSharedProbe *probe, uint64_t index,
+                           EgtbSide side, int16_t *value);
+void egtb_shared_probe_statistics(const EgtbSharedProbe *probe,
+                                  EgtbSharedStatistics *statistics);
+
 /* Convert exact public plies to/from signed 16-bit half-distance codes. */
 bool egtb_encode_dtm(int16_t value, int16_t *stored);
 int16_t egtb_decode_dtm(int16_t stored);

@@ -40,3 +40,4 @@ test_storage_safety
 test_compact_pipeline
 /test_frontier
 /test_dependency_resident
+/test_shared_cache

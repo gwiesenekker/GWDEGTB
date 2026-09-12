@@ -13,6 +13,18 @@
 #include <string.h>
 #include <time.h>
 
+static _Thread_local void (*quiescent_hook)(void *);
+static _Thread_local void *quiescent_context;
+void egtb_generator_quiescent_hook(void (*hook)(void *), void *context)
+{
+    quiescent_hook = hook; quiescent_context = context;
+}
+static void quiescent_maintenance(void)
+{
+    if (quiescent_hook) quiescent_hook(quiescent_context);
+}
+#define MAINTENANCE_SCAN_ENTRIES UINT64_C(1048576)
+
 #if defined(EGTB_PADDED_MOVEGEN) && \
     !defined(EGTB_PADDED_MOVEGEN_CALLBACK)
 #define GENERATE_QUIET_PREDECESSORS \
@@ -1688,6 +1700,7 @@ bool egtb_make_consistent_threaded(
         }
         if (created_threads != thread_count)
             goto done;
+        quiescent_maintenance();
         for (i = 0; i < thread_count; ++i) {
             local.positions_checked += workers[i].positions_checked;
             if (workers[i].failed) {
@@ -1976,6 +1989,14 @@ static bool verify_consistent_impl(
                         position_count - (verified_positions != NULL
                             ? progress_bitmap_count(verified_positions) : 0),
                         "positions");
+    uint64_t full_end[EGTB_MAX_THREADS];
+    for (i = 0; i < thread_count; ++i) {
+        full_end[i] = workers[i].end_index;
+        if (quiescent_hook && full_end[i] - workers[i].first_index > MAINTENANCE_SCAN_ENTRIES)
+            workers[i].end_index = workers[i].first_index + MAINTENANCE_SCAN_ENTRIES;
+    }
+verification_round:
+    created_threads = 0;
     for (i = 0; i < thread_count; ++i) {
         int error = pthread_create(&threads[i], NULL,
                                    run_consistency_verify_worker,
@@ -1998,6 +2019,17 @@ join:
     }
     if (created_threads != thread_count)
         goto done;
+    quiescent_maintenance();
+    bool more = false, failed_round = false;
+    for (i = 0; i < thread_count; ++i) {
+        failed_round |= workers[i].failed || workers[i].mismatch;
+        workers[i].first_index = workers[i].end_index;
+        uint64_t remaining = full_end[i] - workers[i].first_index;
+        workers[i].end_index += remaining > MAINTENANCE_SCAN_ENTRIES
+                               ? MAINTENANCE_SCAN_ENTRIES : remaining;
+        more |= remaining != 0;
+    }
+    if (more && !failed_round) goto verification_round;
     local.passes = 1;
     /* A storage/probe error takes precedence over a mismatch in another worker. */
     for (i = 0; i < thread_count; ++i)
@@ -2343,7 +2375,15 @@ static bool initialize_frontier_range(FrontierWorker *worker)
         }
         egtb_progress_tick(&worker->progress_pending);
     }
-    worker->initialization = local;
+    worker->initialization.positions += local.positions;
+    for (unsigned s = 0; s < 2; ++s) {
+        worker->initialization.legal_moves[s] += local.legal_moves[s];
+        worker->initialization.lost_in_zero[s] += local.lost_in_zero[s];
+        worker->initialization.won_in_one[s] += local.won_in_one[s];
+        worker->initialization.external_wins[s] += local.external_wins[s];
+        worker->initialization.external_losses[s] += local.external_losses[s];
+        worker->initialization.unknown[s] += local.unknown[s];
+    }
     return true;
 }
 
@@ -2741,11 +2781,20 @@ static bool run_frontier_workers(FrontierWorker *workers, pthread_t *threads,
         for (i = 0; i < thread_count; ++i)
             total += workers[i].marked_candidates;
     egtb_progress_begin(label, total, "positions");
+    uint64_t first[EGTB_MAX_THREADS], end[EGTB_MAX_THREADS];
+    bool chunked = quiescent_hook && workers[0].work == FRONTIER_WORK_INITIALIZE;
+    for (i = 0; i < thread_count; ++i) {
+        first[i] = workers[i].first_index; end[i] = workers[i].end_index;
+        if (chunked && end[i] - first[i] > MAINTENANCE_SCAN_ENTRIES)
+            workers[i].end_index = first[i] + MAINTENANCE_SCAN_ENTRIES;
+    }
     if ((workers[0].work == FRONTIER_WORK_LOSS_CANDIDATES ||
          workers[0].work == FRONTIER_WORK_WIN_CANDIDATES) && total == 0) {
         egtb_progress_end(true);
         return true;
     }
+frontier_round:
+    created = 0;
     for (i = 0; i < thread_count; ++i) {
         int error;
         workers[i].failed = false;
@@ -2774,6 +2823,21 @@ static bool run_frontier_workers(FrontierWorker *workers, pthread_t *threads,
             return fail("frontier worker %u failed: %s", i,
                         workers[i].error);
         }
+    quiescent_maintenance();
+    if (chunked) {
+        bool more = false;
+        for (i = 0; i < thread_count; ++i) {
+            workers[i].first_index = workers[i].end_index;
+            uint64_t remaining = end[i] - workers[i].first_index;
+            workers[i].end_index += remaining > MAINTENANCE_SCAN_ENTRIES
+                                   ? MAINTENANCE_SCAN_ENTRIES : remaining;
+            more |= remaining != 0;
+        }
+        if (more) goto frontier_round;
+        for (i = 0; i < thread_count; ++i) {
+            workers[i].first_index = first[i]; workers[i].end_index = end[i];
+        }
+    }
     egtb_progress_end(true);
     return true;
 }
