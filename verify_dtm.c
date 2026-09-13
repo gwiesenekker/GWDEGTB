@@ -449,6 +449,7 @@ int main(int argc, char **argv)
     }
     if (dependency_shared_adaptive(dependency_pool))
         egtb_generator_quiescent_hook(dependency_shared_maintain, dependency_pool);
+    egtb_generator_phase_hook(dependency_shared_phase, dependency_pool);
     for (unsigned worker = 0; worker < thread_count; ++worker) {
         initialize_catalog(&catalogs[worker], DEPENDENCY_CACHE_BYTES, dependency_pool);
         contexts[worker] = &catalogs[worker];
@@ -487,6 +488,7 @@ int main(int argc, char **argv)
 
 done:
     egtb_generator_quiescent_hook(NULL, NULL);
+    egtb_generator_phase_hook(NULL, NULL);
     egtb_progress_stop();
     dependency_resident_destroy(dependency_pool);
     if (catalogs != NULL) {

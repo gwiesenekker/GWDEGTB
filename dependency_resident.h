@@ -34,6 +34,16 @@ void dependency_shared_maintain(void *pool, unsigned workers);
 /* Same quiescent maintenance with an explicit monotonic time in seconds,
  * for deterministic policy tests. Do not mix clock domains within a pool. */
 void dependency_shared_maintain_at(DependencyResidentPool *pool, double now);
+/* Called only with all probes quiescent; cancels trials and resets idle grace. */
+void dependency_shared_phase(void *pool);
+void dependency_shared_phase_at(DependencyResidentPool *pool, double now);
+typedef struct {
+    uint64_t allocated, recovery_reserve;
+    unsigned shrinks, transfers, rollbacks;
+    bool assessing;
+} DependencyCoordinatorStatistics;
+void dependency_shared_coordinator_statistics(DependencyResidentPool *pool,
+                                              DependencyCoordinatorStatistics *out);
 void dependency_resident_destroy(DependencyResidentPool *pool);
 void dependency_resident_report(DependencyResidentPool *pool);
 uint64_t dependency_resident_used(DependencyResidentPool *pool);

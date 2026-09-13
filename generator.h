@@ -107,6 +107,8 @@ typedef bool (*EgtbExternalProbe)(
  * Enabled scans use 1M-position rounds per worker, retaining
  * their original ownership ranges and private dependency contexts. */
 void egtb_generator_quiescent_hook(void (*hook)(void *, unsigned), void *context);
+/* Initialization (including slices) and read-only verification boundaries. */
+void egtb_generator_phase_hook(void (*hook)(void *), void *context);
 
 typedef void (*EgtbConsistencyReporter)(
     uint64_t index, EgtbSide side, const DraughtsPosition *position,

@@ -8,7 +8,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.3** (working revision **3.311**).
+Current version: **3.3** (working revision **3.312**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 The summary includes per-material dependency cache statistics, summed across
@@ -770,7 +770,12 @@ with 99.9% hits can still benefit. The eligible dependency with the highest
 includes slot metadata). Rates use monotonic elapsed time between checkpoints;
 these measure workload pressure, not decompression CPU time or guaranteed savings.
 Implicit-draw misses do not count. An idle checkpoint resets the sample clock.
-Each cache keeps its own scaling factor, initially 1.5. The environment setting
+Each cache keeps its own scaling factor, initially 1.5.
+Under high measured load share, revision 3.313 takes up to three factor steps
+at once: the smallest power covering load share / admission floor, capped at
+3.375x (or an explicitly larger base factor). Zero admission floor disables
+acceleration. Existing sample confidence, measurement and memory guards apply.
+The environment setting
 `EGTB_DEPENDENCY_SHARED_CACHE_GROWTH` accepts 1.1..4. Sizes round down to complete
 pages with equal capacity per side; growth requests advance by at least one
 page per side. If the requested allocation exceeds remaining migration headroom,
@@ -899,6 +904,68 @@ tests passed, including fractional migration, shrinking, collisions and
 budget-clamped growth. Logs: `/tmp/gwdegtb-policy-puCiJR/`. This is not a
 16-thread or eight-piece scaling benchmark, nor a comparison of old/new
 cache-addressing implementations.
+
+#### Conservative memory coordinator (3.312, refined in 3.313)
+
+Adaptive shared pools now reclaim sustained-idle caches when an eligible
+growth cannot be funded. Set `EGTB_DEPENDENCY_SHARED_CACHE_REBALANCE=0` to
+retain growth-only behavior (default: `1`). Fixed-size pools are unchanged.
+Resident arrays remain outside this coordinator and keep their separate budget.
+
+Stage one uses **idle donors only**: no lookups for at least 60 seconds,
+including dense caches. It never treats a high hit rate as evidence that an
+active cache can shrink. A donor shrinks by its per-cache factor (default
+divide by 1.5), rounded to whole slots, down to the smaller of its initial
+size and 1 MiB. The coordinator tries a feasible donor for the highest-scored
+unfunded growth request. Without a growth request, idle reclamation is attempted
+only above 90% budget utilization. This is a conservative heuristic, not an
+optimal allocator or a ghost-based miss predictor.
+
+Only one transfer experiment is outstanding. Before starting, the coordinator
+checks every allocate-before-free peak for both forward execution and recovery.
+It reserves recovery headroom against new admissions and suspends other resizing.
+If the donor develops decompression pressure during assessment, the receiver is restored first,
+then the donor. A transfer is accepted after receiver warm-up plus two substantial
+measurement windows only if decompressions per lookup improve by at least 10%
+(or it becomes dense). No evidence within 120 seconds causes rollback; idle-only
+reclamation is accepted after that interval if the donor remains below the pressure
+floor. An isolated donor hit does not trigger recovery. Recovery uses historical
+measured load cost, or 5 microseconds/load until available, with at least 256
+decompressions observed and cost normalized by elapsed time and worker count.
+Receiver comparisons use the same two-window baseline as ordinary growth.
+Explicit initialization and verification boundaries (also for slices) reset idle
+grace and pressure windows and roll back outstanding trials. Compilation time
+therefore cannot make a dependency immediately eligible for idle reclamation.
+Allocation failures during recovery retain the reservation and retry at subsequent
+checkpoints; budget headroom does not guarantee allocation success at the OS level.
+After assessment the donor is protected for 300 seconds and receiver for 60.
+For a reproducible constrained-budget six-piece A/B, run
+`sh benchmark_coordinator.sh /absolute/path/generate_egtb /absolute/path/databases 16 2`.
+It compares rebalancing off/on in alternating order, with a 1 GiB shared budget
+and residency disabled for dependencies. Runs use a fresh `/tmp` directory,
+verify exhaustively and compare statistics. Check that transfers actually occur
+before interpreting timing differences as coordinator benefits.
+
+The initial 3.312/3.313 two-thread A/B on `1 2 2 0` (one measured pair per
+configuration) gave adaptive-64-MiB totals of 37.54/38.15 seconds and
+adaptive-1-MiB totals of 60.94/47.98 seconds. Cold-start initialization fell
+from 32.71 to 19.40 seconds with 17 versus 7 growths. All statistics matched
+and all runs verified. These are preliminary timings, not repeated-trial
+confidence intervals or evidence of a redistribution benefit.
+The 16-thread constrained `3 0 2 1` trial took 136.25 seconds with rebalancing
+disabled and 138.19 seconds enabled; both verified with identical statistics.
+Neither triggered a shrink or transfer, so redistribution's production benefit
+remains unmeasured. Logs: `/tmp/gwdegtb-coordinator-mlKkde/`.
+
+Later workload changes can still require ordinary growth; rollback protection
+is limited to the experiment, not the remainder of generation.
+
+Logs identify experiment, acceptance and rollback, sizes, peak allocation and
+recovery reserve. The summary counts shrinks, transfers and rollbacks. The reported
+resize stall total includes coordinator resizing as well as growth. No shared
+updates or extra checks are added to the lookup hit path. Active-donor trials,
+ghost prediction, zero-headroom shrinking and parallel atomic initialization
+are deliberately deferred.
 
 `make test-adaptive` generates a private-cache baseline and an adaptive
 `1 1 1 1` database, compares every paired value and runs standalone verification

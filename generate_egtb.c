@@ -631,6 +631,7 @@ int main(int argc, char **argv)
     }
     if (dependency_shared_adaptive(dependency_pool))
         egtb_generator_quiescent_hook(dependency_shared_maintain, dependency_pool);
+    egtb_generator_phase_hook(dependency_shared_phase, dependency_pool);
     catalogs = calloc(thread_count, sizeof(*catalogs));
     probe_contexts = calloc(thread_count, sizeof(*probe_contexts));
     if (catalogs == NULL || probe_contexts == NULL) {
@@ -898,6 +899,7 @@ int main(int argc, char **argv)
                 egtb_sliced_last_error());
 done:
     egtb_generator_quiescent_hook(NULL, NULL);
+    egtb_generator_phase_hook(NULL, NULL);
     egtb_progress_end(ok);
     egtb_progress_stop();
     egtb_resident_destroy(resident);

@@ -220,7 +220,7 @@ static void adaptive(Egtb *db)
         dependency_shared_maintain_at(pool, ++now);
         if (!sample) CHECK(egtb_shared_cache_bytes(c) == 256);
     }
-    CHECK(egtb_shared_cache_bytes(c) == 512);
+    CHECK(egtb_shared_cache_bytes(c) >= 512);
     unsigned since_growth = 0;
     for (unsigned pass=0; pass<60 && !egtb_shared_cache_dense(c); ++pass) {
         uint64_t old_allocation = egtb_shared_cache_allocation(c);
@@ -393,6 +393,77 @@ static void pressure_priority(Egtb *a, Egtb *b)
     puts("decompression pressure per additional MiB priority test passed");
 }
 
+static void coordinator(Egtb *a, Egtb *b)
+{
+    for (unsigned outcome = 0; outcome < 7; ++outcome) {
+        DependencyResidentPool *pool;
+        EgtbSharedCache *c[2]; EgtbSharedProbe *p[2];
+        Egtb *backing[2] = {a,b}; const EgtbResident *r;
+        CHECK(dependency_resident_create(&pool, 0, 0));
+        CHECK(dependency_shared_configure(pool, 256, 1800));
+        CHECK(dependency_shared_minimum_load(pool, 0));
+        for (unsigned k=0; k<2; ++k) {
+            CHECK(dependency_resident_acquire(pool, backing[k], &r) && !r);
+            CHECK(dependency_shared_acquire(pool, backing[k], &c[k]) && c[k]);
+            CHECK(egtb_shared_probe_create(&p[k], c[k]));
+        }
+        int16_t v;
+        for (unsigned pass=0; pass<6; ++pass) {
+            for (unsigned j=0; j<100001; ++j)
+                CHECK(egtb_shared_probe_get(p[0], pass < 3 && (j&1) ? 64 : 0,
+                                           EGTB_WHITE_TO_MOVE, &v));
+            dependency_shared_maintain_at(pool, pass+1);
+        }
+        CHECK(egtb_shared_cache_bytes(c[0]) == 512);
+        if (outcome == 6) dependency_shared_phase_at(pool, 67);
+        for (unsigned pass=0; pass<3; ++pass) {
+            for (unsigned j=0; j<100001; ++j)
+                CHECK(egtb_shared_probe_get(p[1], j&1 ? (outcome == 2 ? 128 : 64) : 0,
+                                           EGTB_WHITE_TO_MOVE, &v));
+            dependency_shared_maintain_at(pool, 67+pass);
+        }
+        DependencyCoordinatorStatistics s;
+        dependency_shared_coordinator_statistics(pool, &s);
+        if (outcome == 6) {
+            CHECK(!s.assessing && s.shrinks == 0);
+            CHECK(egtb_shared_cache_bytes(c[0]) == 512);
+            for (unsigned k=0; k<2; ++k) egtb_shared_probe_destroy(p[k]);
+            dependency_resident_destroy(pool);
+            continue;
+        }
+        CHECK(s.assessing && s.transfers == 1);
+        CHECK(s.allocated + s.recovery_reserve <= 1800);
+        CHECK(egtb_shared_cache_bytes(c[0]) == 256);
+        CHECK(egtb_shared_cache_bytes(c[1]) == 512);
+        if (outcome == 3) dependency_shared_maintain_at(pool, 190);
+        if (outcome == 5) dependency_shared_phase_at(pool, 70);
+        for (unsigned pass=0; outcome != 3 && outcome != 5 && pass<3; ++pass) {
+            if (!outcome) {
+                for (unsigned j=0; j<100001; ++j)
+                    CHECK(egtb_shared_probe_get(p[0], j&1 ? 64 : 0, EGTB_WHITE_TO_MOVE, &v));
+            }
+            if (outcome == 4) CHECK(egtb_shared_probe_get(p[0], 0, EGTB_WHITE_TO_MOVE, &v));
+            for (unsigned j=0; j<100001; ++j)
+                CHECK(egtb_shared_probe_get(p[1], j&1 ? (outcome == 2 ? 128 : 64) : 0,
+                                           EGTB_WHITE_TO_MOVE, &v));
+            dependency_shared_maintain_at(pool, 70+pass);
+        }
+        dependency_shared_coordinator_statistics(pool, &s);
+        CHECK(!s.assessing && !s.recovery_reserve);
+        CHECK(s.rollbacks == (outcome == 1 || outcome == 4 ? 0u : 1u));
+        CHECK(egtb_shared_cache_bytes(c[0]) == (outcome == 1 || outcome == 4 ? 256 : 512));
+        for (unsigned k=0; k<2; ++k) {
+            for (unsigned i=0; i<N; ++i) {
+                CHECK(egtb_shared_probe_get(p[k], i, EGTB_WHITE_TO_MOVE, &v));
+                CHECK(v == expected(i,0));
+            }
+            egtb_shared_probe_destroy(p[k]);
+        }
+        dependency_resident_destroy(pool);
+    }
+    puts("coordinator transfer, acceptance, returning donor and weak-benefit rollback passed");
+}
+
 static void burst_pressure(Egtb *db)
 {
     for (unsigned idle=0; idle<2; ++idle) {
@@ -418,7 +489,7 @@ static void burst_pressure(Egtb *db)
                 dependency_shared_maintain_at(pool, now);
             }
         }
-        CHECK(egtb_shared_cache_bytes(c) == (idle ? 256 : 512));
+        CHECK(idle ? egtb_shared_cache_bytes(c) == 256 : egtb_shared_cache_bytes(c) >= 512);
         uint64_t samples, ns;
         egtb_shared_cache_timing(c, &samples, &ns);
         CHECK(samples > 0 && ns > 0);
@@ -430,6 +501,11 @@ static void burst_pressure(Egtb *db)
 
 int main(void)
 {
+    CHECK(shared_cache_growth_multiplier(1.5, .006, .005) == 1.5);
+    CHECK(shared_cache_growth_multiplier(1.5, .01, .005) == 2.25);
+    CHECK(shared_cache_growth_multiplier(1.5, .10, .005) == 3.375);
+    CHECK(shared_cache_growth_multiplier(1.5, .10, 0) == 1.5);
+    CHECK(shared_cache_growth_multiplier(4, 1, .005) == 4);
     cost_policy();
     char dir[] = "/tmp/gwdegtb-shared-XXXXXX", path[256];
     CHECK(mkdtemp(dir));
@@ -451,6 +527,7 @@ int main(void)
     snprintf(alias, sizeof(alias), "%s/./test.dtm", dir);
     CHECK(egtb_open_readonly(&other, alias, 1));
     pressure_priority(db, other);
+    coordinator(db, other);
     CHECK(egtb_close(other));
     CHECK(!egtb_shared_cache_create(&cache, db, 1));
     CHECK(egtb_shared_cache_create(&cache, db, 256)); /* One slot per side. */

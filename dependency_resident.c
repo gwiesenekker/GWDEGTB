@@ -18,12 +18,16 @@ typedef struct ResidentEntry {
     bool shared_decided, sampled, stopped;
     uint64_t previous_lookups, previous_decompressions;
     double previous_time, before_growth_rate, before_growth_density;
+    double baseline_rate, baseline_density;
     bool pending_measurement;
     unsigned pressure_windows, measurement_windows, cooldown_windows;
     uint64_t measured_lookups, measured_decompressions;
     double measured_seconds;
     double pressure_rate, last_window_seconds, decode_ns;
     double growth_factor; /* Per-cache policy state; initialized from pool default. */
+    bool activity_seen;
+    uint64_t activity_lookups;
+    double last_activity, resize_after;
     uint64_t last_window_lookups, last_window_decompressions;
     uint64_t previous_samples, previous_ns;
     uint64_t cost_samples;
@@ -45,6 +49,14 @@ struct DependencyResidentPool {
     double growth_factor;
     unsigned workers;
     ResidentEntry *entries;
+    ResidentEntry *donor, *receiver;
+    uint64_t donor_bytes, receiver_bytes, donor_lookups, recovery_reserve;
+    uint64_t donor_decompressions;
+    double donor_observed_at;
+    double trial_deadline;
+    bool rollback_requested;
+    bool rebalance;
+    unsigned shrinks, transfers, rollbacks;
 };
 
 static _Thread_local char error_text[256];
@@ -69,6 +81,7 @@ bool dependency_resident_create(DependencyResidentPool **out,
     p->budget = budget; p->maximum_database = maximum_database;
     p->minimum_load_share = 0.005;
     p->growth_factor = 1.5;
+    p->rebalance = true;
     p->workers = 1;
     *out = p;
     return true;
@@ -135,6 +148,13 @@ bool dependency_resident_configure(DependencyResidentPool **out)
     dependency_shared_configure(*out, (size_t)shared, shared_budget);
     (*out)->minimum_load_share = percent / 100;
     (*out)->growth_factor = factor;
+    const char *rebalance = getenv("EGTB_DEPENDENCY_SHARED_CACHE_REBALANCE");
+    if (rebalance && strcmp(rebalance, "0") && strcmp(rebalance, "1")) {
+        dependency_resident_destroy(*out); *out = NULL;
+        snprintf(error_text, sizeof(error_text), "invalid EGTB_DEPENDENCY_SHARED_CACHE_REBALANCE: expected 0 or 1");
+        return false;
+    }
+    (*out)->rebalance = !rebalance || !strcmp(rebalance, "1");
     return true;
 }
 
@@ -184,7 +204,7 @@ bool dependency_shared_acquire(DependencyResidentPool *p, Egtb *backing,
     e->shared_decided = true;
     e->growth_factor = p->growth_factor;
     uint64_t allocation = egtb_shared_cache_planned_allocation(backing, (size_t)p->shared_bytes);
-    if (p->shared_budget && allocation > p->shared_budget - p->shared_allocated) {
+    if (p->shared_budget && allocation > p->shared_budget - p->shared_allocated - p->recovery_reserve) {
         pthread_mutex_unlock(&p->mutex);
         return true; /* Explicit private-cache fallback when admission cannot fit. */
     }
@@ -214,6 +234,128 @@ bool dependency_shared_adaptive(DependencyResidentPool *p)
     return p && p->shared_bytes && p->shared_budget;
 }
 
+/* All callers hold the pool mutex and have quiesced every probe. */
+static bool coordinated_resize(DependencyResidentPool *p, ResidentEntry *e,
+                               uint64_t bytes)
+{
+    uint64_t old = egtb_shared_cache_bytes(e->shared);
+    uint64_t allocation = egtb_shared_cache_allocation(e->shared);
+    uint64_t next = egtb_shared_cache_planned_allocation(e->backing, (size_t)bytes);
+    if (next == allocation) return true;
+    if (next > p->shared_budget - p->shared_allocated) return false;
+    double started = monotonic_seconds();
+    if (!egtb_shared_cache_resize(e->shared, (size_t)bytes)) return false;
+    p->growth_seconds += monotonic_seconds() - started;
+    p->shared_used = p->shared_used - old + egtb_shared_cache_bytes(e->shared);
+    p->shared_allocated = p->shared_allocated - allocation +
+                          egtb_shared_cache_allocation(e->shared);
+    e->sampled = false;
+    e->pending_measurement = false;
+    e->pressure_windows = e->cooldown_windows = 0;
+    e->last_window_seconds = 0;
+    e->last_window_lookups = e->last_window_decompressions = 0;
+    return true;
+}
+
+static void finish_transfer(DependencyResidentPool *p, double now, bool rollback)
+{
+    if (rollback) {
+        p->rollback_requested = true;
+        uint64_t peak = p->shared_allocated + p->recovery_reserve;
+        /* Undo receiver first: the preflight reserved this exact recovery path. */
+        if (p->receiver && !coordinated_resize(p, p->receiver, p->receiver_bytes)) {
+            egtb_progress_log("cache rebalance: recovery deferred (receiver): %s\n", egtb_last_error());
+            return;
+        }
+        p->recovery_reserve = peak - p->shared_allocated;
+        if (!coordinated_resize(p, p->donor, p->donor_bytes)) {
+            egtb_progress_log("cache rebalance: recovery deferred (donor): %s\n", egtb_last_error());
+            return;
+        }
+        ++p->rollbacks;
+    }
+    egtb_progress_log("cache rebalance: %s; donor-index=%" PRIu64
+                     " allocated=%.2f MiB recovery-reserve=0\n",
+                     rollback ? "rolled back" : "accepted",
+                     egtb_maximum_index(p->donor->backing),
+                     (double)p->shared_allocated / 1048576);
+    p->donor->resize_after = now + 300;
+    if (p->receiver) p->receiver->resize_after = now + 60;
+    p->donor = p->receiver = NULL;
+    p->recovery_reserve = 0;
+    p->rollback_requested = false;
+}
+
+static bool start_transfer(DependencyResidentPool *p, ResidentEntry *receiver,
+                           uint64_t target, double now)
+{
+    if (!p->rebalance) return false;
+    /* Idle is the only donor evidence in stage one. No high-hit-rate shrinking. */
+    for (ResidentEntry *d = p->entries; d; d = d->next) {
+        if (!d->shared || d == receiver || !d->activity_seen ||
+            now - d->last_activity < 60 || now < d->resize_after ||
+            d->pending_measurement) continue;
+        uint64_t old = egtb_shared_cache_bytes(d->shared);
+        uint64_t floor = p->shared_bytes < 1048576 ? p->shared_bytes : 1048576;
+        uint64_t small = (uint64_t)(old / d->growth_factor);
+        if (small < floor) small = floor;
+        uint64_t da = egtb_shared_cache_allocation(d->shared);
+        uint64_t dn = egtb_shared_cache_planned_allocation(d->backing, (size_t)small);
+        if (!dn || dn >= da) continue;
+        uint64_t ra = receiver ? egtb_shared_cache_allocation(receiver->shared) : 0;
+        uint64_t rn = receiver ? egtb_shared_cache_planned_allocation(receiver->backing, (size_t)target) : 0;
+        uint64_t used = p->shared_allocated;
+        /* Check forward and inverse allocation peaks, without overflowing. */
+        if (dn > p->shared_budget - used) continue;
+        uint64_t after_shrink = used - da + dn;
+        if (rn > p->shared_budget - after_shrink) continue;
+        uint64_t final = after_shrink - ra + rn;
+        if (ra > p->shared_budget - final) continue;
+        uint64_t peak = used + dn;
+        if (after_shrink + rn > peak) peak = after_shrink + rn;
+        if (final + ra > peak) peak = final + ra;
+        uint64_t old_receiver = receiver ? egtb_shared_cache_bytes(receiver->shared) : 0;
+        double density = receiver ? receiver->baseline_density : 0;
+        if (!coordinated_resize(p, d, small)) continue;
+        p->donor = d; p->receiver = NULL;
+        p->donor_bytes = old; p->receiver_bytes = old_receiver;
+        p->donor_lookups = d->activity_lookups;
+        EgtbCacheStatistics donor_stats;
+        egtb_shared_cache_statistics(d->shared, &donor_stats);
+        p->donor_decompressions = donor_stats.decompressions;
+        p->donor_observed_at = now;
+        p->recovery_reserve = peak - p->shared_allocated;
+        p->trial_deadline = now + 120;
+        ++p->shrinks;
+        if (receiver) {
+            if (!coordinated_resize(p, receiver, target)) {
+                finish_transfer(p, now, true);
+                return true;
+            }
+            p->receiver = receiver;
+            p->recovery_reserve = peak - p->shared_allocated;
+            ++p->growths; ++p->transfers;
+            receiver->before_growth_density = density;
+            receiver->before_growth_rate = receiver->baseline_rate;
+            receiver->pending_measurement = true;
+            receiver->measurement_windows = 0;
+            receiver->measured_lookups = receiver->measured_decompressions = 0;
+            receiver->measured_seconds = 0;
+        }
+        egtb_progress_log("cache rebalance: experiment; idle donor-index=%" PRIu64
+            " %.2f -> %.2f MiB; receiver=%s index=%" PRIu64 " %.2f -> %.2f MiB; peak=%.2f MiB reserve=%.2f MiB\n",
+            egtb_maximum_index(d->backing), (double)old / 1048576,
+            (double)egtb_shared_cache_bytes(d->shared) / 1048576,
+            receiver ? "grow" : "none", receiver ? egtb_maximum_index(receiver->backing) : 0,
+            (double)old_receiver / 1048576,
+            receiver ? (double)egtb_shared_cache_bytes(receiver->shared) / 1048576 : 0,
+            (double)peak / 1048576,
+            (double)p->recovery_reserve / 1048576);
+        return true;
+    }
+    return false;
+}
+
 /* Called by the coordinator with all dependency probes quiescent. No mutex,
  * counter write, clock query or resize check is added to the lookup path. */
 void dependency_shared_maintain(void *context, unsigned workers)
@@ -226,11 +368,92 @@ void dependency_shared_maintain(void *context, unsigned workers)
     dependency_shared_maintain_at(context, (double)now.tv_sec + now.tv_nsec * 1e-9);
 }
 
+/* Explicit quiescent phase boundary, including each slice's initialization and
+ * verification. Never carry an experiment or an idle interval across workloads. */
+void dependency_shared_phase_at(DependencyResidentPool *p, double now)
+{
+    if (!p) return;
+    pthread_mutex_lock(&p->mutex);
+    if (p->donor) finish_transfer(p, now, true);
+    for (ResidentEntry *e = p->entries; e; e = e->next) {
+        if (!e->shared) continue;
+        EgtbCacheStatistics s;
+        egtb_shared_cache_statistics(e->shared, &s);
+        e->last_activity = now;
+        e->activity_seen = true;
+        e->activity_lookups = s.lookups;
+        e->previous_lookups = s.lookups;
+        e->previous_decompressions = s.decompressions;
+        e->sampled = e->pending_measurement = false;
+        e->pressure_windows = e->cooldown_windows = 0;
+        e->pressure_rate = e->last_window_seconds = 0;
+        e->last_window_lookups = e->last_window_decompressions = 0;
+        e->baseline_rate = e->baseline_density = 0;
+        egtb_shared_cache_timing(e->shared, &e->previous_samples, &e->previous_ns);
+    }
+    /* Failed recovery keeps rollback_requested and its reservation intact. */
+    pthread_mutex_unlock(&p->mutex);
+}
+
+void dependency_shared_phase(void *context)
+{
+    dependency_shared_phase_at(context, monotonic_seconds());
+}
+
+static bool donor_under_pressure(DependencyResidentPool *p, double now)
+{
+    EgtbCacheStatistics s;
+    egtb_shared_cache_statistics(p->donor->shared, &s);
+    if (s.decompressions < p->donor_decompressions || now < p->donor_observed_at) {
+        p->donor_decompressions = s.decompressions;
+        p->donor_observed_at = now;
+        return false;
+    }
+    uint64_t count = s.decompressions - p->donor_decompressions;
+    double elapsed = now - p->donor_observed_at;
+    if (!count) p->donor_observed_at = now;
+    if (count < 256 || elapsed <= 0) return false;
+    /* Preserve historical measured cost after shrink; absent that, use a
+     * conservative 5 us/load fallback, still normalized by elapsed worker time. */
+    double ns = p->donor->decode_ns > 0 ? p->donor->decode_ns : 5000;
+    bool pressure = shared_cache_load_share(count / elapsed, ns, p->workers) >=
+                    p->minimum_load_share;
+    p->donor_decompressions = s.decompressions;
+    p->donor_observed_at = now;
+    return pressure;
+}
+
 void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
 {
     if (!dependency_shared_adaptive(p)) return;
     pthread_mutex_lock(&p->mutex);
+    /* Track dense and cold entries as well. Counter resets restart idle grace. */
+    for (ResidentEntry *e = p->entries; e; e = e->next) {
+        if (!e->shared) continue;
+        EgtbCacheStatistics s;
+        egtb_shared_cache_statistics(e->shared, &s);
+        if (!e->activity_seen || s.lookups != e->activity_lookups || now < e->last_activity) {
+            e->last_activity = now;
+            e->activity_seen = true;
+        }
+        e->activity_lookups = s.lookups;
+    }
+    if (p->donor && (p->rollback_requested || donor_under_pressure(p, now))) {
+        finish_transfer(p, now, true);
+        pthread_mutex_unlock(&p->mutex);
+        return;
+    }
+    if (p->donor && now >= p->trial_deadline) {
+        /* No evidence for a transfer by the deadline: undo it. Idle-only
+         * reclamation may be accepted after the complete observation period. */
+        finish_transfer(p, now, p->receiver != NULL);
+        pthread_mutex_unlock(&p->mutex);
+        return;
+    }
     ResidentEntry *best = NULL;
+    ResidentEntry *unfunded = NULL;
+    uint64_t unfunded_payload = 0;
+    double unfunded_score = 0;
     uint64_t best_payload = 0, best_allocation = 0;
     double best_score = 0, best_rate = 0, best_density = 0;
     for (ResidentEntry *e = p->entries; e; e = e->next) {
@@ -243,9 +466,15 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             e->sampled = false;
             e->previous_lookups = 0; e->previous_decompressions = 0;
             e->pending_measurement = false;
+            if (p->receiver == e) {
+                finish_transfer(p, now, true);
+                pthread_mutex_unlock(&p->mutex);
+                return;
+            }
             e->pressure_windows = e->cooldown_windows = 0;
             e->pressure_rate = e->last_window_seconds = 0;
             e->last_window_lookups = e->last_window_decompressions = 0;
+            e->baseline_rate = e->baseline_density = 0;
             e->previous_samples = e->previous_ns = e->cost_samples = 0;
             e->decode_ns = 0;
         }
@@ -276,6 +505,8 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
                              (elapsed + e->last_window_seconds);
         double before_density = (double)(decompressions + e->last_window_decompressions) * 1000000 /
                                 (lookups + e->last_window_lookups);
+        e->baseline_rate = before_rate;
+        e->baseline_density = before_density;
         e->last_window_seconds = elapsed;
         e->last_window_lookups = lookups;
         e->last_window_decompressions = decompressions;
@@ -311,6 +542,11 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
                 egtb_maximum_index(e->backing), e->before_growth_rate, measured_rate,
                 e->before_growth_density, measured_density, weak ? 2u : 0u);
             e->pending_measurement = false;
+            if (p->receiver == e) {
+                finish_transfer(p, now, weak);
+                pthread_mutex_unlock(&p->mutex);
+                return;
+            }
             if (weak) {
                 e->cooldown_windows = 2;
                 continue;
@@ -324,14 +560,25 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
         if (e->pressure_windows < 2 ||
             !shared_cache_cost_eligible(e->pressure_rate, e->decode_ns,
                 e->cost_samples, p->workers, p->minimum_load_share) ||
-            egtb_shared_cache_dense(e->shared)) continue;
+            egtb_shared_cache_dense(e->shared) || now < e->resize_after) continue;
         uint64_t payload = egtb_shared_cache_bytes(e->shared);
-        long double target = (long double)payload * e->growth_factor;
+        double factor = shared_cache_growth_multiplier(e->growth_factor,
+            shared_cache_load_share(e->pressure_rate, e->decode_ns, p->workers),
+            p->minimum_load_share);
+        long double target = (long double)payload * factor;
         /* At least one additional page per side after rounding. */
         uint64_t quantum = 2 * (uint64_t)egtb_cache_page_size(e->backing);
         if (payload > SIZE_MAX - quantum) continue;
         if (target < payload + quantum) target = payload + quantum;
         payload = target >= SIZE_MAX ? SIZE_MAX : (uint64_t)target;
+        uint64_t desired = egtb_shared_cache_planned_allocation(e->backing, (size_t)payload);
+        uint64_t current = egtb_shared_cache_allocation(e->shared);
+        if (desired > current) {
+            double score = shared_cache_cost_score(e->pressure_rate, e->decode_ns, desired - current);
+            if (score > unfunded_score) {
+                unfunded = e; unfunded_payload = payload; unfunded_score = score;
+            }
+        }
         /* Reduce the requested growth to fit remaining migration headroom.
          * This is a monotone cold-path search, never part of a cache hit. */
         uint64_t lo = 0, hi = payload;
@@ -355,6 +602,16 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             best_allocation = allocation; best_rate = before_rate; best_density = before_density;
         }
     }
+    if (p->donor) {
+        pthread_mutex_unlock(&p->mutex);
+        return; /* One reversible experiment at a time. */
+    }
+    if (!best && unfunded && start_transfer(p, unfunded, unfunded_payload, now)) {
+        pthread_mutex_unlock(&p->mutex);
+        return;
+    }
+    if (!best && !unfunded && p->shared_allocated > p->shared_budget / 10 * 9)
+        start_transfer(p, NULL, 0, now);
     if (best) {
         uint64_t old = egtb_shared_cache_bytes(best->shared);
         uint64_t old_allocation = egtb_shared_cache_allocation(best->shared);
@@ -454,6 +711,15 @@ uint64_t dependency_resident_used(DependencyResidentPool *p)
     return used;
 }
 
+void dependency_shared_coordinator_statistics(DependencyResidentPool *p,
+                                              DependencyCoordinatorStatistics *out)
+{
+    pthread_mutex_lock(&p->mutex);
+    *out = (DependencyCoordinatorStatistics){p->shared_allocated, p->recovery_reserve,
+        p->shrinks, p->transfers, p->rollbacks, p->donor != NULL};
+    pthread_mutex_unlock(&p->mutex);
+}
+
 void dependency_resident_report(DependencyResidentPool *p)
 {
     pthread_mutex_lock(&p->mutex);
@@ -471,6 +737,10 @@ void dependency_resident_report(DependencyResidentPool *p)
                p->shared_budget / 1048576, (double)p->shared_allocated / 1048576, p->growths);
     if (p->shared_budget)
         printf("shared-cache growth stalls: %.6f s total\n", p->growth_seconds);
+    if (p->shared_budget)
+        printf("shared-cache coordinator: shrinks=%u transfers=%u rollbacks=%u recovery-reserve=%.2f MiB assessing=%s\n",
+               p->shrinks, p->transfers, p->rollbacks,
+               (double)p->recovery_reserve / 1048576, p->donor ? "yes" : "no");
     if (p->shared_budget)
         printf("shared-cache growth admission: minimum-load-share=%.3f%% minimum-timed-loads=16 growth-factor=%.3f one-growth-per-checkpoint\n",
                100 * p->minimum_load_share, p->growth_factor);

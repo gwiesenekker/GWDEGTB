@@ -24,4 +24,18 @@ static inline double shared_cache_cost_score(double rate, double ns, uint64_t ex
 {
     return extra_bytes ? rate * ns / 1e9 / ((double)extra_bytes / 1048576) : 0;
 }
+
+/* At most three fractional steps. A zero admission floor (tests/override)
+ * disables acceleration rather than dividing by zero. */
+static inline double shared_cache_growth_multiplier(double factor, double share, double floor)
+{
+    double result = factor;
+    if (floor > 0 && isfinite(share)) {
+        for (unsigned k = 1; k < 3 && share / floor > result; ++k)
+            result *= factor;
+    }
+    /* Never accelerate beyond 3.375x, but honor an explicitly larger base. */
+    double cap = factor > 3.375 ? factor : 3.375;
+    return result > cap ? cap : result;
+}
 #endif
