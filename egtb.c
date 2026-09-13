@@ -3,6 +3,7 @@
 #include "egtb.h"
 #include "progress.h"
 #include "crc32c.h"
+#include "cache_modulo.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -1736,6 +1737,7 @@ struct EgtbSharedCache {
     SharedSlot *slots;
     _Atomic uint64_t *words;
     size_t per_side, capacity, words_per_page;
+    CacheModulo modulo;
     bool dense;
     pthread_mutex_t probes_mutex;
     EgtbSharedProbe *probes;
@@ -1752,10 +1754,7 @@ static size_t shared_per_side(Egtb *backing, size_t bytes)
 {
     size_t n = bytes / backing->memory_page_size / (backing->planar ? 2 : 1);
     if (n >= backing->side_page_count) return (size_t)backing->side_page_count;
-    if (!n) return 0;
-    size_t power = 1;
-    while (power <= n / 2) power *= 2;
-    return power;
+    return n;
 }
 
 uint64_t egtb_shared_cache_planned_allocation(Egtb *backing, size_t bytes)
@@ -1780,11 +1779,6 @@ bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes
     if (!per_side) return fail("shared cache budget is smaller than one logical page");
     bool dense = per_side >= backing->side_page_count;
     if (dense) per_side = (size_t)backing->side_page_count;
-    else {
-        size_t power = 1;
-        while (power <= per_side / 2) power *= 2;
-        per_side = power;
-    }
     size_t capacity = per_side * sides;
     if (capacity > SIZE_MAX / sizeof(SharedSlot))
         return fail("shared cache metadata size overflow");
@@ -1794,6 +1788,7 @@ bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes
         free(c); return fail("cannot initialize shared cache registry");
     }
     c->backing = backing; c->per_side = per_side; c->capacity = capacity;
+    c->modulo = cache_modulo_init(per_side);
     c->dense = dense; c->words_per_page = backing->memory_page_size / 8;
     c->slots = aligned_alloc(64, capacity * sizeof(SharedSlot));
     c->words = malloc(capacity * backing->memory_page_size);
@@ -1861,6 +1856,13 @@ bool egtb_shared_cache_grow(EgtbSharedCache *c, size_t bytes)
 {
     if (!c) return fail("invalid shared cache growth");
     if (shared_per_side(c->backing, bytes) <= c->per_side) return true;
+    return egtb_shared_cache_resize(c, bytes);
+}
+
+bool egtb_shared_cache_resize(EgtbSharedCache *c, size_t bytes)
+{
+    if (!c) return fail("invalid shared cache resize");
+    if (shared_per_side(c->backing, bytes) == c->per_side) return true;
     EgtbSharedCache *next;
     if (!egtb_shared_cache_create(&next, c->backing, bytes)) return false;
     for (size_t old = 0; old < c->capacity; ++old) {
@@ -1868,10 +1870,12 @@ bool egtb_shared_cache_grow(EgtbSharedCache *c, size_t bytes)
         if (tag == UINT64_MAX) continue;
         size_t side = c->backing->planar && tag >= c->backing->side_page_count;
         uint64_t page = tag - side * c->backing->side_page_count;
-        size_t slot = (next->dense ? (size_t)page : (size_t)page & (next->per_side - 1))
+        size_t slot = (next->dense ? (size_t)page : (size_t)cache_modulo(page, next->modulo))
                       + side * next->per_side;
-        /* Doubling the mask, or switching to direct addressing, cannot merge
-         * two previously distinct slots. No I/O or decompression is needed. */
+        /* Fractional growth or shrinking may merge old slots. Keep the first entry;
+         * sequence numbers are replacement counters, not global recency. */
+        if (atomic_load_explicit(&next->slots[slot].tag, memory_order_relaxed) != UINT64_MAX)
+            continue;
         for (size_t w = 0; w < c->words_per_page; ++w)
             atomic_store_explicit(&next->words[slot * c->words_per_page + w],
                 atomic_load_explicit(&c->words[old * c->words_per_page + w],
@@ -1883,6 +1887,7 @@ bool egtb_shared_cache_grow(EgtbSharedCache *c, size_t bytes)
     _Atomic uint64_t *old_words = c->words;
     c->slots = next->slots; c->words = next->words;
     c->per_side = next->per_side; c->capacity = next->capacity; c->dense = next->dense;
+    c->modulo = next->modulo;
     next->slots = old_slots; next->words = old_words;
     egtb_shared_cache_destroy(next);
     return true;
@@ -1993,7 +1998,7 @@ bool egtb_shared_probe_get(EgtbSharedProbe *p, uint64_t index,
     Egtb *db = c->backing;
     uint64_t page; uint32_t entry;
     split_entry_index(db, index, &page, &entry);
-    size_t slot = c->dense ? (size_t)page : (size_t)page & (c->per_side - 1);
+    size_t slot = c->dense ? (size_t)page : (size_t)cache_modulo(page, c->modulo);
     uint64_t physical = page;
     size_t byte = (size_t)entry * (db->planar ? 2 : 4);
     if (db->planar) {

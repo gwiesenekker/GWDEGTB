@@ -8,7 +8,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.3** (working revision **3.309**).
+Current version: **3.3** (working revision **3.311**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 The summary includes per-material dependency cache statistics, summed across
@@ -716,8 +716,8 @@ EGTB_DEPENDENCY_RESIDENT_GIB=0 EGTB_DEPENDENCY_SHARED_CACHE_MIB=1024 \
 ```
 
 Resident dependencies still take priority. A cache that holds all pages uses
-collision-free addressing; otherwise each side uses a power-of-two number of
-slots rounded down to fit the budget. Actual allocation is reported, with
+collision-free addressing; otherwise each side uses as many whole page
+slots as fit the budget. Actual allocation is reported, with
 another 64 bytes of metadata per physical slot and private codec/scratch
 workspaces per worker. Multiply by the number of nonresident dependencies
 opened when planning RAM.
@@ -737,13 +737,15 @@ are unchanged. This remains opt-in pending representative performance tests.
 `test_shared_cache` exercises concurrent replacement, dense-cache hits,
 shared admission, wide DTM values, partial/draw pages and corruption rejection.
 
-#### Adaptive doubling and lazy dense mode
+#### Adaptive fractional growth and lazy dense mode
 
 To enable growth, also set a **total** shared-cache budget:
 
 ```sh
 export EGTB_DEPENDENCY_SHARED_CACHE_MIB=64  # Initial payload per cached dependency
 export EGTB_DEPENDENCY_SHARED_CACHE_GIB=8   # Combined shared-cache allocation budget
+export EGTB_DEPENDENCY_SHARED_CACHE_GROWTH=1.5 # Default factor, copied into each cache
+export EGTB_DEPENDENCY_SHARED_CACHE_MIN_LOAD_PERCENT=0.5 # Estimated worker-time threshold
 ```
 
 The total defaults to **0**, retaining fixed-size behavior. The initial MIB
@@ -754,16 +756,37 @@ At a quiescent checkpoint, the coordinator samples private probe counters.
 It discards the first nonempty interval (and the first interval after growth)
 as warm-up. Complete samples require at least 100,000 lookups. Growth requires
 two observations with at least 1,000 actual decompressions (not necessarily
-consecutive), and a smoothed pressure of at least 1,000 decompressions/second.
+consecutive), at least 16 successful timed page loads, and an estimated load
+share of at least **0.5%** of worker elapsed time. The share is
+`smoothed_decompressions_per_second * sampled_load_ns / 1e9 / workers`.
+The coordinator supplies the actual (page-count-capped) worker count for each
+phase. `EGTB_DEPENDENCY_SHARED_CACHE_MIN_LOAD_PERCENT` accepts 0..100 (default
+0.5); zero disables only this cost threshold, not confidence or hysteresis.
 Pressure uses a time-aware weighted average with a 5-second time constant:
 `weight = elapsed / (5 + elapsed)`. Quiet windows and idle checkpoints decay
 the pressure instead of immediately forgetting bursts. There is no hit-rate cutoff: a busy dependency
 with 99.9% hits can still benefit. The eligible dependency with the highest
-**smoothed decompressions/second per additional MiB** is doubled (additional allocation
+**estimated load-worker-seconds/second per additional MiB** is grown (additional allocation
 includes slot metadata). Rates use monotonic elapsed time between checkpoints;
 these measure workload pressure, not decompression CPU time or guaranteed savings.
 Implicit-draw misses do not count. An idle checkpoint resets the sample clock.
-If the doubled size
+Each cache keeps its own scaling factor, initially 1.5. The environment setting
+`EGTB_DEPENDENCY_SHARED_CACHE_GROWTH` accepts 1.1..4. Sizes round down to complete
+pages with equal capacity per side; growth requests advance by at least one
+page per side. If the requested allocation exceeds remaining migration headroom,
+the coordinator chooses the largest smaller allocation that fits, provided it
+still increases capacity. This uses partial headroom, but cannot fill the final
+budget to 100%: old and new allocations must coexist during migration.
+
+Arbitrary slot counts use exact remainder addressing (reciprocal multiplication
+for 32-bit page numbers, a mask for powers of two, and a safe wider fallback).
+Dense caches retain direct addressing. Migration can create collisions after
+fractional scaling; the first entry is retained and others load again on demand.
+Sequence numbers are not used as a recency estimate. The explicit quiescent
+`egtb_shared_cache_resize` primitive also supports shrinking, but the automatic
+policy does not yet choose factors below one or reclaim caches.
+
+If the requested size
 would hold every page, allocation is capped to the exact page count and
 addressing becomes dense. Loaded pages are migrated without disk reads;
 remaining pages load on demand. Dense caches never evict and do not grow again,
@@ -781,15 +804,19 @@ growth stalls. One in 256 shared-cache misses is timed with a monotonic clock;
 only successful actual decompressions contribute samples. Timed page loading
 includes I/O, CRC and decode, not only Zstd CPU time. Growth logs report a
 smoothed sampled load cost and estimated summed worker elapsed load-seconds
-per wall second (not CPU utilization). These are observational diagnostics,
-not yet an admission threshold or a promise of savings. Hits perform no timing.
+per wall second (not CPU utilization), normalized share, threshold and worker
+count. Admission uses this estimate, but it is not a promise of savings:
+I/O waits and scheduling affect the measurement and workload may change.
+The cost estimate is retained across growth, refreshed by subsequent timed
+loads, and reset if counters regress. Only one cache grows per checkpoint.
+Hits perform no timing.
 After growth, one active interval is discarded as warm-up, then two complete
 samples are collected before another resize can qualify. Their combined counts
 and elapsed time report before/after decompressions/second and decompressions
 per million lookups; the baseline likewise aggregates the last two complete
 pre-growth windows. If the latter improves by less than 10%, the cache waits
 two additional complete samples before reconsidering smoothed pressure.
-This bounded cooldown does not permanently disable growth: further doubling
+This bounded cooldown does not permanently disable growth: further growth
 may still help, especially near dense addressing. Workloads can change between samples, so
 these are observational comparisons, not measured causal speedups. This first
 policy only grows caches; shrinking, reclamation and bidirectional hysteresis
@@ -829,6 +856,49 @@ benchmark does not establish performance for multi-GiB growth or eight pieces.
 Reproduce with `sh benchmark_cache_policy.sh OLD_BINARY NEW_BINARY DEPENDENCY_DIRECTORY 3`
 (absolute paths, on an idle host). Raw logs for this run were retained in
 `/tmp/gwdegtb-policy-0wrMTx/`; temporary files are not part of the repository.
+
+Measured-cost admission comparison (3.309 → 3.310), same material and budgets,
+AOCC 5.2 on the 5950X: one warm-up followed by two repetitions, reversing
+old/new order on the second repetition. Mean total seconds:
+
+| Shared-cache configuration | Revision 3.309 | Revision 3.310 | Change |
+|---|---:|---:|---:|
+| Fixed 64 MiB | 37.884 | 38.104 | +0.6% |
+| Adaptive, initial 64 MiB | 38.340 | 38.775 | +1.1% |
+| Adaptive, initial 1 MiB | 52.698 | 52.454 | −0.5% |
+
+This does **not** demonstrate a runtime improvement. The 0.5% admission
+threshold rejected the previously unhelpful 64→128 MiB growth in both runs:
+combined allocation was 99.20 instead of 165.20 MiB. The 1 MiB start performed
+12 instead of 13 growths (28.03 versus 32.15 MiB allocated); its cold-start
+penalty remains. Growth cadence is unchanged. All 12 measured runs passed
+full verification and matched histograms, examples and storage statistics.
+Full regression tests, adaptive entry-for-entry comparison on `1 1 1 1`, and
+the shared-cache ThreadSanitizer test also passed. Raw timing logs are in
+`/tmp/gwdegtb-policy-Ouqko2/`. These measurements do not establish eight-piece
+scaling or justify changing the other RAM budgets.
+
+Fractional growth comparison (revision 3.311), same material (`1 2 2 0`),
+two threads, AOCC 5.2 on an idle 5950X. Both columns use the same executable,
+with growth factors 2 and 1.5 respectively, isolating the policy change.
+One warm-up and two repetitions, with reversed order; mean total seconds:
+
+| Shared-cache configuration | Factor 2 | Factor 1.5 |
+|---|---:|---:|
+| Fixed 64 MiB (control) | 35.444 | 35.381 |
+| Adaptive, initial 64 MiB | 35.961 | 36.004 |
+| Adaptive, initial 1 MiB | 48.972 | 58.723 |
+
+Neither 64 MiB adaptive run grew on this material. Starting at 1 MiB,
+fractional growth used 25.81 instead of 28.03 MiB, but required 17 rather
+than 12 growths and took 19.9% longer. Thus 1.5 provides finer memory
+increments, not a guaranteed speedup; retain a sensible initial cache size.
+All 12 measured runs passed verification and matched histograms, examples
+and storage statistics. Full regression and shared-cache ThreadSanitizer
+tests passed, including fractional migration, shrinking, collisions and
+budget-clamped growth. Logs: `/tmp/gwdegtb-policy-puCiJR/`. This is not a
+16-thread or eight-piece scaling benchmark, nor a comparison of old/new
+cache-addressing implementations.
 
 `make test-adaptive` generates a private-cache baseline and an adaptive
 `1 1 1 1` database, compares every paired value and runs standalone verification

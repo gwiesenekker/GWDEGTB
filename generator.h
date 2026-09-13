@@ -103,9 +103,10 @@ typedef bool (*EgtbExternalProbe)(
 
 /* Optional coordinator-thread-local maintenance hook. Install before starting
  * generation/verification, clear before destroying context. Invoked only after
- * ALL workers join. Enabled scans use 1M-position rounds per worker, retaining
+ * ALL workers join; the second callback argument is the phase's worker count.
+ * Enabled scans use 1M-position rounds per worker, retaining
  * their original ownership ranges and private dependency contexts. */
-void egtb_generator_quiescent_hook(void (*hook)(void *), void *context);
+void egtb_generator_quiescent_hook(void (*hook)(void *, unsigned), void *context);
 
 typedef void (*EgtbConsistencyReporter)(
     uint64_t index, EgtbSide side, const DraughtsPosition *position,

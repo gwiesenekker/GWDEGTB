@@ -117,6 +117,9 @@ uint64_t egtb_shared_cache_allocation(const EgtbSharedCache *cache);
 uint64_t egtb_shared_cache_planned_allocation(Egtb *backing, size_t payload_bytes);
 bool egtb_shared_cache_dense(const EgtbSharedCache *cache);
 bool egtb_shared_cache_grow(EgtbSharedCache *cache, size_t payload_bytes);
+/* Grow OR shrink, with all probes quiescent. Failed allocation preserves the
+ * old cache. Callers owning a shared budget must account for both allocations. */
+bool egtb_shared_cache_resize(EgtbSharedCache *cache, size_t payload_bytes);
 void egtb_shared_cache_statistics(EgtbSharedCache *cache, EgtbCacheStatistics *stats);
 void egtb_shared_cache_timing(EgtbSharedCache *cache, uint64_t *samples, uint64_t *nanoseconds);
 bool egtb_shared_probe_create(EgtbSharedProbe **out, EgtbSharedCache *cache);

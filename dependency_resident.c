@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "dependency_resident.h"
 #include "progress.h"
+#include "shared_cache_policy.h"
 #include <pthread.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -22,8 +23,10 @@ typedef struct ResidentEntry {
     uint64_t measured_lookups, measured_decompressions;
     double measured_seconds;
     double pressure_rate, last_window_seconds, decode_ns;
+    double growth_factor; /* Per-cache policy state; initialized from pool default. */
     uint64_t last_window_lookups, last_window_decompressions;
     uint64_t previous_samples, previous_ns;
+    uint64_t cost_samples;
     char error[256];
     struct ResidentEntry *next;
 } ResidentEntry;
@@ -38,6 +41,9 @@ struct DependencyResidentPool {
     uint64_t shared_budget, shared_allocated;
     unsigned growths;
     double growth_seconds;
+    double minimum_load_share;
+    double growth_factor;
+    unsigned workers;
     ResidentEntry *entries;
 };
 
@@ -61,6 +67,9 @@ bool dependency_resident_create(DependencyResidentPool **out,
         pthread_mutex_destroy(&p->mutex); free(p); goto failed;
     }
     p->budget = budget; p->maximum_database = maximum_database;
+    p->minimum_load_share = 0.005;
+    p->growth_factor = 1.5;
+    p->workers = 1;
     *out = p;
     return true;
 failed:
@@ -87,6 +96,19 @@ bool dependency_resident_configure(DependencyResidentPool **out)
 {
     const uint64_t mib = UINT64_C(1024) * 1024;
     uint64_t budget, maximum, shared, shared_budget;
+    double percent = 0.5;
+    const char *threshold = getenv("EGTB_DEPENDENCY_SHARED_CACHE_MIN_LOAD_PERCENT");
+    if (threshold && *threshold) {
+        char *end;
+        errno = 0;
+        percent = strtod(threshold, &end);
+        if (*threshold < '0' || *threshold > '9' || *end || errno ||
+            !isfinite(percent) || percent < 0 || percent > 100) {
+            snprintf(error_text, sizeof(error_text),
+                "invalid EGTB_DEPENDENCY_SHARED_CACHE_MIN_LOAD_PERCENT: expected 0..100");
+            return false;
+        }
+    }
     if (!setting("EGTB_DEPENDENCY_RESIDENT_GIB", 1024 * mib, 2048 * mib, &budget) ||
         !setting("EGTB_DEPENDENCY_RESIDENT_MAX_MIB", mib, 256 * mib, &maximum) ||
         !setting("EGTB_DEPENDENCY_SHARED_CACHE_MIB", mib, 0, &shared) ||
@@ -96,8 +118,31 @@ bool dependency_resident_configure(DependencyResidentPool **out)
         snprintf(error_text, sizeof(error_text), "shared cache exceeds address space");
         return false;
     }
+    double factor = 1.5;
+    const char *growth = getenv("EGTB_DEPENDENCY_SHARED_CACHE_GROWTH");
+    if (growth && *growth) {
+        char *end;
+        errno = 0;
+        factor = strtod(growth, &end);
+        if (*growth < '0' || *growth > '9' || *end || errno ||
+            !isfinite(factor) || factor < 1.1 || factor > 4) {
+            snprintf(error_text, sizeof(error_text),
+                "invalid EGTB_DEPENDENCY_SHARED_CACHE_GROWTH: expected 1.1..4");
+            return false;
+        }
+    }
     if (!dependency_resident_create(out, budget, maximum)) return false;
     dependency_shared_configure(*out, (size_t)shared, shared_budget);
+    (*out)->minimum_load_share = percent / 100;
+    (*out)->growth_factor = factor;
+    return true;
+}
+
+bool dependency_shared_minimum_load(DependencyResidentPool *p, double percent)
+{
+    if (!p || p->entries || !isfinite(percent) || percent < 0 || percent > 100)
+        return false;
+    p->minimum_load_share = percent / 100;
     return true;
 }
 
@@ -137,6 +182,7 @@ bool dependency_shared_acquire(DependencyResidentPool *p, Egtb *backing,
         return ok;
     }
     e->shared_decided = true;
+    e->growth_factor = p->growth_factor;
     uint64_t allocation = egtb_shared_cache_planned_allocation(backing, (size_t)p->shared_bytes);
     if (p->shared_budget && allocation > p->shared_budget - p->shared_allocated) {
         pthread_mutex_unlock(&p->mutex);
@@ -170,8 +216,11 @@ bool dependency_shared_adaptive(DependencyResidentPool *p)
 
 /* Called by the coordinator with all dependency probes quiescent. No mutex,
  * counter write, clock query or resize check is added to the lookup path. */
-void dependency_shared_maintain(void *context)
+void dependency_shared_maintain(void *context, unsigned workers)
 {
+    DependencyResidentPool *p = context;
+    if (!p || !workers) return;
+    p->workers = workers;
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
     dependency_shared_maintain_at(context, (double)now.tv_sec + now.tv_nsec * 1e-9);
@@ -197,6 +246,8 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             e->pressure_windows = e->cooldown_windows = 0;
             e->pressure_rate = e->last_window_seconds = 0;
             e->last_window_lookups = e->last_window_decompressions = 0;
+            e->previous_samples = e->previous_ns = e->cost_samples = 0;
+            e->decode_ns = 0;
         }
         if (!e->sampled) {
             /* First interval is warm-up, also after a resize. */
@@ -231,13 +282,19 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
         e->previous_lookups = s.lookups; e->previous_decompressions = s.decompressions;
         e->previous_time = now;
         /* Two substantial observations, not necessarily adjacent. Smoothing
-         * retains bursts across quiet windows; the rate floor rejects old ones. */
+         * retains bursts across quiet windows; the cost floor rejects old ones. */
         if (decompressions >= 1000 && e->pressure_windows < 2) ++e->pressure_windows;
         uint64_t samples, ns;
         egtb_shared_cache_timing(e->shared, &samples, &ns);
+        if (samples < e->previous_samples || ns < e->previous_ns) {
+            e->previous_samples = e->previous_ns = e->cost_samples = 0;
+            e->decode_ns = 0;
+        }
         if (samples > e->previous_samples && ns >= e->previous_ns) {
             double cost = (double)(ns - e->previous_ns) / (samples - e->previous_samples);
             e->decode_ns = e->decode_ns ? e->decode_ns + weight * (cost - e->decode_ns) : cost;
+            e->cost_samples = samples - e->previous_samples >= 16 - e->cost_samples ?
+                16 : e->cost_samples + samples - e->previous_samples;
         }
         e->previous_samples = samples; e->previous_ns = ns;
         if (e->pending_measurement) {
@@ -264,17 +321,35 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             continue;
         }
         /* Ignore small/cold samples and implicit-draw misses, regardless of hit rate. */
-        if (e->pressure_windows < 2 || e->pressure_rate < 1000 ||
+        if (e->pressure_windows < 2 ||
+            !shared_cache_cost_eligible(e->pressure_rate, e->decode_ns,
+                e->cost_samples, p->workers, p->minimum_load_share) ||
             egtb_shared_cache_dense(e->shared)) continue;
         uint64_t payload = egtb_shared_cache_bytes(e->shared);
-        if (payload > SIZE_MAX / 2) continue;
-        payload *= 2;
+        long double target = (long double)payload * e->growth_factor;
+        /* At least one additional page per side after rounding. */
+        uint64_t quantum = 2 * (uint64_t)egtb_cache_page_size(e->backing);
+        if (payload > SIZE_MAX - quantum) continue;
+        if (target < payload + quantum) target = payload + quantum;
+        payload = target >= SIZE_MAX ? SIZE_MAX : (uint64_t)target;
+        /* Reduce the requested growth to fit remaining migration headroom.
+         * This is a monotone cold-path search, never part of a cache hit. */
+        uint64_t lo = 0, hi = payload;
+        uint64_t available = p->shared_budget - p->shared_allocated;
+        while (lo < hi) {
+            uint64_t mid = lo + (hi - lo) / 2 + (hi - lo) % 2;
+            if (egtb_shared_cache_planned_allocation(e->backing, (size_t)mid) <= available)
+                lo = mid;
+            else hi = mid - 1;
+        }
+        payload = lo;
         uint64_t allocation = egtb_shared_cache_planned_allocation(e->backing, (size_t)payload);
         uint64_t old_allocation = egtb_shared_cache_allocation(e->shared);
         if (allocation <= old_allocation) continue;
         /* Both old and new storage coexist during migration. */
         if (allocation > p->shared_budget - p->shared_allocated) continue;
-        double score = e->pressure_rate / ((double)(allocation - old_allocation) / 1048576);
+        double score = shared_cache_cost_score(e->pressure_rate, e->decode_ns,
+                                               allocation - old_allocation);
         if (score > best_score) {
             best = e; best_score = score; best_payload = payload;
             best_allocation = allocation; best_rate = before_rate; best_density = before_density;
@@ -300,12 +375,14 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             best->last_window_seconds = 0;
             best->before_growth_rate = best_rate;
             best->before_growth_density = best_density;
-            egtb_progress_log("shared dependency cache: maximum-index=%" PRIu64 " grew %.2f -> %.2f MiB; mode=%s; decompressions/s=%.0f; pressure=%.1f decompressions/s/additional-MiB; grow-seconds=%.6f; sampled-load-us=%.3f; estimated-load-worker-seconds/s=%.3f\n",
+            egtb_progress_log("shared dependency cache: maximum-index=%" PRIu64 " grew %.2f -> %.2f MiB; mode=%s; decompressions/s=%.0f; pressure=%.6f load-worker-seconds/s/additional-MiB; grow-seconds=%.6f; sampled-load-us=%.3f; estimated-load-worker-seconds/s=%.3f; estimated-load-share=%.3f%%; minimum=%.3f%%; workers=%u\n",
                 egtb_maximum_index(best->backing),
                 (double)old / 1048576, (double)actual / 1048576,
                 egtb_shared_cache_dense(best->shared) ? "dense (lazy)" : "cached",
                 best_rate, best_score, growth_seconds, best->decode_ns / 1000,
-                best->pressure_rate * best->decode_ns / 1e9);
+                best->pressure_rate * best->decode_ns / 1e9,
+                100 * shared_cache_load_share(best->pressure_rate, best->decode_ns, p->workers),
+                100 * p->minimum_load_share, p->workers);
         } else {
             best->stopped = true; /* Preserve old cache; allocation failure is recoverable. */
             egtb_progress_log("shared dependency cache growth skipped: %s\n", egtb_last_error());
@@ -394,6 +471,9 @@ void dependency_resident_report(DependencyResidentPool *p)
                p->shared_budget / 1048576, (double)p->shared_allocated / 1048576, p->growths);
     if (p->shared_budget)
         printf("shared-cache growth stalls: %.6f s total\n", p->growth_seconds);
+    if (p->shared_budget)
+        printf("shared-cache growth admission: minimum-load-share=%.3f%% minimum-timed-loads=16 growth-factor=%.3f one-growth-per-checkpoint\n",
+               100 * p->minimum_load_share, p->growth_factor);
     pthread_mutex_unlock(&p->mutex);
 }
 

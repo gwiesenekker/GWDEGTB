@@ -19,7 +19,7 @@ bool dependency_resident_acquire(DependencyResidentPool *pool, Egtb *backing,
  * EGTB_DEPENDENCY_SHARED_CACHE_MIB sets payload budget per cached database. */
 bool dependency_shared_acquire(DependencyResidentPool *pool, Egtb *backing,
                                EgtbSharedCache **out);
-/* A nonzero SHARED_CACHE_GIB enables doubling, bounds combined allocations
+/* A nonzero SHARED_CACHE_GIB enables fractional growth, bounds combined allocations
  * including migration/slot metadata; MIB remains the initial per-DB size.
  * Maintain must run on the coordinator with ALL probes quiescent. */
 bool dependency_shared_adaptive(DependencyResidentPool *pool);
@@ -27,7 +27,10 @@ bool dependency_shared_adaptive(DependencyResidentPool *pool);
  * keeps fixed-size mode. Total includes slot metadata and migration storage. */
 bool dependency_shared_configure(DependencyResidentPool *pool,
                                   size_t initial_bytes, uint64_t total_bytes);
-void dependency_shared_maintain(void *pool);
+/* Before acquisitions. Default 0.5%; zero disables the cost threshold but
+ * still requires timing confidence and the existing hysteresis safeguards. */
+bool dependency_shared_minimum_load(DependencyResidentPool *pool, double percent);
+void dependency_shared_maintain(void *pool, unsigned workers);
 /* Same quiescent maintenance with an explicit monotonic time in seconds,
  * for deterministic policy tests. Do not mix clock domains within a pool. */
 void dependency_shared_maintain_at(DependencyResidentPool *pool, double now);

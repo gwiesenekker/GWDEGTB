@@ -13,15 +13,15 @@
 #include <string.h>
 #include <time.h>
 
-static _Thread_local void (*quiescent_hook)(void *);
+static _Thread_local void (*quiescent_hook)(void *, unsigned);
 static _Thread_local void *quiescent_context;
-void egtb_generator_quiescent_hook(void (*hook)(void *), void *context)
+void egtb_generator_quiescent_hook(void (*hook)(void *, unsigned), void *context)
 {
     quiescent_hook = hook; quiescent_context = context;
 }
-static void quiescent_maintenance(void)
+static void quiescent_maintenance(unsigned workers)
 {
-    if (quiescent_hook) quiescent_hook(quiescent_context);
+    if (quiescent_hook) quiescent_hook(quiescent_context, workers);
 }
 #define MAINTENANCE_SCAN_ENTRIES UINT64_C(1048576)
 
@@ -1700,7 +1700,7 @@ bool egtb_make_consistent_threaded(
         }
         if (created_threads != thread_count)
             goto done;
-        quiescent_maintenance();
+        quiescent_maintenance(thread_count);
         for (i = 0; i < thread_count; ++i) {
             local.positions_checked += workers[i].positions_checked;
             if (workers[i].failed) {
@@ -2019,7 +2019,7 @@ join:
     }
     if (created_threads != thread_count)
         goto done;
-    quiescent_maintenance();
+    quiescent_maintenance(thread_count);
     bool more = false, failed_round = false;
     for (i = 0; i < thread_count; ++i) {
         failed_round |= workers[i].failed || workers[i].mismatch;
@@ -2823,7 +2823,7 @@ frontier_round:
             return fail("frontier worker %u failed: %s", i,
                         workers[i].error);
         }
-    quiescent_maintenance();
+    quiescent_maintenance(thread_count);
     if (chunked) {
         bool more = false;
         for (i = 0; i < thread_count; ++i) {
