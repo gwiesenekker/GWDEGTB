@@ -60,6 +60,13 @@ struct DependencyResidentPool {
 };
 
 static _Thread_local char error_text[256];
+static const char *entry_name(const ResidentEntry *e)
+{
+    if (!e) return "none";
+    const char *path = egtb_path(e->backing);
+    const char *slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
 static double monotonic_seconds(void)
 {
     struct timespec t;
@@ -257,26 +264,28 @@ static bool coordinated_resize(DependencyResidentPool *p, ResidentEntry *e,
     return true;
 }
 
-static void finish_transfer(DependencyResidentPool *p, double now, bool rollback)
+static void finish_transfer(DependencyResidentPool *p, double now, bool rollback,
+                            const char *reason)
 {
     if (rollback) {
         p->rollback_requested = true;
         uint64_t peak = p->shared_allocated + p->recovery_reserve;
         /* Undo receiver first: the preflight reserved this exact recovery path. */
         if (p->receiver && !coordinated_resize(p, p->receiver, p->receiver_bytes)) {
-            egtb_progress_log("cache rebalance: recovery deferred (receiver): %s\n", egtb_last_error());
+            egtb_progress_log("cache rebalance: recovery deferred (receiver=%s): %s\n", entry_name(p->receiver), egtb_last_error());
             return;
         }
         p->recovery_reserve = peak - p->shared_allocated;
         if (!coordinated_resize(p, p->donor, p->donor_bytes)) {
-            egtb_progress_log("cache rebalance: recovery deferred (donor): %s\n", egtb_last_error());
+            egtb_progress_log("cache rebalance: recovery deferred (donor=%s): %s\n", entry_name(p->donor), egtb_last_error());
             return;
         }
         ++p->rollbacks;
     }
-    egtb_progress_log("cache rebalance: %s; donor-index=%" PRIu64
+    egtb_progress_log("cache rebalance: %s; donor=%s receiver=%s reason=%s; donor-index=%" PRIu64
                      " allocated=%.2f MiB recovery-reserve=0\n",
                      rollback ? "rolled back" : "accepted",
+                     entry_name(p->donor), entry_name(p->receiver), reason,
                      egtb_maximum_index(p->donor->backing),
                      (double)p->shared_allocated / 1048576);
     p->donor->resize_after = now + 300;
@@ -329,7 +338,7 @@ static bool start_transfer(DependencyResidentPool *p, ResidentEntry *receiver,
         ++p->shrinks;
         if (receiver) {
             if (!coordinated_resize(p, receiver, target)) {
-                finish_transfer(p, now, true);
+                finish_transfer(p, now, true, "receiver allocation failed");
                 return true;
             }
             p->receiver = receiver;
@@ -342,8 +351,9 @@ static bool start_transfer(DependencyResidentPool *p, ResidentEntry *receiver,
             receiver->measured_lookups = receiver->measured_decompressions = 0;
             receiver->measured_seconds = 0;
         }
-        egtb_progress_log("cache rebalance: experiment; idle donor-index=%" PRIu64
+        egtb_progress_log("cache rebalance: experiment; donor=%s receiver-database=%s; idle donor-index=%" PRIu64
             " %.2f -> %.2f MiB; receiver=%s index=%" PRIu64 " %.2f -> %.2f MiB; peak=%.2f MiB reserve=%.2f MiB\n",
+            entry_name(d), entry_name(receiver),
             egtb_maximum_index(d->backing), (double)old / 1048576,
             (double)egtb_shared_cache_bytes(d->shared) / 1048576,
             receiver ? "grow" : "none", receiver ? egtb_maximum_index(receiver->backing) : 0,
@@ -374,7 +384,7 @@ void dependency_shared_phase_at(DependencyResidentPool *p, double now)
 {
     if (!p) return;
     pthread_mutex_lock(&p->mutex);
-    if (p->donor) finish_transfer(p, now, true);
+    if (p->donor) finish_transfer(p, now, true, "phase boundary");
     for (ResidentEntry *e = p->entries; e; e = e->next) {
         if (!e->shared) continue;
         EgtbCacheStatistics s;
@@ -439,14 +449,15 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
         e->activity_lookups = s.lookups;
     }
     if (p->donor && (p->rollback_requested || donor_under_pressure(p, now))) {
-        finish_transfer(p, now, true);
+        finish_transfer(p, now, true, p->rollback_requested ? "deferred recovery" : "donor pressure");
         pthread_mutex_unlock(&p->mutex);
         return;
     }
     if (p->donor && now >= p->trial_deadline) {
         /* No evidence for a transfer by the deadline: undo it. Idle-only
          * reclamation may be accepted after the complete observation period. */
-        finish_transfer(p, now, p->receiver != NULL);
+        finish_transfer(p, now, p->receiver != NULL,
+                        p->receiver ? "inconclusive deadline" : "idle observation complete");
         pthread_mutex_unlock(&p->mutex);
         return;
     }
@@ -467,7 +478,7 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             e->previous_lookups = 0; e->previous_decompressions = 0;
             e->pending_measurement = false;
             if (p->receiver == e) {
-                finish_transfer(p, now, true);
+                finish_transfer(p, now, true, "measurement counters reset");
                 pthread_mutex_unlock(&p->mutex);
                 return;
             }
@@ -537,13 +548,13 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             double measured_density = (double)e->measured_decompressions * 1000000 / e->measured_lookups;
             bool weak = measured_density > e->before_growth_density * 0.90 &&
                         !egtb_shared_cache_dense(e->shared);
-            egtb_progress_log("shared dependency cache measurement: maximum-index=%" PRIu64
+            egtb_progress_log("shared dependency cache measurement: database=%s maximum-index=%" PRIu64
                 " decompressions/s=%.0f -> %.0f; decompressions/million-lookups=%.1f -> %.1f; extra-cooldown=%u windows (observed, workload may differ)\n",
-                egtb_maximum_index(e->backing), e->before_growth_rate, measured_rate,
+                entry_name(e), egtb_maximum_index(e->backing), e->before_growth_rate, measured_rate,
                 e->before_growth_density, measured_density, weak ? 2u : 0u);
             e->pending_measurement = false;
             if (p->receiver == e) {
-                finish_transfer(p, now, weak);
+                finish_transfer(p, now, weak, weak ? "weak receiver benefit" : "receiver benefit confirmed");
                 pthread_mutex_unlock(&p->mutex);
                 return;
             }
@@ -632,8 +643,8 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             best->last_window_seconds = 0;
             best->before_growth_rate = best_rate;
             best->before_growth_density = best_density;
-            egtb_progress_log("shared dependency cache: maximum-index=%" PRIu64 " grew %.2f -> %.2f MiB; mode=%s; decompressions/s=%.0f; pressure=%.6f load-worker-seconds/s/additional-MiB; grow-seconds=%.6f; sampled-load-us=%.3f; estimated-load-worker-seconds/s=%.3f; estimated-load-share=%.3f%%; minimum=%.3f%%; workers=%u\n",
-                egtb_maximum_index(best->backing),
+            egtb_progress_log("shared dependency cache: database=%s maximum-index=%" PRIu64 " grew %.2f -> %.2f MiB; mode=%s; decompressions/s=%.0f; pressure=%.6f load-worker-seconds/s/additional-MiB; grow-seconds=%.6f; sampled-load-us=%.3f; estimated-load-worker-seconds/s=%.3f; estimated-load-share=%.3f%%; minimum=%.3f%%; workers=%u\n",
+                entry_name(best), egtb_maximum_index(best->backing),
                 (double)old / 1048576, (double)actual / 1048576,
                 egtb_shared_cache_dense(best->shared) ? "dense (lazy)" : "cached",
                 best_rate, best_score, growth_seconds, best->decode_ns / 1000,
@@ -642,7 +653,7 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
                 100 * p->minimum_load_share, p->workers);
         } else {
             best->stopped = true; /* Preserve old cache; allocation failure is recoverable. */
-            egtb_progress_log("shared dependency cache growth skipped: %s\n", egtb_last_error());
+            egtb_progress_log("shared dependency cache growth skipped: database=%s: %s\n", entry_name(best), egtb_last_error());
         }
     }
     pthread_mutex_unlock(&p->mutex);
@@ -723,6 +734,29 @@ void dependency_shared_coordinator_statistics(DependencyResidentPool *p,
 void dependency_resident_report(DependencyResidentPool *p)
 {
     pthread_mutex_lock(&p->mutex);
+    if (p->entries) {
+        printf("dependency memory at report time (shared allocations counted once):\n");
+        printf("  %-27s %12s %12s %14s %10s %s\n", "Database", "Full MiB",
+               "Payload MiB", "Allocated MiB", "Coverage %", "Mode");
+        for (ResidentEntry *e = p->entries; e; e = e->next) {
+            double full = ((double)egtb_maximum_index(e->backing) + 1) * 4;
+            if (!e->shared && !e->resident) {
+                printf("  %-27s %12.2f %12s %14s %10s private\n",
+                       entry_name(e), full / 1048576, "-", "-", "-");
+                continue;
+            }
+            uint64_t payload = e->shared ? egtb_shared_cache_bytes(e->shared) :
+                                         egtb_resident_bytes(e->resident);
+            uint64_t allocation = e->shared ? egtb_shared_cache_allocation(e->shared) : payload;
+            double coverage = full > 0 ? 100 * payload / full : 0;
+            if (coverage > 100) coverage = 100;
+            printf("  %-27s %12.2f %12.2f %14.2f %10.2f %s\n", entry_name(e),
+                   full / 1048576, (double)payload / 1048576,
+                   (double)allocation / 1048576, coverage,
+                   e->resident ? "resident" : egtb_shared_cache_dense(e->shared) ? "dense-lazy" : "cached");
+        }
+        puts("  Coverage is capacity/full size, not occupancy or hit rate. Allocated includes shared-slot metadata; excludes contexts and private views.");
+    }
     printf("shared dependency residency: budget=%" PRIu64 " MiB maximum-database=%" PRIu64
            " MiB used=%.2f MiB loaded=%u cached=%u\n",
            p->budget / 1048576, p->maximum_database / 1048576,

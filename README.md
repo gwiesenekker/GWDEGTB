@@ -8,7 +8,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.3** (working revision **3.312**).
+Current version: **3.4** (executable revision **3.401**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 The summary includes per-material dependency cache statistics, summed across
@@ -960,8 +960,15 @@ remains unmeasured. Logs: `/tmp/gwdegtb-coordinator-mlKkde/`.
 Later workload changes can still require ordinary growth; rollback protection
 is limited to the experiment, not the remainder of generation.
 
-Logs identify experiment, acceptance and rollback, sizes, peak allocation and
-recovery reserve. The summary counts shrinks, transfers and rollbacks. The reported
+Logs identify experiments, acceptance and rollback, sizes, and peak allocation.
+Revision 3.314 adds database filenames to growth, measurement, and coordinator
+events (maximum indices are not unique material identifiers). Completion events
+also report the acceptance/recovery reason. The dependency memory table shows
+current payload, allocation including shared-slot metadata, full decoded size,
+capacity coverage, and cached/dense-lazy/resident mode. Shared allocations are
+counted once, not multiplied by worker count; private-view memory is not included.
+Coverage is capacity, not page occupancy or cache hit rate.
+Logs also show recovery reserve. The summary counts shrinks, transfers and rollbacks. The reported
 resize stall total includes coordinator resizing as well as growth. No shared
 updates or extra checks are added to the lookup hit path. Active-donor trials,
 ghost prediction, zero-headroom shrinking and parallel atomic initialization

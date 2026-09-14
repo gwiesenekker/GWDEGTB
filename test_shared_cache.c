@@ -452,6 +452,7 @@ static void coordinator(Egtb *a, Egtb *b)
         CHECK(!s.assessing && !s.recovery_reserve);
         CHECK(s.rollbacks == (outcome == 1 || outcome == 4 ? 0u : 1u));
         CHECK(egtb_shared_cache_bytes(c[0]) == (outcome == 1 || outcome == 4 ? 256 : 512));
+        if (outcome == 1) dependency_resident_report(pool);
         for (unsigned k=0; k<2; ++k) {
             for (unsigned i=0; i<N; ++i) {
                 CHECK(egtb_shared_probe_get(p[k], i, EGTB_WHITE_TO_MOVE, &v));
@@ -513,6 +514,7 @@ int main(void)
     EgtbCreateOptions options = {4, 20, 1};
     Egtb *db; EgtbSharedCache *cache;
     CHECK(egtb_create(&db, path, N - 1, 128, &options));
+    CHECK(strcmp(egtb_path(db), path) == 0);
     CHECK(!egtb_shared_cache_create(&cache, db, 256));
     for (uint64_t i = 0; i < N; ++i)
         for (unsigned s = 0; s < 2; ++s)

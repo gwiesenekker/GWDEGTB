@@ -1,11 +1,29 @@
 # Version history
 
 Published versions are Git tags. The `REVISION` file identifies the executable
-revision independently of individual commits; version 3.3 starts at 3.301.
+revision independently of individual commits; version 3.4 starts at 3.401.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
 
-## Unreleased — revision 3.309
+## Version 3.4 — revision 3.401
+
+- Parallelize final slice merging by output page ranges and optimize candidate
+  bitmap processing and read-only DTM access (revisions 3.302–3.303).
+- Publish the shared dependency residency and optimistic adaptive-cache work
+  developed in revisions 3.304–3.314 (earlier development notes below).
+- Use sampled miss-load time and smoothed decompression pressure for growth
+  admission; normalize estimated cost by worker count. Keep timing off cache hits.
+- Support fractional cache capacities, fast modulo addressing, a default 1.5
+  growth factor, accelerated growth under high pressure, and dense-lazy mode.
+- Add phase-aware idle-cache reclamation and reversible redistribution with
+  explicit migration/recovery headroom, donor-pressure recovery and bounded trials.
+  Stage one only reclaims idle donors; active-cache redistribution is not implemented.
+- Improve cache diagnostics with database names, decision reasons, payload and
+  allocated memory, capacity coverage, growth stalls and coordinator counters.
+- Preserve run logs with revision, timestamp and PID in family-script filenames.
+- No DTM/WDL file-format change.
+
+### Revision 3.309
 
 - Smooth decompression pressure with elapsed-time weighting, retaining burst
   evidence across quiet windows while decaying stale pressure. Compare two

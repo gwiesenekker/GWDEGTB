@@ -2611,6 +2611,11 @@ done:
     }
 }
 
+const char *egtb_path(const Egtb *egtb)
+{
+    return egtb ? egtb->path : "";
+}
+
 uint64_t egtb_maximum_index(const Egtb *egtb)
 {
     return egtb == NULL ? 0 : egtb->maximum_index;
