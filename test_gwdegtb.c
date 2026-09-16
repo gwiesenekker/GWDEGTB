@@ -203,17 +203,22 @@ int main(void)
     free(bitmap);
     bitmap = NULL;
 
-    if (!gwdegtb_wdl_compressed_info(directory, "1wX-0wO-0bX-1bO",
-                                     &compressed_bytes) ||
+    /* Explicit thread counts override even an invalid environment setting,
+     * including generation performed by info before allocation. */
+    if (unlink(wdl_path) != 0 || setenv("EGTB_WDL_THREADS", "invalid", 1) != 0 ||
+        !gwdegtb_wdl_compressed_info_threads(directory, "1wX-0wO-0bX-1bO",
+                                              &compressed_bytes, 4) ||
         compressed_bytes == 0)
         goto done;
+    if (unlink(wdl_path) != 0) goto done; /* load also generates if missing */
     compressed_image = malloc(compressed_bytes);
     if (compressed_image == NULL ||
         gwdegtb_wdl_compressed_load(directory, "1wX-0wO-0bX-1bO",
                                     compressed_image,
                                     compressed_bytes - 1) ||
-        !gwdegtb_wdl_compressed_load(directory, "0wX-1wO-1bX-0bO.wdl",
-                                     compressed_image, compressed_bytes) ||
+        !gwdegtb_wdl_compressed_load_threads(directory, "0wX-1wO-1bX-0bO.wdl",
+                                             compressed_image, compressed_bytes, 4) ||
+        unsetenv("EGTB_WDL_THREADS") != 0 ||
         !gwdegtb_wdl_compressed_attach("0wX-1wO-1bX-0bO",
                                        compressed_image,
                                        compressed_bytes) ||

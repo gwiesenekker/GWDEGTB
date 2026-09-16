@@ -6,8 +6,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <zstd.h>
 
-#define WDL_FORMAT_VERSION 1
+#define WDL_LEGACY_FORMAT_VERSION 1
+#define WDL_FORMAT_VERSION 2
 #define WDL_PAGE_SIZE 1024
 #define WDL_MAX_DECOMPRESSION_THREADS 256
 
@@ -34,12 +36,23 @@ typedef struct Wdl Wdl;
 typedef struct WdlImage WdlImage;
 
 const char *wdl_last_error(void);
+/* EGTB_WDL_THREADS, default 4; zero means an invalid setting. */
+unsigned wdl_default_threads(void);
 
 /* Compile a complete DTM EGTB into a packed, compressed WDL file. */
 bool wdl_compile(const char *dtm_path, const char *wdl_path,
                  int compression_level, size_t dtm_cache_pages,
                  WdlStatistics *statistics,
                  WdlStorageStatistics *storage_statistics);
+/* Streaming compilation: bounded per-worker storage, no full WDL bitmap.
+ * Legacy dtm_cache_pages is accepted but sequential views need only two pages.
+ * Trains a per-file dictionary on bounded samples; EGTB_WDL_DICTIONARY_KIB
+ * defaults to 110 (0 disables, maximum 256). Small datasets skip training.
+ * Payload layout can differ between runs; format and logical values do not. */
+bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
+                           int compression_level, size_t dtm_cache_pages,
+                           unsigned thread_count, WdlStatistics *statistics,
+                           WdlStorageStatistics *storage_statistics);
 
 /*
  * Open path read-only. If a .wdl path does not exist, derive the corresponding
@@ -47,6 +60,9 @@ bool wdl_compile(const char *dtm_path, const char *wdl_path,
  */
 bool wdl_open(Wdl **out, const char *path, size_t cache_pages,
               int compression_level, size_t dtm_cache_pages);
+bool wdl_open_threaded(Wdl **out, const char *path, size_t cache_pages,
+                       int compression_level, size_t dtm_cache_pages,
+                       unsigned thread_count);
 bool wdl_close(Wdl *wdl);
 bool wdl_get(Wdl *wdl, uint64_t index, EgtbSide side, WdlResult *result);
 
@@ -58,6 +74,9 @@ bool wdl_decompress_into_threaded(Wdl *wdl, void *data, size_t size,
 /* Immutable, caller-owned in-memory image of a complete compressed WDL file. */
 bool wdl_file_size(const char *path, size_t *size);
 bool wdl_file_load_into(const char *path, void *data, size_t size);
+/* Parallel disjoint reads; the legacy function above uses one worker. */
+bool wdl_file_load_into_threaded(const char *path, void *data, size_t size,
+                                 unsigned thread_count);
 bool wdl_image_attach(WdlImage **out, const void *data, size_t size);
 void wdl_image_destroy(WdlImage *image);
 uint64_t wdl_image_maximum_index(const WdlImage *image);
@@ -67,6 +86,10 @@ bool wdl_image_page(const WdlImage *image, uint64_t page,
                     uint32_t *checksum);
 bool wdl_image_validate_page(const WdlImage *image, uint64_t page,
                              const void *uncompressed, size_t size);
+/* Shared immutable prepared dictionary (NULL for legacy/dictionary-free files).
+ * Valid until image destruction; use with ZSTD_decompress_usingDDict when
+ * decoding the compressed bytes returned by wdl_image_page(). */
+const ZSTD_DDict *wdl_image_dictionary(const WdlImage *image);
 
 uint64_t wdl_maximum_index(const Wdl *wdl);
 uint64_t wdl_page_count(const Wdl *wdl);

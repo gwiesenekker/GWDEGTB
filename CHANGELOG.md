@@ -1,9 +1,29 @@
 # Version history
 
 Published versions are Git tags. The `REVISION` file identifies the executable
-revision independently of individual commits; version 3.4 starts at 3.401.
+revision independently of individual commits; version 3.5 starts at 3.501.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
+
+## Version 3.5 — revision 3.501
+
+- Generate WDL files with parallel, bounded-memory streaming rather than a full
+  uncompressed bitmap; publish completed output atomically and durably.
+- Optimize GWD's on-demand WDL generation for decompression: Zstd level 12,
+  a trained dictionary of up to 110 KiB, and up to 4,096 sampled pages.
+- Introduce WDL format 2 with a CRC32C-protected dictionary. Readers retain
+  format-1 compatibility, and small or unsuitable training sets fall back to
+  dictionary-free files. Existing WDL files are reused, not silently upgraded.
+- Share immutable prepared dictionaries across private decompression contexts;
+  support resident decompression and mixed-database compressed probes.
+- Add explicit-thread compressed-info and compressed-load APIs. The thread
+  count controls missing-file generation and parallel loading into caller-owned
+  memory. Default wrappers use `EGTB_WDL_THREADS` (default four).
+- Add regression coverage for parallel compilation/loading, dictionary
+  corruption, legacy files, mixed threaded probes, and argument validation.
+- Record WDL compression-level, dictionary, training-size and DTM frontier
+  compilation benchmarks in `reports/`. DTM format and compression defaults
+  are unchanged. GWD must be relinked before using dictionary-backed WDL files.
 
 ## Version 3.4 — revision 3.401
 

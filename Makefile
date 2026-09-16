@@ -16,6 +16,15 @@ all: benchmark_tunstall
 all: benchmark_wdl3
 all: test_dtm16 test_progress test_8piece
 all: test_storage_safety
+all: test_wdl_compile test_wdl_dictionary
+
+test_wdl_dictionary: test_wdl_dictionary.o libgwdegtb.a
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test_wdl_compile: test_wdl_compile.o wdl.o egtb.o progress.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+test: test_wdl_compile test_wdl_dictionary
 all: test_compact_pipeline
 
 test: generate_egtb
@@ -152,6 +161,8 @@ benchmark_wdl3: benchmark_wdl3.o libgwdegtb.a
 
 test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_dtm16 test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap
 	./test_dependency_resident
+	./test_wdl_compile
+	./test_wdl_dictionary
 	./test_shared_cache
 	./test_crc32c
 	./test_frontier
@@ -223,6 +234,8 @@ clean:
 	$(RM) test_8piece test_8piece.o
 	$(RM) test_progress test_progress.o
 	$(RM) test_dtm16 test_dtm16.o
+	$(RM) test_wdl_compile test_wdl_compile.o
+	$(RM) test_wdl_dictionary test_wdl_dictionary.o
 	$(RM) libgwdegtb.a test_index test_slice_index test_sliced test_combinatorial_index test_egtb test_gwdegtb test_movegen test_generator test_generator_padded test_material test_bitmap check_stats benchmark_index benchmark_combinatorial_index \
 		benchmark_egtb benchmark_movegen benchmark_wdl_probe benchmark_wdl_probe.o benchmark_tunstall benchmark_tunstall.o benchmark_wdl3 benchmark_wdl3.o test_index.o test_slice_index.o test_sliced.o test_egtb.o \
 		test_gwdegtb.o test_movegen.o test_generator.o test_material.o test_bitmap.o test_combinatorial_index.o check_stats.o combinatorial_index.o endgame_index.o egtb.o progress.o wdl.o gwdegtb.o movegen.o \

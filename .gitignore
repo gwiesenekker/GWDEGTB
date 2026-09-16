@@ -33,6 +33,7 @@
 /*.wdl
 /logs/
 /test_dtm16
+/test_wdl_compile
 /test_crc32c
 /test_progress
 /test_8piece
@@ -41,3 +42,4 @@ test_compact_pipeline
 /test_frontier
 /test_dependency_resident
 /test_shared_cache
+/test_wdl_dictionary

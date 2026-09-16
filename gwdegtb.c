@@ -27,8 +27,7 @@
 #endif
 
 #define MATERIAL_DIMENSION (EGTB_MAX_PIECES + 1)
-#define DEFAULT_WDL_COMPRESSION_LEVEL 3
-#define DEFAULT_WDL_DECOMPRESSION_THREADS 4
+#define DEFAULT_WDL_COMPRESSION_LEVEL 12
 #define DEFAULT_DTM_CACHE_PAGES 16384
 
 typedef struct {
@@ -256,9 +255,12 @@ bool gwdegtb_wdl_decompress(const char *directory,
                             const char *database_name,
                             void *data, size_t size)
 {
+    unsigned threads = wdl_default_threads();
+    if (!threads)
+        return fail("%s", wdl_last_error());
     return gwdegtb_wdl_decompress_threads(
         directory, database_name, data, size,
-        DEFAULT_WDL_DECOMPRESSION_THREADS);
+        threads);
 }
 
 bool gwdegtb_wdl_decompress_threads(const char *directory,
@@ -275,6 +277,7 @@ bool gwdegtb_wdl_decompress_threads(const char *directory,
     bool ok = false;
 
     if (data == NULL || thread_count == 0 ||
+        thread_count > WDL_MAX_DECOMPRESSION_THREADS ||
         !parse_database_name(database_name, &requested, &canonical, &kind) ||
         !material_info(&canonical, &maximum_index, &expected_size))
         return false;
@@ -284,8 +287,8 @@ bool gwdegtb_wdl_decompress_threads(const char *directory,
     path = database_path(directory, &canonical, "wdl");
     if (path == NULL)
         return fail("cannot allocate resident WDL path");
-    if (!wdl_open(&wdl, path, 1, DEFAULT_WDL_COMPRESSION_LEVEL,
-                  DEFAULT_DTM_CACHE_PAGES)) {
+    if (!wdl_open_threaded(&wdl, path, 1, DEFAULT_WDL_COMPRESSION_LEVEL,
+                           DEFAULT_DTM_CACHE_PAGES, thread_count)) {
         fail("cannot open or generate %s: %s", path, wdl_last_error());
         goto done;
     }
@@ -494,7 +497,7 @@ int16_t gwdegtb_wdl_lookup(uint64_t white_kings, uint64_t white_men,
 
 static bool ensure_compressed_wdl(const char *directory,
                                   const EgtbMaterial *canonical,
-                                  char **path)
+                                  char **path, unsigned thread_count)
 {
     Wdl *wdl = NULL;
     *path = database_path(directory, canonical, "wdl");
@@ -502,8 +505,8 @@ static bool ensure_compressed_wdl(const char *directory,
         return fail("cannot allocate compressed WDL path");
     if (access(*path, F_OK) == 0)
         return true;
-    if (!wdl_open(&wdl, *path, 1, DEFAULT_WDL_COMPRESSION_LEVEL,
-                  DEFAULT_DTM_CACHE_PAGES))
+    if (!wdl_open_threaded(&wdl, *path, 1, DEFAULT_WDL_COMPRESSION_LEVEL,
+                           DEFAULT_DTM_CACHE_PAGES, thread_count))
         return fail("cannot open or generate %s: %s", *path,
                     wdl_last_error());
     if (!wdl_close(wdl))
@@ -563,6 +566,15 @@ bool gwdegtb_wdl_compressed_info(const char *directory,
                                  const char *database_name,
                                  size_t *size)
 {
+    unsigned threads = wdl_default_threads();
+    if (!threads) return fail("%s", wdl_last_error());
+    return gwdegtb_wdl_compressed_info_threads(directory, database_name, size, threads);
+}
+
+bool gwdegtb_wdl_compressed_info_threads(const char *directory,
+                                         const char *database_name,
+                                         size_t *size, unsigned thread_count)
+{
     EgtbMaterial requested, canonical;
     EgtbMaterialKind kind;
     char *path = NULL;
@@ -571,6 +583,8 @@ bool gwdegtb_wdl_compressed_info(const char *directory,
     if (size == NULL)
         return fail("invalid compressed WDL size output");
     *size = 0;
+    if (!thread_count || thread_count > WDL_MAX_DECOMPRESSION_THREADS)
+        return fail("invalid WDL thread count");
     if (!parse_database_name(database_name, &requested, &canonical, &kind) ||
         !compressed_wdl_can_be_provided(directory, &canonical, &available))
         goto done;
@@ -578,7 +592,7 @@ bool gwdegtb_wdl_compressed_info(const char *directory,
         ok = true;
         goto done;
     }
-    if (!ensure_compressed_wdl(directory, &canonical, &path))
+    if (!ensure_compressed_wdl(directory, &canonical, &path, thread_count))
         goto done;
     if (!wdl_file_size(path, size)) {
         fail("cannot size %s: %s", path, wdl_last_error());
@@ -594,16 +608,28 @@ bool gwdegtb_wdl_compressed_load(const char *directory,
                                  const char *database_name,
                                  void *data, size_t size)
 {
+    unsigned threads = wdl_default_threads();
+    if (!threads) return fail("%s", wdl_last_error());
+    return gwdegtb_wdl_compressed_load_threads(directory, database_name, data, size, threads);
+}
+
+bool gwdegtb_wdl_compressed_load_threads(const char *directory,
+                                         const char *database_name,
+                                         void *data, size_t size,
+                                         unsigned thread_count)
+{
     EgtbMaterial requested, canonical;
     EgtbMaterialKind kind;
     char *path = NULL;
     bool ok = false;
     if (data == NULL)
         return fail("invalid compressed WDL destination");
+    if (!thread_count || thread_count > WDL_MAX_DECOMPRESSION_THREADS)
+        return fail("invalid WDL thread count");
     if (!parse_database_name(database_name, &requested, &canonical, &kind) ||
-        !ensure_compressed_wdl(directory, &canonical, &path))
+        !ensure_compressed_wdl(directory, &canonical, &path, thread_count))
         goto done;
-    if (!wdl_file_load_into(path, data, size)) {
+    if (!wdl_file_load_into_threaded(path, data, size, thread_count)) {
         fail("cannot load %s: %s", path, wdl_last_error());
         goto done;
     }
@@ -763,9 +789,9 @@ static bool load_compressed_cache_page(GwdegtbWdlProbe *probe,
     if (compressed == NULL) {
         memset(entry->data, 0, sizeof(entry->data));
     } else {
-        decompressed = ZSTD_decompressDCtx(
+        decompressed = ZSTD_decompress_usingDDict(
             probe->decompressor, entry->data, sizeof(entry->data),
-            compressed, compressed_size);
+            compressed, compressed_size, wdl_image_dictionary(database->image));
         if (ZSTD_isError(decompressed) || decompressed != sizeof(entry->data))
             return fail("compressed WDL decompression failed for page %llu: %s",
                         (unsigned long long)page,

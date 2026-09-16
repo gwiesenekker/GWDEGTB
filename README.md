@@ -8,7 +8,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.4** (executable revision **3.401**).
+Current version: **3.5** (executable revision **3.501**).
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 The summary includes per-material dependency cache statistics, summed across
@@ -1140,10 +1140,65 @@ pair, `00` is draw/unknown, `01` is won, and `10` is lost. Sixteen positions fit
 in one `uint64_t`. WDL pages are 1,024 bytes and cover 2,048 positions.
 
 `wdl_open()` opens the requested `.wdl`; if it does not exist, it derives the
-corresponding `.dtm`, compiles the complete WDL bitmap in memory, collects WTM
-and BTM statistics, compresses and checksums the pages, atomically installs the
+corresponding `.dtm`, streams disjoint page ranges through parallel DTM readers,
+collects WTM and BTM statistics, compresses and checksums the pages, atomically installs the
 file, and opens it read-only. Its deliberately simple cache maps page N to
 `N % cache_pages` and stores only the page number and uncompressed bytes.
+
+GWD's on-demand WDL generation now uses **Zstd level 12 with a trained
+dictionary**, optimized for read-only page decompression. This setting is
+independent of `EGTB_COMPRESSION_LEVEL` (DTM generation). Low-level compilation
+functions still accept an explicit compression level.
+
+Before compilation, at most 4,096 pages are sampled across the entire position
+range, including both sides. Only non-draw pages train the dictionary. The
+default dictionary limit is 110 KiB, capped at 1/32 of the sampled bytes.
+Files below 256 WDL pages, samples with fewer than 128 non-draw pages, or
+unsuitable training samples fall back to dictionary-free compression. Sampling
+and training are single-threaded and bounded to about 4 MiB of sample storage;
+page compilation remains parallel. Allocation or source-read/checksum errors
+fail generation instead of silently disabling the dictionary.
+
+`EGTB_WDL_DICTIONARY_KIB=0` disables training; values 1..256 set the maximum
+dictionary size in KiB. This is a generation-time setting only: readers use
+the dictionary recorded in the file, regardless of their environment.
+
+Dictionary-backed files use WDL format 2. The 64-byte header stores dictionary
+length at byte 56 and its CRC32C at byte 60. The dictionary follows the existing
+page directory, before page payloads, and is stored only once. Its checksum is
+verified before preparing the shared immutable Zstd dictionary. Each reader
+thread/probe retains a private decompression context. Page CRCs, packed values,
+implicit draw pages, and the GWD/MPI allocation/attach API are unchanged.
+
+New readers accept both format 1 and format 2, including mixed databases in one
+probe. Old libraries cannot read format 2: **relink GWD with the new library**
+before using new files. Existing WDLs are reused, never automatically replaced;
+explicit recompilation is required to gain dictionary compression. For raw
+`WdlImage` page consumers, use `wdl_image_dictionary()` with
+`ZSTD_decompress_usingDDict()` rather than decoding without the dictionary.
+
+Missing-file generation defaults to four workers. Set `EGTB_WDL_THREADS=16`
+to use sixteen for implicit generation (including compressed-WDL information
+and loading calls) and the default resident decompression call. Explicit
+`gwdegtb_wdl_decompress_threads(..., n)` uses `n` both to generate a missing
+WDL and subsequently decompress it. Existing WDL files are never regenerated
+just because the thread count changes. Values must be in 1..256; workers are
+capped by the page count. These are process-local threads: only the MPI master
+should generate/load, as before.
+
+Each compilation worker owns a two-page DTM sequential view, a Zstd context,
+and a bounded batch of up to 1,024 compressed WDL pages (approximately 1 MiB).
+It reads both sides together, packs the unchanged four-bit representation, and
+writes exact-sized batches using `pwrite`. No whole WDL bitmap is allocated
+during compilation. The completed temporary file is flushed and atomically
+published; source checksum or I/O failures prevent publication. Pages that
+contain only draws remain implicit. Parallel output has identical results and
+compression size, but physical batch ordering/file hashes may differ.
+
+Low-level callers can use `wdl_compile_threaded(..., thread_count, ...)` and
+`wdl_open_threaded(..., thread_count)`. `wdl_compile()` remains a one-worker
+wrapper. The legacy `dtm_cache_pages` compilation argument remains accepted,
+but the streaming implementation needs only two pages per worker.
 
 ### Resident WDL API for GWD
 
@@ -1233,6 +1288,23 @@ the padded entry point.
 
 ### Compressed-resident WDL API for GWD
 
+Use `gwdegtb_wdl_compressed_info_threads(directory, name, &bytes, n)`
+before allocation and
+`gwdegtb_wdl_compressed_load_threads(directory, name, memory, bytes, n)`
+afterwards to choose the worker count explicitly. Both use `n` to generate a
+missing WDL; the load call also reads disjoint byte ranges in parallel into
+caller-owned memory using `pread`. No decompression is performed while loading
+the compressed image. Counts must be 1..256; small files use at most one worker
+per MiB, with single-worker reads performed directly. Buffers may be partially
+filled on failure and must not be attached until loading succeeds.
+
+The calls without `_threads` use `EGTB_WDL_THREADS` (default 4) for generation
+and loading. Set the explicit count on **both** calls: the size-query call
+may perform generation before allocation. Parallel reads may benefit SSD/NVMe
+storage but are not guaranteed faster on HDDs. MPI synchronization and per-search
+thread probes are unchanged. Resident `gwdegtb_wdl_decompress_threads()` likewise
+uses its explicit count for both missing-file generation and decompression.
+
 The compressed tier keeps each complete WDL file image in caller-owned
 memory and expands only the pages touched by search. This can reduce WDL RAM
 substantially, at the cost of one small mutable cache per search thread.
@@ -1249,10 +1321,11 @@ the shared window has been synchronized:
 ~~~c
 size_t compressed_bytes = 0;
 uint64_t shared_bytes = 0;
+unsigned wdl_threads = 16;
 
 if (is_master &&
-    !gwdegtb_wdl_compressed_info(egtb_directory, database_name,
-                                 &compressed_bytes))
+    !gwdegtb_wdl_compressed_info_threads(egtb_directory, database_name,
+                                         &compressed_bytes, wdl_threads))
     abort();
 if (is_master && compressed_bytes == 0) {
     /* Neither the configured WDL nor its source DTM exists yet: skip it. */
@@ -1267,8 +1340,8 @@ if (compressed_bytes == 0)
 
 /* Allocate compressed_bytes in the existing MPI shared-window wrapper. */
 if (is_master &&
-    !gwdegtb_wdl_compressed_load(egtb_directory, database_name,
-                                 shared_image, compressed_bytes))
+    !gwdegtb_wdl_compressed_load_threads(egtb_directory, database_name,
+                                         shared_image, compressed_bytes, wdl_threads))
     abort();
 
 /* Synchronize the shared window here. */

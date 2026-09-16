@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "wdl.h"
+#include "crc32c.h"
+#include <stdatomic.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -16,11 +18,16 @@
 #include <unistd.h>
 
 #include <zstd.h>
+#include <zdict.h>
 
 #define WDL_HEADER_SIZE 64
 #define WDL_DIRECTORY_ENTRY_SIZE 14
 #define WDL_POSITIONS_PER_PAGE (WDL_PAGE_SIZE * 2)
 #define WDL_INVALID_PAGE UINT64_MAX
+#define WDL_MAX_DICTIONARY_BYTES (256u * 1024u)
+#ifndef WDL_DICTIONARY_SAMPLES
+#define WDL_DICTIONARY_SAMPLES 4096u
+#endif
 
 typedef struct {
     uint64_t page_number;
@@ -40,6 +47,7 @@ struct Wdl {
     WdlCacheEntry *cache;
     size_t cache_pages;
     ZSTD_DCtx *decompressor;
+    ZSTD_DDict *dictionary;
     unsigned char *compressed;
     size_t compressed_capacity;
 };
@@ -51,6 +59,7 @@ struct WdlImage {
     uint64_t page_count;
     uint64_t packed_bytes;
     uint64_t data_offset;
+    ZSTD_DDict *dictionary;
 };
 
 static const unsigned char wdl_magic[8] = {'I','P','D','W','D','L','\0','\0'};
@@ -113,31 +122,6 @@ static uint64_t get_u64(const unsigned char *p)
     return value;
 }
 
-static uint32_t crc32c(const void *data, size_t size)
-{
-    static uint32_t table[256];
-    static bool initialized;
-    const unsigned char *bytes = data;
-    uint32_t crc = UINT32_MAX;
-    size_t i;
-
-    if (!initialized) {
-        unsigned entry;
-        for (entry = 0; entry < 256; ++entry) {
-            uint32_t value = entry;
-            unsigned bit;
-            for (bit = 0; bit < 8; ++bit)
-                value = (value >> 1) ^
-                        (UINT32_C(0x82f63b78) &
-                         (UINT32_C(0) - (value & 1)));
-            table[entry] = value;
-        }
-        initialized = true;
-    }
-    for (i = 0; i < size; ++i)
-        crc = table[(crc ^ bytes[i]) & 0xff] ^ (crc >> 8);
-    return ~crc;
-}
 
 static bool seek_file(FILE *file, uint64_t offset)
 {
@@ -153,12 +137,6 @@ static bool read_at(FILE *file, uint64_t offset, void *data, size_t size)
     return seek_file(file, offset) &&
            (fread(data, 1, size, file) == size ||
             fail("WDL file read failed or was truncated"));
-}
-
-static bool write_all(FILE *file, const void *data, size_t size)
-{
-    return fwrite(data, 1, size, file) == size ||
-           fail("WDL file write failed");
 }
 
 static WdlResult dtm_to_wdl(int16_t dtm)
@@ -201,177 +179,446 @@ static bool replace_extension(const char *path, const char *old_extension,
     return true;
 }
 
-static bool write_wdl_file(const char *path, const uint64_t *bitmap,
-                           uint64_t maximum_index, int compression_level,
-                           WdlStorageStatistics *statistics)
-{
-    uint64_t positions = maximum_index + 1;
-    uint64_t packed_bytes = positions / 2 + (positions % 2 != 0);
-    uint64_t page_count = packed_bytes / WDL_PAGE_SIZE +
-                          (packed_bytes % WDL_PAGE_SIZE != 0);
-    uint64_t directory_bytes, data_offset, page;
-    uint64_t *offsets = NULL;
-    uint16_t *lengths = NULL;
-    uint32_t *checksums = NULL;
-    unsigned char *compressed = NULL;
-    unsigned char page_data[WDL_PAGE_SIZE];
-    unsigned char header[WDL_HEADER_SIZE] = {0};
-    unsigned char directory_entry[WDL_DIRECTORY_ENTRY_SIZE];
-    size_t compressed_capacity = ZSTD_compressBound(WDL_PAGE_SIZE);
-    ZSTD_CCtx *compressor = NULL;
-    FILE *file = NULL;
-    char *temporary = NULL;
-    int descriptor = -1;
-    bool ok = false;
+/* A worker buffers at most 1024 compressed pages (~1 MiB), then reserves
+ * one exact output extent. Page-directory ranges are disjoint. */
+#define WDL_BATCH_PAGES 1024
 
-    if (page_count > SIZE_MAX / sizeof(*offsets) ||
-        page_count > (UINT64_MAX - WDL_HEADER_SIZE) /
-                         WDL_DIRECTORY_ENTRY_SIZE)
-        return fail("WDL directory is too large");
-    directory_bytes = page_count * WDL_DIRECTORY_ENTRY_SIZE;
-    data_offset = WDL_HEADER_SIZE + directory_bytes;
-    if (data_offset > (uint64_t)INT64_MAX)
-        return fail("WDL file is too large for this platform");
-    offsets = calloc((size_t)page_count, sizeof(*offsets));
-    lengths = calloc((size_t)page_count, sizeof(*lengths));
-    checksums = calloc((size_t)page_count, sizeof(*checksums));
-    compressed = malloc(compressed_capacity);
-    compressor = ZSTD_createCCtx();
-    temporary = malloc(strlen(path) + 24);
-    if (offsets == NULL || lengths == NULL || checksums == NULL ||
-        compressed == NULL || compressor == NULL || temporary == NULL) {
+typedef struct {
+    Egtb *dtm;
+    int descriptor;
+    int level;
+    ZSTD_CDict *dictionary;
+    uint64_t positions;
+    uint64_t next_offset;
+    pthread_mutex_t mutex;
+    atomic_bool cancelled;
+} WdlCompileShared;
+
+typedef struct {
+    WdlCompileShared *shared;
+    uint64_t first_page, end_page;
+    WdlStatistics statistics;
+    WdlStorageStatistics storage;
+    bool failed;
+    char error[256];
+} WdlCompileWorker;
+
+static bool pwrite_all(int fd, uint64_t offset, const void *data, size_t bytes)
+{
+    const unsigned char *p = data;
+    if (offset > INT64_MAX || bytes > (uint64_t)INT64_MAX - offset)
+        return fail("WDL output offset overflow");
+    while (bytes) {
+        ssize_t n = pwrite(fd, p, bytes, (off_t)offset);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return fail("WDL file write failed: %s",
+                        n < 0 ? strerror(errno) : "short write");
+        p += n;
+        offset += (size_t)n;
+        bytes -= (size_t)n;
+    }
+    return true;
+}
+
+static void *compile_wdl_pages(void *opaque)
+{
+    WdlCompileWorker *w = opaque;
+    WdlCompileShared *s = w->shared;
+    EgtbView *view = NULL;
+    EgtbSequentialReader reader;
+    ZSTD_CCtx *compressor = ZSTD_createCCtx();
+    size_t bound = ZSTD_compressBound(WDL_PAGE_SIZE);
+    unsigned char *payload = malloc(bound * WDL_BATCH_PAGES);
+    unsigned char *directory = malloc(WDL_DIRECTORY_ENTRY_SIZE * WDL_BATCH_PAGES);
+    unsigned char decoded[WDL_PAGE_SIZE];
+    uint64_t first = w->first_page * WDL_POSITIONS_PER_PAGE;
+    uint64_t end = w->end_page * WDL_POSITIONS_PER_PAGE;
+    if (end > s->positions)
+        end = s->positions;
+    if (!compressor || !payload || !directory) {
+        fail("cannot allocate WDL compilation worker");
+        goto failed;
+    }
+    /* One page per plane; the cursor consumes both before advancing. */
+    if (!egtb_view_create(&view, s->dtm, 2, false) ||
+        !egtb_sequential_reader_init(&reader, view, first, end)) {
+        fail("cannot create DTM sequential reader: %s", egtb_last_error());
+        goto failed;
+    }
+    for (uint64_t batch = w->first_page; batch < w->end_page;) {
+        size_t pages = (size_t)(w->end_page - batch);
+        size_t used = 0;
+        uint64_t offset;
+        if (atomic_load_explicit(&s->cancelled, memory_order_relaxed))
+            goto done;
+        if (pages > WDL_BATCH_PAGES)
+            pages = WDL_BATCH_PAGES;
+        memset(directory, 0, pages * WDL_DIRECTORY_ENTRY_SIZE);
+        for (size_t p = 0; p < pages; ++p) {
+            uint64_t index = (batch + p) * WDL_POSITIONS_PER_PAGE;
+            size_t count = (size_t)(s->positions - index);
+            bool all_draw = true;
+            if (count > WDL_POSITIONS_PER_PAGE)
+                count = WDL_POSITIONS_PER_PAGE;
+            memset(decoded, 0, sizeof(decoded));
+            for (size_t i = 0; i < count; ++i) {
+                int16_t white, black;
+                if (!egtb_sequential_reader_next(&reader, &white, &black)) {
+                    fail("cannot read DTM source: %s", egtb_last_error());
+                    goto failed;
+                }
+                WdlResult a = dtm_to_wdl(white), b = dtm_to_wdl(black);
+                unsigned char packed = (unsigned char)(a | (b << 2));
+                decoded[i / 2] |= (unsigned char)(packed << ((i % 2) * 4));
+                all_draw &= packed == 0;
+                count_result(&w->statistics, EGTB_WHITE_TO_MOVE, a);
+                count_result(&w->statistics, EGTB_BLACK_TO_MOVE, b);
+            }
+            if (!all_draw) {
+                size_t n = s->dictionary
+                    ? ZSTD_compress_usingCDict(compressor, payload + used, bound,
+                                              decoded, sizeof(decoded), s->dictionary)
+                    : ZSTD_compressCCtx(compressor, payload + used, bound,
+                                         decoded, sizeof(decoded), s->level);
+                if (ZSTD_isError(n) || !n || n > UINT16_MAX) {
+                    fail("WDL Zstd compression failed: %s", ZSTD_getErrorName(n));
+                    goto failed;
+                }
+                unsigned char *entry = directory + p * WDL_DIRECTORY_ENTRY_SIZE;
+                put_u64(entry, used); /* rebased after reserving the batch */
+                put_u16(entry + 8, (uint16_t)n);
+                put_u32(entry + 10, crc32c(decoded, sizeof(decoded)));
+                used += n;
+                ++w->storage.stored_pages;
+            }
+        }
+        pthread_mutex_lock(&s->mutex);
+        offset = s->next_offset;
+        bool fits = offset <= INT64_MAX && used <= (uint64_t)INT64_MAX - offset;
+        if (fits)
+            s->next_offset += used;
+        pthread_mutex_unlock(&s->mutex);
+        if (!fits) {
+            fail("WDL output offset overflow");
+            goto failed;
+        }
+        for (size_t p = 0; p < pages; ++p) {
+            unsigned char *entry = directory + p * WDL_DIRECTORY_ENTRY_SIZE;
+            if (get_u16(entry + 8))
+                put_u64(entry, get_u64(entry) + offset);
+        }
+        if (!pwrite_all(s->descriptor, offset, payload, used) ||
+            !pwrite_all(s->descriptor,
+                         WDL_HEADER_SIZE + batch * WDL_DIRECTORY_ENTRY_SIZE,
+                         directory, pages * WDL_DIRECTORY_ENTRY_SIZE))
+            goto failed;
+        w->storage.compressed_payload_bytes += used;
+        batch += pages;
+    }
+    goto done;
+failed:
+    w->failed = true;
+    snprintf(w->error, sizeof(w->error), "%s", wdl_last_error());
+    atomic_store_explicit(&s->cancelled, true, memory_order_relaxed);
+done:
+    if (!egtb_view_close(view) && !w->failed) {
+        w->failed = true;
+        snprintf(w->error, sizeof(w->error), "cannot close DTM view: %s",
+                 egtb_last_error());
+        atomic_store_explicit(&s->cancelled, true, memory_order_relaxed);
+    }
+    ZSTD_freeCCtx(compressor);
+    free(payload);
+    free(directory);
+    return NULL;
+}
+
+unsigned wdl_default_threads(void)
+{
+    const char *value = getenv("EGTB_WDL_THREADS");
+    char *end;
+    unsigned long n;
+    if (!value || !*value)
+        return 4;
+    errno = 0;
+    n = strtoul(value, &end, 10);
+    if (errno || *end || n == 0 || n > WDL_MAX_DECOMPRESSION_THREADS) {
+        fail("EGTB_WDL_THREADS must be between 1 and %u",
+             WDL_MAX_DECOMPRESSION_THREADS);
+        return 0;
+    }
+    return (unsigned)n;
+}
+
+static bool train_dictionary(Egtb *dtm, uint64_t positions, uint64_t pages,
+                              unsigned char **out, size_t *out_size)
+{
+    const char *setting = getenv("EGTB_WDL_DICTIONARY_KIB");
+    size_t capacity = 110u * 1024u;
+    *out = NULL;
+    *out_size = 0;
+    if (setting && *setting) {
+        char *end;
+        errno = 0;
+        unsigned long n = strtoul(setting, &end, 10);
+        if (errno || *end || *setting < '0' || *setting > '9' || n > 256)
+            return fail("EGTB_WDL_DICTIONARY_KIB must be 0..256");
+        capacity = (size_t)n * 1024;
+    }
+    if (!capacity || pages < 256)
+        return true;
+    unsigned attempts = pages < WDL_DICTIONARY_SAMPLES
+                            ? (unsigned)pages : WDL_DICTIONARY_SAMPLES;
+    unsigned char *samples = malloc((size_t)attempts * WDL_PAGE_SIZE);
+    size_t *sizes = malloc((size_t)attempts * sizeof(*sizes));
+    unsigned char *dictionary = NULL;
+    EgtbView *view = NULL;
+    unsigned count = 0;
+    bool ok = false;
+    if (!samples || !sizes) {
+        fail("cannot allocate WDL dictionary samples");
+        goto done;
+    }
+    if (!egtb_view_create(&view, dtm, 2, false)) {
+        fail("cannot create dictionary sampling view: %s", egtb_last_error());
+        goto done;
+    }
+    for (unsigned i = 0; i < attempts; ++i) {
+        /* One deterministic pseudorandom page per equal index stratum;
+         * avoids a fixed stride repeatedly sampling the same pattern. */
+        uint64_t first = (pages / attempts) * i + (pages % attempts) * i / attempts;
+        uint64_t end = (pages / attempts) * (i + 1) +
+                       (pages % attempts) * (i + 1) / attempts;
+        uint64_t hash = (uint64_t)(i + 1) * UINT64_C(0x9e3779b97f4a7c15);
+        hash = (hash ^ (hash >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+        hash = (hash ^ (hash >> 27)) * UINT64_C(0x94d049bb133111eb);
+        uint64_t page = first + (hash ^ (hash >> 31)) % (end - first);
+        uint64_t start = page * WDL_POSITIONS_PER_PAGE;
+        uint64_t limit = positions - start;
+        if (limit > WDL_POSITIONS_PER_PAGE) limit = WDL_POSITIONS_PER_PAGE;
+        EgtbSequentialReader reader;
+        if (!egtb_sequential_reader_init(&reader, view, start, start + limit)) {
+            fail("cannot initialize WDL dictionary sample: %s", egtb_last_error());
+            goto done;
+        }
+        unsigned char *sample = samples + (size_t)count * WDL_PAGE_SIZE;
+        memset(sample, 0, WDL_PAGE_SIZE);
+        bool nonzero = false;
+        for (uint64_t j = 0; j < limit; ++j) {
+            int16_t white, black;
+            if (!egtb_sequential_reader_next(&reader, &white, &black)) {
+                fail("cannot read WDL dictionary sample: %s", egtb_last_error());
+                goto done;
+            }
+            unsigned packed = dtm_to_wdl(white) | (dtm_to_wdl(black) << 2);
+            sample[j / 2] |= (unsigned char)(packed << ((j % 2) * 4));
+            nonzero |= packed != 0;
+        }
+        if (nonzero) sizes[count++] = WDL_PAGE_SIZE;
+    }
+    if (count < 128) { ok = true; goto done; }
+    /* Avoid oversized dictionaries on small or draw-heavy databases. */
+    size_t sample_bytes = (size_t)count * WDL_PAGE_SIZE;
+    if (capacity > sample_bytes / 32) capacity = sample_bytes / 32;
+    dictionary = malloc(capacity);
+    if (!dictionary) { fail("cannot allocate WDL dictionary"); goto done; }
+    size_t trained = ZDICT_trainFromBuffer(dictionary, capacity, samples, sizes, count);
+    if (ZDICT_isError(trained)) {
+        fprintf(stderr, "WDL dictionary training skipped: %s\n", ZDICT_getErrorName(trained));
+        ok = true;
+        goto done;
+    }
+    printf("WDL dictionary: %zu bytes trained from %u non-draw pages\n", trained, count);
+    *out = dictionary;
+    *out_size = trained;
+    dictionary = NULL;
+    ok = true;
+done:
+    if (!egtb_view_close(view) && ok) {
+        fail("cannot close WDL dictionary sample view: %s", egtb_last_error());
+        ok = false;
+    }
+    free(dictionary);
+    free(samples);
+    free(sizes);
+    return ok;
+}
+
+static bool prepare_dictionary(const void *bytes, size_t size, uint32_t checksum,
+                                ZSTD_DDict **out)
+{
+    *out = NULL;
+    if (crc32c(bytes, size) != checksum)
+        return fail("CRC32C mismatch for WDL dictionary");
+    if (!ZSTD_getDictID_fromDict(bytes, size))
+        return fail("invalid trained WDL dictionary");
+    *out = ZSTD_createDDict(bytes, size);
+    return *out != NULL || fail("cannot prepare WDL dictionary");
+}
+
+bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
+                           int compression_level, size_t dtm_cache_pages,
+                           unsigned thread_count, WdlStatistics *statistics,
+                           WdlStorageStatistics *storage_statistics)
+{
+    Egtb *dtm = NULL;
+    WdlCompileWorker *workers = NULL;
+    pthread_t *threads = NULL;
+    unsigned created = 0;
+    unsigned char header[WDL_HEADER_SIZE] = {0};
+    char *temporary = NULL;
+    bool ok = false, mutex_ready = false, temporary_created = false;
+    WdlCompileShared shared = {0};
+    WdlStatistics totals = {0};
+    WdlStorageStatistics storage = {0};
+    unsigned char *dictionary = NULL;
+    size_t dictionary_size = 0;
+    uint64_t pages, packed_bytes, data_offset;
+    shared.descriptor = -1;
+    atomic_init(&shared.cancelled, false);
+    if (!dtm_path || !wdl_path || !dtm_cache_pages ||
+        !thread_count || thread_count > WDL_MAX_DECOMPRESSION_THREADS)
+        return fail("invalid WDL compilation argument");
+    /* The legacy cache argument remains accepted; streaming needs only a
+     * two-page private view per worker, not a large random-access cache. */
+    if (!egtb_open_readonly(&dtm, dtm_path, 1))
+        return fail("cannot open DTM source: %s", egtb_last_error());
+    shared.dtm = dtm;
+    shared.positions = egtb_maximum_index(dtm) + 1;
+    shared.level = compression_level;
+    packed_bytes = shared.positions / 2 + (shared.positions % 2 != 0);
+    pages = packed_bytes / WDL_PAGE_SIZE + (packed_bytes % WDL_PAGE_SIZE != 0);
+    if (!shared.positions ||
+        pages > ((uint64_t)INT64_MAX - WDL_HEADER_SIZE) / WDL_DIRECTORY_ENTRY_SIZE) {
+        fail("WDL output is too large");
+        goto done;
+    }
+    if (!train_dictionary(dtm, shared.positions, pages, &dictionary, &dictionary_size))
+        goto done;
+    if (dictionary_size) {
+        shared.dictionary = ZSTD_createCDict(dictionary, dictionary_size, compression_level);
+        if (!shared.dictionary) { fail("cannot prepare WDL compression dictionary"); goto done; }
+    }
+    data_offset = WDL_HEADER_SIZE + pages * WDL_DIRECTORY_ENTRY_SIZE;
+    if (dictionary_size > (uint64_t)INT64_MAX - data_offset) {
+        fail("WDL dictionary offset overflow"); goto done;
+    }
+    data_offset += dictionary_size;
+    shared.next_offset = data_offset;
+    if (thread_count > pages)
+        thread_count = (unsigned)pages;
+    workers = calloc(thread_count, sizeof(*workers));
+    threads = calloc(thread_count, sizeof(*threads));
+    temporary = malloc(strlen(wdl_path) + 24);
+    if (!workers || !threads || !temporary) {
         fail("cannot allocate WDL compilation data");
         goto done;
     }
-    snprintf(temporary, strlen(path) + 24, "%s.tmp.XXXXXX", path);
-    descriptor = mkstemp(temporary);
-    if (descriptor < 0) {
+    int error = pthread_mutex_init(&shared.mutex, NULL);
+    if (error) {
+        fail("cannot initialize WDL writer mutex: %s", strerror(error));
+        goto done;
+    }
+    mutex_ready = true;
+    snprintf(temporary, strlen(wdl_path) + 24, "%s.tmp.XXXXXX", wdl_path);
+    shared.descriptor = mkstemp(temporary);
+    if (shared.descriptor < 0) {
         fail("cannot create temporary WDL file: %s", strerror(errno));
         goto done;
     }
-    file = fdopen(descriptor, "w+b");
-    if (file == NULL) {
-        close(descriptor);
-        descriptor = -1;
-        fail("cannot create WDL stream: %s", strerror(errno));
-        goto done;
-    }
-    descriptor = -1;
-
+    temporary_created = true;
     memcpy(header, wdl_magic, sizeof(wdl_magic));
-    header[8] = WDL_FORMAT_VERSION;
+    header[8] = dictionary_size ? WDL_FORMAT_VERSION : WDL_LEGACY_FORMAT_VERSION;
     put_u16(header + 10, WDL_HEADER_SIZE);
     put_u32(header + 12, WDL_PAGE_SIZE);
-    put_u64(header + 16, maximum_index);
-    put_u64(header + 24, page_count);
+    put_u64(header + 16, shared.positions - 1);
+    put_u64(header + 24, pages);
     put_u64(header + 32, WDL_HEADER_SIZE);
     put_u64(header + 40, data_offset);
     put_u64(header + 48, packed_bytes);
-    if (!write_all(file, header, sizeof(header)) ||
-        ftruncate(fileno(file), (off_t)data_offset) != 0) {
-        fail("cannot initialize WDL file: %s", strerror(errno));
+    put_u32(header + 56, (uint32_t)dictionary_size);
+    if (dictionary_size) put_u32(header + 60, crc32c(dictionary, dictionary_size));
+    if (ftruncate(shared.descriptor, (off_t)data_offset) != 0) {
+        fail("cannot initialize WDL output: %s", strerror(errno));
         goto done;
     }
-
-    for (page = 0; page < page_count; ++page) {
-        uint64_t first_byte = page * WDL_PAGE_SIZE;
-        size_t bytes = (size_t)(packed_bytes - first_byte);
-        size_t word, words;
-        bool all_draw = true;
-        if (bytes > WDL_PAGE_SIZE)
-            bytes = WDL_PAGE_SIZE;
-        memset(page_data, 0, sizeof(page_data));
-        words = (bytes + 7) / 8;
-        for (word = 0; word < words; ++word) {
-            uint64_t value = bitmap[first_byte / 8 + word];
-            size_t byte;
-            for (byte = 0; byte < 8 && word * 8 + byte < bytes; ++byte) {
-                unsigned char value_byte =
-                    (unsigned char)(value >> (8 * byte));
-                page_data[word * 8 + byte] = value_byte;
-                if (value_byte != 0)
-                    all_draw = false;
-            }
+    if (!pwrite_all(shared.descriptor, 0, header, sizeof(header)))
+        goto done;
+    if (dictionary_size && !pwrite_all(shared.descriptor,
+            data_offset - dictionary_size, dictionary, dictionary_size)) goto done;
+    for (unsigned i = 0; i < thread_count; ++i) {
+        uint64_t quotient = pages / thread_count, remainder = pages % thread_count;
+        workers[i].shared = &shared;
+        workers[i].first_page = i * quotient + (i < remainder ? i : remainder);
+        workers[i].end_page = workers[i].first_page + quotient + (i < remainder);
+        error = pthread_create(&threads[i], NULL, compile_wdl_pages, &workers[i]);
+        if (error) {
+            fail("cannot create WDL compilation worker: %s", strerror(error));
+            atomic_store_explicit(&shared.cancelled, true, memory_order_relaxed);
+            break;
         }
-        if (!all_draw) {
-            size_t compressed_size = ZSTD_compressCCtx(
-                compressor, compressed, compressed_capacity, page_data,
-                sizeof(page_data), compression_level);
-            off_t offset;
-            if (ZSTD_isError(compressed_size) || compressed_size == 0 ||
-                compressed_size > UINT16_MAX) {
-                fail("WDL Zstd compression failed: %s",
-                     ZSTD_getErrorName(compressed_size));
-                goto done;
-            }
-            if (fseeko(file, 0, SEEK_END) != 0 ||
-                (offset = ftello(file)) < 0) {
-                fail("cannot seek in WDL output");
-                goto done;
-            }
-            offsets[page] = (uint64_t)offset;
-            lengths[page] = (uint16_t)compressed_size;
-            checksums[page] = crc32c(page_data, sizeof(page_data));
-            if (!write_all(file, compressed, compressed_size))
-                goto done;
-        }
+        ++created;
     }
-
-    for (page = 0; page < page_count; ++page) {
-        put_u64(directory_entry, offsets[page]);
-        put_u16(directory_entry + 8, lengths[page]);
-        put_u32(directory_entry + 10, checksums[page]);
-        if (!seek_file(file, WDL_HEADER_SIZE +
-                             page * WDL_DIRECTORY_ENTRY_SIZE) ||
-            !write_all(file, directory_entry, sizeof(directory_entry)))
+    for (unsigned i = 0; i < created; ++i)
+        pthread_join(threads[i], NULL);
+    if (created != thread_count)
+        goto done;
+    for (unsigned i = 0; i < thread_count; ++i) {
+        if (workers[i].failed) {
+            fail("WDL compilation worker %u failed: %s", i, workers[i].error);
             goto done;
+        }
+        for (unsigned side = 0; side < 2; ++side) {
+            totals.wins[side] += workers[i].statistics.wins[side];
+            totals.draws[side] += workers[i].statistics.draws[side];
+            totals.losses[side] += workers[i].statistics.losses[side];
+        }
+        storage.stored_pages += workers[i].storage.stored_pages;
+        storage.compressed_payload_bytes += workers[i].storage.compressed_payload_bytes;
     }
-    if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
+    if (!egtb_close(dtm)) {
+        dtm = NULL;
+        fail("cannot close DTM source: %s", egtb_last_error());
+        goto done;
+    }
+    dtm = NULL;
+    if (fsync(shared.descriptor) != 0) {
         fail("cannot flush WDL output: %s", strerror(errno));
         goto done;
     }
-    if (fclose(file) != 0) {
-        file = NULL;
+    if (close(shared.descriptor) != 0) {
+        shared.descriptor = -1;
         fail("cannot close WDL output: %s", strerror(errno));
         goto done;
     }
-    file = NULL;
-    if (rename(temporary, path) != 0) {
-        fail("cannot install WDL file: %s", strerror(errno));
+    shared.descriptor = -1;
+    if (!egtb_publish(temporary, wdl_path)) {
+        fail("cannot publish WDL output: %s", egtb_last_error());
         goto done;
     }
-
-    if (statistics != NULL) {
-        struct stat status;
-        memset(statistics, 0, sizeof(*statistics));
-        statistics->logical_uncompressed_bytes = packed_bytes;
-        for (page = 0; page < page_count; ++page) {
-            if (offsets[page] != 0) {
-                ++statistics->stored_pages;
-                statistics->compressed_payload_bytes += lengths[page];
-            }
-        }
-        if (stat(path, &status) != 0) {
-            fail("cannot stat WDL output: %s", strerror(errno));
-            goto done;
-        }
-        statistics->file_bytes = (uint64_t)status.st_size;
-    }
+    storage.logical_uncompressed_bytes = packed_bytes;
+    storage.file_bytes = shared.next_offset;
+    if (statistics)
+        *statistics = totals;
+    if (storage_statistics)
+        *storage_statistics = storage;
     ok = true;
-
 done:
-    if (file != NULL)
-        fclose(file);
-    if (descriptor >= 0)
-        close(descriptor);
-    if (!ok && temporary != NULL)
+    if (shared.descriptor >= 0)
+        close(shared.descriptor);
+    if (!ok && temporary_created)
         unlink(temporary);
+    if (dtm)
+        egtb_close(dtm);
+    if (mutex_ready)
+        pthread_mutex_destroy(&shared.mutex);
     free(temporary);
-    ZSTD_freeCCtx(compressor);
-    free(compressed);
-    free(checksums);
-    free(lengths);
-    free(offsets);
+    free(threads);
+    free(workers);
+    ZSTD_freeCDict(shared.dictionary);
+    free(dictionary);
     return ok;
 }
 
@@ -380,55 +627,9 @@ bool wdl_compile(const char *dtm_path, const char *wdl_path,
                  WdlStatistics *statistics,
                  WdlStorageStatistics *storage_statistics)
 {
-    Egtb *dtm = NULL;
-    uint64_t positions, word_count, index;
-    uint64_t *bitmap = NULL;
-    WdlStatistics local_statistics;
-    bool ok = false;
-
-    if (dtm_path == NULL || wdl_path == NULL || dtm_cache_pages == 0)
-        return fail("invalid WDL compilation argument");
-    memset(&local_statistics, 0, sizeof(local_statistics));
-    if (!egtb_open_readonly(&dtm, dtm_path, dtm_cache_pages))
-        return fail("cannot open DTM source: %s", egtb_last_error());
-    positions = egtb_maximum_index(dtm) + 1;
-    word_count = positions / 16 + (positions % 16 != 0);
-    if (word_count > SIZE_MAX / sizeof(*bitmap)) {
-        fail("packed WDL bitmap is too large for this process");
-        goto done;
-    }
-    bitmap = calloc((size_t)word_count, sizeof(*bitmap));
-    if (bitmap == NULL) {
-        fail("cannot allocate packed WDL bitmap");
-        goto done;
-    }
-    for (index = 0; index < positions; ++index) {
-        unsigned side;
-        for (side = 0; side < 2; ++side) {
-            int16_t dtm_value;
-            WdlResult result;
-            unsigned shift = (unsigned)(index % 16) * 4 + side * 2;
-            if (!egtb_get(dtm, index, (EgtbSide)side, &dtm_value)) {
-                fail("cannot read DTM source: %s", egtb_last_error());
-                goto done;
-            }
-            result = dtm_to_wdl(dtm_value);
-            bitmap[index / 16] |= (uint64_t)result << shift;
-            count_result(&local_statistics, (EgtbSide)side, result);
-        }
-    }
-    if (!write_wdl_file(wdl_path, bitmap, positions - 1, compression_level,
-                        storage_statistics))
-        goto done;
-    if (statistics != NULL)
-        *statistics = local_statistics;
-    ok = true;
-
-done:
-    free(bitmap);
-    if (!egtb_close(dtm) && ok)
-        return fail("cannot close DTM source: %s", egtb_last_error());
-    return ok;
+    return wdl_compile_threaded(dtm_path, wdl_path, compression_level,
+                                dtm_cache_pages, 1, statistics,
+                                storage_statistics);
 }
 
 static void destroy_wdl(Wdl *wdl)
@@ -438,6 +639,7 @@ static void destroy_wdl(Wdl *wdl)
     if (wdl->file != NULL)
         fclose(wdl->file);
     ZSTD_freeDCtx(wdl->decompressor);
+    ZSTD_freeDDict(wdl->dictionary);
     free(wdl->compressed);
     free(wdl->cache);
     free(wdl->checksums);
@@ -475,7 +677,7 @@ static bool open_existing(Wdl **out, const char *path, size_t cache_pages,
         fail("not an International Polish Draughts WDL database");
         goto failure;
     }
-    if (header[8] != WDL_FORMAT_VERSION) {
+    if (header[8] != WDL_FORMAT_VERSION && header[8] != WDL_LEGACY_FORMAT_VERSION) {
         fail("unsupported WDL version %u", (unsigned)header[8]);
         goto failure;
     }
@@ -489,6 +691,11 @@ static bool open_existing(Wdl **out, const char *path, size_t cache_pages,
     directory_offset = get_u64(header + 32);
     wdl->data_offset = get_u64(header + 40);
     wdl->packed_bytes = get_u64(header + 48);
+    uint32_t dictionary_size = header[8] == WDL_FORMAT_VERSION ? get_u32(header + 56) : 0;
+    if (header[8] == WDL_FORMAT_VERSION &&
+        (!dictionary_size || dictionary_size > WDL_MAX_DICTIONARY_BYTES)) {
+        fail("invalid WDL dictionary size"); goto failure;
+    }
     if (wdl->maximum_index == UINT64_MAX) {
         fail("invalid WDL maximum index");
         goto failure;
@@ -499,10 +706,10 @@ static bool open_existing(Wdl **out, const char *path, size_t cache_pages,
                                  ((wdl->maximum_index + 1) % 2 != 0) ||
         calculated_pages != wdl->page_count ||
         directory_offset != WDL_HEADER_SIZE ||
-        wdl->page_count > (UINT64_MAX - WDL_HEADER_SIZE) /
+        wdl->page_count > (UINT64_MAX - WDL_HEADER_SIZE - dictionary_size) /
                               WDL_DIRECTORY_ENTRY_SIZE ||
         wdl->data_offset != WDL_HEADER_SIZE +
-                                wdl->page_count * WDL_DIRECTORY_ENTRY_SIZE ||
+                                wdl->page_count * WDL_DIRECTORY_ENTRY_SIZE + dictionary_size ||
         wdl->page_count > SIZE_MAX / sizeof(*wdl->offsets)) {
         fail("inconsistent WDL header");
         goto failure;
@@ -515,6 +722,16 @@ static bool open_existing(Wdl **out, const char *path, size_t cache_pages,
     if (wdl->data_offset > wdl->file_bytes) {
         fail("truncated WDL directory");
         goto failure;
+    }
+    if (dictionary_size) {
+        unsigned char *dictionary = malloc(dictionary_size);
+        if (!dictionary) { fail("cannot allocate WDL dictionary"); goto failure; }
+        bool valid = read_at(wdl->file, wdl->data_offset - dictionary_size,
+                             dictionary, dictionary_size) &&
+                     prepare_dictionary(dictionary, dictionary_size,
+                                         get_u32(header + 60), &wdl->dictionary);
+        free(dictionary);
+        if (!valid) goto failure;
     }
     wdl->offsets = malloc((size_t)wdl->page_count * sizeof(*wdl->offsets));
     wdl->lengths = malloc((size_t)wdl->page_count * sizeof(*wdl->lengths));
@@ -547,7 +764,8 @@ static bool open_existing(Wdl **out, const char *path, size_t cache_pages,
                     fail("invalid implicit WDL page %" PRIu64, current);
                     goto failure;
                 }
-            } else if ((uint64_t)wdl->lengths[current] > wdl->file_bytes ||
+            } else if (wdl->lengths[current] > ZSTD_compressBound(WDL_PAGE_SIZE) ||
+                       (uint64_t)wdl->lengths[current] > wdl->file_bytes ||
                        wdl->offsets[current] < wdl->data_offset ||
                        wdl->lengths[current] == 0 ||
                        wdl->offsets[current] >
@@ -594,13 +812,28 @@ failure:
 bool wdl_open(Wdl **out, const char *path, size_t cache_pages,
               int compression_level, size_t dtm_cache_pages)
 {
+    unsigned threads = wdl_default_threads();
+    if (!threads) {
+        if (out) *out = NULL;
+        return false;
+    }
+    return wdl_open_threaded(out, path, cache_pages, compression_level,
+                             dtm_cache_pages, threads);
+}
+
+bool wdl_open_threaded(Wdl **out, const char *path, size_t cache_pages,
+                       int compression_level, size_t dtm_cache_pages,
+                       unsigned thread_count)
+{
     bool not_found;
     char *dtm_path = NULL;
     WdlStatistics statistics;
     WdlStorageStatistics storage;
     bool ok;
+    if (out != NULL) *out = NULL;
     if (out == NULL || path == NULL || cache_pages == 0 ||
-        dtm_cache_pages == 0)
+        dtm_cache_pages == 0 || thread_count == 0 ||
+        thread_count > WDL_MAX_DECOMPRESSION_THREADS)
         return fail("invalid WDL open argument");
     if (open_existing(out, path, cache_pages, &not_found))
         return true;
@@ -608,8 +841,11 @@ bool wdl_open(Wdl **out, const char *path, size_t cache_pages,
         return false;
     if (!replace_extension(path, ".wdl", ".dtm", &dtm_path))
         return false;
-    ok = wdl_compile(dtm_path, path, compression_level, dtm_cache_pages,
-                     &statistics, &storage);
+    printf("WDL generation: %s with up to %u threads (Zstd level %d)\n",
+           path, thread_count, compression_level);
+    fflush(stdout);
+    ok = wdl_compile_threaded(dtm_path, path, compression_level, dtm_cache_pages,
+                              thread_count, &statistics, &storage);
     free(dtm_path);
     if (!ok)
         return false;
@@ -656,9 +892,9 @@ static bool load_page(Wdl *wdl, uint64_t page, WdlCacheEntry *entry)
         if (length > wdl->compressed_capacity ||
             !read_at(wdl->file, wdl->offsets[page], wdl->compressed, length))
             return false;
-        decompressed = ZSTD_decompressDCtx(
+        decompressed = ZSTD_decompress_usingDDict(
             wdl->decompressor, entry->data, sizeof(entry->data),
-            wdl->compressed, length);
+            wdl->compressed, length, wdl->dictionary);
         if (ZSTD_isError(decompressed))
             return fail("WDL Zstd decompression failed for page %" PRIu64
                         ": %s", page, ZSTD_getErrorName(decompressed));
@@ -760,9 +996,9 @@ static void *decompress_wdl_pages(void *opaque)
             worker->failed = true;
             break;
         }
-        decompressed = ZSTD_decompressDCtx(decompressor, decoded,
+        decompressed = ZSTD_decompress_usingDDict(decompressor, decoded,
                                             sizeof(decoded), compressed,
-                                            length);
+                                            length, wdl->dictionary);
         if (ZSTD_isError(decompressed)) {
             snprintf(worker->error, sizeof(worker->error),
                      "WDL Zstd decompression failed for page %" PRIu64 ": %s",
@@ -868,38 +1104,95 @@ bool wdl_file_size(const char *path, size_t *size)
     return true;
 }
 
-bool wdl_file_load_into(const char *path, void *data, size_t size)
-{
-    size_t expected;
+typedef struct {
     int descriptor;
-    unsigned char *destination = data;
-    size_t remaining = size;
-    off_t offset = 0;
-    if (data == NULL)
-        return fail("invalid compressed WDL destination");
-    if (!wdl_file_size(path, &expected))
-        return false;
-    if (size != expected)
-        return fail("invalid compressed WDL destination size");
-    descriptor = open(path, O_RDONLY);
-    if (descriptor < 0)
-        return fail("cannot open %s: %s", path, strerror(errno));
-    while (remaining != 0) {
-        ssize_t got = pread(descriptor, destination, remaining, offset);
+    unsigned char *data;
+    size_t first, end;
+    int error;
+    atomic_bool *cancelled;
+} WdlLoadWorker;
+
+static void *load_wdl_range(void *argument)
+{
+    WdlLoadWorker *w = argument;
+    size_t offset = w->first;
+    while (offset < w->end && !atomic_load_explicit(w->cancelled, memory_order_relaxed)) {
+        size_t count = w->end - offset;
+        if (count > 1024u * 1024u) count = 1024u * 1024u;
+        ssize_t got = pread(w->descriptor, w->data + offset, count, (off_t)offset);
         if (got < 0 && errno == EINTR)
             continue;
         if (got <= 0) {
-            close(descriptor);
-            return fail("cannot read %s: %s", path,
-                        got < 0 ? strerror(errno) : "unexpected end of file");
+            w->error = got < 0 ? errno : EIO;
+            atomic_store_explicit(w->cancelled, true, memory_order_relaxed);
+            break;
         }
-        destination += (size_t)got;
-        remaining -= (size_t)got;
-        offset += got;
+        offset += (size_t)got;
     }
-    if (close(descriptor) != 0)
+    return NULL;
+}
+
+bool wdl_file_load_into_threaded(const char *path, void *data, size_t size,
+                                 unsigned thread_count)
+{
+    struct stat status;
+    if (!path || !data || !thread_count || thread_count > WDL_MAX_DECOMPRESSION_THREADS)
+        return fail("invalid compressed WDL loading argument");
+    int descriptor = open(path, O_RDONLY);
+    if (descriptor < 0) return fail("cannot open %s: %s", path, strerror(errno));
+    bool ok = false;
+    WdlLoadWorker *workers = NULL;
+    pthread_t *threads = NULL;
+    atomic_bool cancelled;
+    atomic_init(&cancelled, false);
+    if (fstat(descriptor, &status) != 0) {
+        fail("cannot stat %s: %s", path, strerror(errno)); goto done;
+    }
+    if (status.st_size < 0 || (uint64_t)status.st_size != size) {
+        fail("invalid compressed WDL destination size"); goto done;
+    }
+    /* Avoid thread creation overhead on tiny files: at most one per MiB. */
+    size_t ranges = size / (1024u * 1024u) + (size % (1024u * 1024u) != 0);
+    if (!ranges) { ok = true; goto done; }
+    if (thread_count > ranges) thread_count = (unsigned)ranges;
+    workers = calloc(thread_count, sizeof(*workers));
+    threads = calloc(thread_count, sizeof(*threads));
+    if (!workers || !threads) { fail("cannot allocate WDL loading workers"); goto done; }
+    unsigned created = 0;
+    for (unsigned i = 0; i < thread_count; ++i) {
+        size_t quotient = size / thread_count, remainder = size % thread_count;
+        workers[i] = (WdlLoadWorker){.descriptor = descriptor, .data = data,
+            .first = i * quotient + (i < remainder ? i : remainder),
+            .cancelled = &cancelled};
+        workers[i].end = workers[i].first + quotient + (i < remainder);
+        if (thread_count == 1) { load_wdl_range(&workers[i]); break; }
+        int error = pthread_create(&threads[i], NULL, load_wdl_range, &workers[i]);
+        if (error) {
+            fail("cannot create WDL loading worker: %s", strerror(error));
+            atomic_store_explicit(&cancelled, true, memory_order_relaxed);
+            break;
+        }
+        ++created;
+    }
+    for (unsigned i = 0; i < created; ++i) pthread_join(threads[i], NULL);
+    if (thread_count > 1 && created != thread_count) goto done;
+    for (unsigned i = 0; i < thread_count; ++i)
+        if (workers[i].error) {
+            fail("cannot read %s: %s (worker %u)", path, strerror(workers[i].error), i);
+            goto done;
+        }
+    ok = true;
+done:
+    free(threads);
+    free(workers);
+    if (close(descriptor) != 0 && ok)
         return fail("cannot close %s: %s", path, strerror(errno));
-    return true;
+    return ok;
+}
+
+bool wdl_file_load_into(const char *path, void *data, size_t size)
+{
+    return wdl_file_load_into_threaded(path, data, size, 1);
 }
 
 bool wdl_image_attach(WdlImage **out, const void *data, size_t size)
@@ -911,7 +1204,7 @@ bool wdl_image_attach(WdlImage **out, const void *data, size_t size)
         return fail("invalid compressed WDL image");
     *out = NULL;
     if (memcmp(bytes, wdl_magic, sizeof(wdl_magic)) != 0 ||
-        bytes[8] != WDL_FORMAT_VERSION ||
+        (bytes[8] != WDL_FORMAT_VERSION && bytes[8] != WDL_LEGACY_FORMAT_VERSION) ||
         get_u16(bytes + 10) != WDL_HEADER_SIZE ||
         get_u32(bytes + 12) != WDL_PAGE_SIZE)
         return fail("unsupported compressed WDL image");
@@ -925,6 +1218,11 @@ bool wdl_image_attach(WdlImage **out, const void *data, size_t size)
     directory_offset = get_u64(bytes + 32);
     image->data_offset = get_u64(bytes + 40);
     image->packed_bytes = get_u64(bytes + 48);
+    uint32_t dictionary_size = bytes[8] == WDL_FORMAT_VERSION ? get_u32(bytes + 56) : 0;
+    if (bytes[8] == WDL_FORMAT_VERSION &&
+        (!dictionary_size || dictionary_size > WDL_MAX_DICTIONARY_BYTES)) {
+        fail("invalid compressed WDL dictionary size"); goto failure;
+    }
     if (image->maximum_index == UINT64_MAX) {
         fail("invalid compressed WDL maximum index");
         goto failure;
@@ -935,14 +1233,17 @@ bool wdl_image_attach(WdlImage **out, const void *data, size_t size)
                                    ((image->maximum_index + 1) % 2 != 0) ||
         calculated_pages != image->page_count ||
         directory_offset != WDL_HEADER_SIZE ||
-        image->page_count > (UINT64_MAX - WDL_HEADER_SIZE) /
+        image->page_count > (UINT64_MAX - WDL_HEADER_SIZE - dictionary_size) /
                                 WDL_DIRECTORY_ENTRY_SIZE ||
         image->data_offset != WDL_HEADER_SIZE +
-                                  image->page_count * WDL_DIRECTORY_ENTRY_SIZE ||
+                                  image->page_count * WDL_DIRECTORY_ENTRY_SIZE + dictionary_size ||
         image->data_offset > size) {
         fail("inconsistent compressed WDL header");
         goto failure;
     }
+    if (dictionary_size && !prepare_dictionary(
+            bytes + image->data_offset - dictionary_size, dictionary_size,
+            get_u32(bytes + 60), &image->dictionary)) goto failure;
     for (uint64_t page = 0; page < image->page_count; ++page) {
         const unsigned char *entry =
             bytes + WDL_HEADER_SIZE + page * WDL_DIRECTORY_ENTRY_SIZE;
@@ -954,7 +1255,8 @@ bool wdl_image_attach(WdlImage **out, const void *data, size_t size)
                 fail("invalid implicit compressed WDL page %" PRIu64, page);
                 goto failure;
             }
-        } else if (offset < image->data_offset || length == 0 ||
+        } else if (length > ZSTD_compressBound(WDL_PAGE_SIZE) ||
+                   offset < image->data_offset || length == 0 ||
                    offset > size || length > size - offset) {
             fail("invalid compressed WDL page %" PRIu64, page);
             goto failure;
@@ -967,13 +1269,19 @@ bool wdl_image_attach(WdlImage **out, const void *data, size_t size)
     *out = image;
     return true;
 failure:
-    free(image);
+    wdl_image_destroy(image);
     return false;
 }
 
 void wdl_image_destroy(WdlImage *image)
 {
+    if (image) ZSTD_freeDDict(image->dictionary);
     free(image);
+}
+
+const ZSTD_DDict *wdl_image_dictionary(const WdlImage *image)
+{
+    return image == NULL ? NULL : image->dictionary;
 }
 
 uint64_t wdl_image_maximum_index(const WdlImage *image)

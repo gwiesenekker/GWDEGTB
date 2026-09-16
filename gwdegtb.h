@@ -47,13 +47,13 @@ bool gwdegtb_wdl_info(const char *database_name, uint64_t *maximum_index,
  * .dtm file before decompression. This does not register the bitmap; call
  * gwdegtb_wdl_attach() after synchronization. directory may be NULL or empty.
  * A mirrored basename resolves to the corresponding canonical WDL file.
- * Decompression uses four workers by default.
+ * Generation and decompression use EGTB_WDL_THREADS workers (default four).
  */
 bool gwdegtb_wdl_decompress(const char *directory,
                             const char *database_name,
                             void *data, size_t size);
 
-/* As above, with an explicit decompression worker count. */
+/* As above, with an explicit worker count for generation and decompression. */
 bool gwdegtb_wdl_decompress_threads(const char *directory,
                                     const char *database_name,
                                     void *data, size_t size,
@@ -110,6 +110,17 @@ bool gwdegtb_wdl_compressed_info(const char *directory,
 bool gwdegtb_wdl_compressed_load(const char *directory,
                                  const char *database_name,
                                  void *data, size_t size);
+/* Explicit counts override EGTB_WDL_THREADS (default 4), range 1..256.
+ * info may generate a missing file before its exact size is known; load uses
+ * the count for missing-file generation and parallel reads into caller memory.
+ * Neither call attaches the buffer. On load failure its contents are partial. */
+bool gwdegtb_wdl_compressed_info_threads(const char *directory,
+                                         const char *database_name,
+                                         size_t *size, unsigned thread_count);
+bool gwdegtb_wdl_compressed_load_threads(const char *directory,
+                                         const char *database_name,
+                                         void *data, size_t size,
+                                         unsigned thread_count);
 bool gwdegtb_wdl_compressed_attach(const char *database_name,
                                    const void *data, size_t size);
 bool gwdegtb_wdl_compressed_is_loaded(unsigned white_kings,
