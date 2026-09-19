@@ -96,6 +96,7 @@ static void close_catalog(DatabaseCatalog *catalog)
             for (unsigned bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
                 for (unsigned bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
                     CatalogEntry *entry = &catalog->entry[wk][wm][bk][bm];
+                    dependency_private_unregister(catalog->resident_pool, &entry->shared_probe);
                     egtb_shared_probe_destroy(entry->shared_probe);
                     entry->shared_probe = NULL;
                     if (entry->view != NULL)
@@ -163,6 +164,11 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot create dependency view for %.100s: %.100s", path,
                  egtb_last_error());
+        return false;
+    }
+    if (!dependency_private_register(catalog->resident_pool, entry->database,
+                                     entry->view, &entry->shared_probe)) {
+        snprintf(catalog->error,sizeof(catalog->error),"%s",dependency_resident_error());
         return false;
     }
     return true;
@@ -251,7 +257,7 @@ static void catalog_cache_statistics(const DatabaseCatalog *catalogs,
                         if (entry->shared_probe) {
                             EgtbSharedStatistics shared;
                             egtb_shared_probe_statistics(entry->shared_probe, &shared);
-                            part = shared.cache;
+                            add_cache_statistics(&part, &shared.cache);
                         }
                         part.lookups += entry->resident_lookups;
                         part.hits += entry->resident_lookups;
@@ -492,8 +498,10 @@ done:
     egtb_progress_stop();
     dependency_resident_destroy(dependency_pool);
     if (catalogs != NULL) {
-        for (unsigned worker = 0; worker < thread_count; ++worker)
+        for (unsigned worker = 0; worker < thread_count; ++worker) {
+            catalogs[worker].resident_pool = NULL;
             close_catalog(&catalogs[worker]);
+        }
     }
     free(contexts);
     free(catalogs);

@@ -553,6 +553,130 @@ static void idle_reclamation(Egtb *a, Egtb *b)
     puts("idle reclamation: constrained budget, active hits, phase grace and refill passed");
 }
 
+static void returning_idle_cache(Egtb *a, Egtb *b)
+{
+    DependencyResidentPool *pool;
+    EgtbSharedCache *c[2]; EgtbSharedProbe *p[2];
+    Egtb *db[2]={a,b}; const EgtbResident *resident;
+    const uint64_t budget=25000;
+    CHECK(dependency_resident_create(&pool,0,0));
+    CHECK(dependency_shared_policy(pool,"idle-reclaim-v1"));
+    CHECK(dependency_shared_configure(pool,256,budget));
+    CHECK(dependency_shared_minimum_load(pool,0.000001));
+    for (unsigned k=0;k<2;++k) {
+        CHECK(dependency_resident_acquire(pool,db[k],&resident));
+        CHECK(dependency_shared_acquire(pool,db[k],&c[k]) && c[k]);
+        CHECK(egtb_shared_probe_create(&p[k],c[k]));
+    }
+    int16_t value;
+    for (unsigned w=0;w<24;++w) {
+        for (unsigned j=0;j<100001;++j)
+            CHECK(egtb_shared_probe_get(p[0],(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+        dependency_shared_maintain_at(pool,w+1);
+    }
+    uint64_t remembered=egtb_shared_cache_bytes(c[0]);
+    CHECK(remembered>4096);
+    bool shrunk=false;
+    for (unsigned w=0;w<24 && !shrunk;++w) {
+        for (unsigned j=0;j<100001;++j)
+            CHECK(egtb_shared_probe_get(p[1],(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+        dependency_shared_maintain_at(pool,100+w);
+        shrunk=egtb_shared_cache_bytes(c[0])==256;
+    }
+    CHECK(shrunk);
+    /* The remembered target must survive a phase boundary. Keep the receiver
+     * active with hits: recovery may use free budget, not evict this cache. */
+    dependency_shared_phase_at(pool,200);
+    uint64_t receiver=egtb_shared_cache_bytes(c[1]);
+    for (unsigned w=0;w<3;++w) {
+        CHECK(egtb_shared_probe_get(p[1],0,EGTB_WHITE_TO_MOVE,&value));
+        for (unsigned j=0;j<100001;++j)
+            CHECK(egtb_shared_probe_get(p[0],(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+        dependency_shared_maintain_at(pool,201+w);
+        if (w<2) CHECK(egtb_shared_cache_bytes(c[0])==256);
+    }
+    /* Ordinary accelerated growth would reach only 864 bytes here. */
+    CHECK(egtb_shared_cache_bytes(c[0])>4096);
+    CHECK(egtb_shared_cache_bytes(c[0])<=remembered);
+    CHECK(egtb_shared_cache_bytes(c[1])==receiver);
+    DependencyCoordinatorStatistics stats;
+    dependency_shared_coordinator_statistics(pool,&stats);
+    CHECK(stats.allocated<=budget && stats.shrinks==1);
+    for (unsigned k=0;k<2;++k) {
+        for (unsigned i=0;i<N;++i) for (unsigned s=0;s<2;++s) {
+            CHECK(egtb_shared_probe_get(p[k],i,(EgtbSide)s,&value));
+            CHECK(value==expected(i,s));
+        }
+        egtb_shared_probe_destroy(p[k]);
+    }
+    dependency_resident_destroy(pool);
+    puts("returning idle cache: phase persistence, pressure gate, direct recovery and budget passed");
+}
+
+static void private_admission(Egtb *a, Egtb *b)
+{
+    for (unsigned mode=0; mode<3; ++mode) {
+        DependencyResidentPool *pool;
+        EgtbSharedCache *donor, *pending;
+        EgtbSharedProbe *d, *promoted[2]={NULL,NULL};
+        EgtbView *views[2]; const EgtbResident *resident;
+        uint64_t budget=2*egtb_shared_cache_planned_allocation(a,1024)+
+                        egtb_shared_cache_planned_allocation(a,256);
+        CHECK(dependency_resident_create(&pool,0,0));
+        CHECK(dependency_shared_policy(pool,"idle-reclaim-v1"));
+        CHECK(dependency_shared_configure(pool,1024,budget));
+        CHECK(dependency_shared_minimum_load(pool,0));
+        CHECK(dependency_resident_acquire(pool,a,&resident));
+        CHECK(dependency_shared_acquire(pool,a,&donor) && donor);
+        CHECK(egtb_shared_probe_create(&d,donor));
+        int16_t v;
+        for (unsigned w=0;w<6;++w) {
+            for (unsigned j=0;j<100001;++j)
+                CHECK(egtb_shared_probe_get(d,w<3 && (j&1) ? 256:0,EGTB_WHITE_TO_MOVE,&v));
+            dependency_shared_maintain_at(pool,w+1);
+        }
+        CHECK(egtb_shared_cache_bytes(donor)>1024);
+        CHECK(dependency_resident_acquire(pool,b,&resident));
+        CHECK(dependency_shared_acquire(pool,b,&pending) && !pending);
+        for (unsigned k=0;k<2;++k) {
+            CHECK(egtb_view_create(&views[k],b,1,false));
+            CHECK(dependency_private_register(pool,b,views[k],&promoted[k]));
+        }
+        if (mode==2) dependency_shared_phase_at(pool,67);
+        for (unsigned w=0;w<3;++w) {
+            if (mode==1) CHECK(egtb_shared_probe_get(d,0,EGTB_WHITE_TO_MOVE,&v));
+            for (unsigned k=0;k<2;++k) for (unsigned j=0;j<100001;++j) {
+                uint64_t i=j&1 ? 64:0;
+                CHECK(egtb_view_get(views[k],i,EGTB_WHITE_TO_MOVE,&v));
+                CHECK(v==expected(i,0));
+            }
+            dependency_shared_maintain_at(pool,67+w);
+        }
+        CHECK((promoted[0]!=NULL)==(mode==0));
+        CHECK((promoted[1]!=NULL)==(mode==0));
+        DependencyCoordinatorStatistics stats;
+        dependency_shared_coordinator_statistics(pool,&stats);
+        CHECK(stats.allocated<=budget);
+        for (unsigned k=0;k<2;++k) {
+            EgtbCacheStatistics prior,after;
+            egtb_view_cache_statistics(views[k],&prior);
+            CHECK(prior.lookups==300003 && prior.decompressions>100000);
+            if (promoted[k]) for (unsigned i=0;i<N;++i) for (unsigned s=0;s<2;++s) {
+                CHECK(egtb_shared_probe_get(promoted[k],i,(EgtbSide)s,&v));
+                CHECK(v==expected(i,s));
+            }
+            egtb_view_cache_statistics(views[k],&after);
+            CHECK(after.lookups==prior.lookups);
+            dependency_private_unregister(pool,&promoted[k]);
+            egtb_shared_probe_destroy(promoted[k]);
+            CHECK(egtb_view_close(views[k]));
+        }
+        egtb_shared_probe_destroy(d);
+        dependency_resident_destroy(pool);
+    }
+    puts("private admission: retry, idle reclamation, active-hit/phase protection and all probes passed");
+}
+
 static void coordinator(Egtb *a, Egtb *b)
 {
     for (unsigned outcome = 0; outcome < 7; ++outcome) {
@@ -693,6 +817,8 @@ int main(void)
     pressure_priority(db, other);
     coordinator(db, other);
     idle_reclamation(db, other);
+    private_admission(db, other);
+    returning_idle_cache(db, other);
     CHECK(egtb_close(other));
     CHECK(!egtb_shared_cache_create(&cache, db, 1));
     CHECK(egtb_shared_cache_create(&cache, db, 256)); /* One slot per side. */

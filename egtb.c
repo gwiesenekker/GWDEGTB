@@ -115,6 +115,8 @@ struct EgtbView {
     bool power_of_two_slots;
     struct EgtbView *next;
     EgtbCacheStatistics statistics;
+    bool sample_loads;
+    uint64_t load_samples, load_ns;
 };
 
 struct EgtbResident {
@@ -1511,8 +1513,17 @@ view_cache_miss(EgtbView *view, uint64_t page, size_t slot, EgtbEntry *data)
             return NULL;
     }
     entry->valid = false;
+    struct timespec begin, end;
+    bool timed = view->sample_loads && (view->statistics.misses & 255) == 1 &&
+                 clock_gettime(CLOCK_MONOTONIC, &begin) == 0;
+    uint64_t before = view->statistics.decompressions;
     if (!view_load_page(view, page, data))
         return NULL;
+    if (timed && view->statistics.decompressions > before &&
+        clock_gettime(CLOCK_MONOTONIC, &end) == 0) {
+        int64_t ns = (int64_t)(end.tv_sec-begin.tv_sec)*INT64_C(1000000000)+end.tv_nsec-begin.tv_nsec;
+        if (ns >= 0) { ++view->load_samples; view->load_ns += (uint64_t)ns; }
+    }
     entry->page_index = page;
     entry->checksum = view->writable ? page_checksum(view->backing, data) : 0;
     entry->valid = true;
@@ -1763,6 +1774,13 @@ uint64_t egtb_shared_cache_planned_allocation(Egtb *backing, size_t bytes)
     uint64_t n = shared_per_side(backing, bytes) * (backing->planar ? 2u : 1u);
     uint64_t unit = backing->memory_page_size + (uint64_t)sizeof(SharedSlot);
     return n > UINT64_MAX / unit ? UINT64_MAX : n * unit;
+}
+
+void egtb_view_enable_timing(EgtbView *v) { if (v) v->sample_loads = true; }
+void egtb_view_load_timing(const EgtbView *v, uint64_t *samples, uint64_t *ns)
+{
+    *samples = v ? v->load_samples : 0;
+    *ns = v ? v->load_ns : 0;
 }
 
 bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes)

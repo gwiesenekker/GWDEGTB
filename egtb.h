@@ -135,6 +135,9 @@ bool egtb_shared_probe_get(EgtbSharedProbe *probe, uint64_t index,
                            EgtbSide side, int16_t *value);
 void egtb_shared_probe_statistics(const EgtbSharedProbe *probe,
                                   EgtbSharedStatistics *statistics);
+/* Optional miss-only sampling for private dependency admission. */
+void egtb_view_enable_timing(EgtbView *view);
+void egtb_view_load_timing(const EgtbView *view, uint64_t *samples, uint64_t *ns);
 
 /* Convert exact public plies to/from signed 16-bit half-distance codes. */
 bool egtb_encode_dtm(int16_t value, int16_t *stored);

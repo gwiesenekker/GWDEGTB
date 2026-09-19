@@ -171,6 +171,7 @@ static void close_catalog(DatabaseCatalog *catalog)
             for (bk = 0; bk <= EGTB_MAX_PIECES; ++bk)
                 for (bm = 0; bm <= EGTB_MAX_PIECES; ++bm) {
                     CatalogEntry *entry = &catalog->entry[wk][wm][bk][bm];
+                    dependency_private_unregister(catalog->resident_pool, &entry->shared_probe);
                     egtb_shared_probe_destroy(entry->shared_probe);
                     entry->shared_probe = NULL;
                     if (entry->view != NULL) {
@@ -207,7 +208,7 @@ static void entry_statistics(const CatalogEntry *e, EgtbCacheStatistics *s)
     if (e->shared_probe) {
         EgtbSharedStatistics shared;
         egtb_shared_probe_statistics(e->shared_probe, &shared);
-        *s = shared.cache;
+        add_cache_statistics(s, &shared.cache);
     }
     s->lookups += e->resident_lookups;
     s->hits += e->resident_lookups;
@@ -368,6 +369,11 @@ static bool open_catalog_database(DatabaseCatalog *catalog,
         snprintf(catalog->error, sizeof(catalog->error),
                  "cannot create dependency view for %.100s: %.100s", path,
                  egtb_last_error());
+        return false;
+    }
+    if (!dependency_private_register(catalog->resident_pool, entry->database,
+                                     entry->view, &entry->shared_probe)) {
+        snprintf(catalog->error,sizeof(catalog->error),"%s",dependency_resident_error());
         return false;
     }
     return true;
@@ -948,8 +954,11 @@ done:
     if (database != NULL && !egtb_close(database))
         ok = false;
     if (catalogs != NULL) {
-        for (unsigned worker = 0; worker < thread_count; ++worker)
+        for (unsigned worker = 0; worker < thread_count; ++worker) {
+            /* Pool destruction has already removed private registrations. */
+            catalogs[worker].resident_pool = NULL;
             close_catalog(&catalogs[worker]);
+        }
         free(catalogs);
     }
     free(probe_contexts);

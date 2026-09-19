@@ -19,6 +19,14 @@ bool dependency_resident_acquire(DependencyResidentPool *pool, Egtb *backing,
  * EGTB_DEPENDENCY_SHARED_CACHE_MIB sets payload budget per cached database. */
 bool dependency_shared_acquire(DependencyResidentPool *pool, Egtb *backing,
                                EgtbSharedCache **out);
+/* Register private fallback before using it. At quiescent checkpoints the pool
+ * may set *shared_probe to a new shared probe. Caller must prefer that probe,
+ * retain the private view for cumulative statistics, and unregister before
+ * destroying either view/probe or the output pointer. No hit-path hook needed. */
+bool dependency_private_register(DependencyResidentPool *pool, Egtb *backing,
+                                  EgtbView *view, EgtbSharedProbe **shared_probe);
+void dependency_private_unregister(DependencyResidentPool *pool,
+                                    EgtbSharedProbe **shared_probe);
 /* A nonzero SHARED_CACHE_GIB enables fractional growth, bounds combined allocations
  * including migration/slot metadata; MIB remains the initial per-DB size.
  * Maintain must run on the coordinator with ALL probes quiescent. */

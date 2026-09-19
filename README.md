@@ -836,6 +836,29 @@ benefit. Returning donors refill and may grow immediately; receiver growth is
 reevaluated at the next checkpoint. It does not reclaim resident arrays or shrink
 active caches. The default policy remains unchanged.
 
+Revision 3.602 also monitors dependencies that fell back to private caches because
+the shared budget was full. Private misses sample page-load time once per 256
+misses; cache hits do no timing. At quiescent checkpoints, two measured pressure
+windows can request shared admission under `idle-reclaim-v1`, reclaiming a
+genuinely idle donor if necessary. All worker probes switch together after
+successful allocation. Allocation failure leaves private lookup intact and retries
+after a cooldown. Phase changes restart measurement and donor idle grace.
+Logs report private lookup/decompression pressure and admission outcomes.
+Old private views remain allocated until their catalogs close, preserving their
+cumulative statistics; their memory, like other private fallback caches, is not
+part of the shared-cache budget. Other policies report private pressure without
+performing these admissions.
+
+Revision 3.603 remembers the capacity discarded by idle reclamation. If that
+dependency becomes busy again, fresh pressure measurements that clear the normal
+load-share floor allow `idle-reclaim-v1` to request its previous capacity directly,
+instead of repeating the growth ladder from 1 MiB. The normal warm-up, two pressure
+windows, timed-sample requirement, budget/metadata/fallback accounting, and
+post-growth assessment still apply. A budget-limited partial recovery retains the
+target for a later pressure-qualified attempt; full recovery clears it. The hint
+survives phase changes but reserves no memory and cannot evict an active cache.
+`cache recovery` log lines report the remembered capacity and actual result.
+
 Policy logs include `lookups-window`, `window-seconds`, `lookups/s`, and
 `idle-seconds`. Lookup windows are intervals between maintenance checkpoints;
 `decompressions/s` is the separately smoothed pressure rate, not the same window.

@@ -10,6 +10,12 @@
 #include <string.h>
 #include <time.h>
 
+typedef struct PrivateRegistration {
+    EgtbView *view;
+    EgtbSharedProbe **output, *prepared;
+    struct PrivateRegistration *next;
+} PrivateRegistration;
+
 typedef struct ResidentEntry {
     Egtb *backing;
     EgtbResident *resident;
@@ -25,6 +31,7 @@ typedef struct ResidentEntry {
     double measured_seconds;
     double pressure_rate, last_window_seconds, decode_ns;
     double growth_factor; /* Per-cache policy state; initialized from pool default. */
+    uint64_t recovery_payload; /* Capacity discarded by idle reclamation, not a reservation. */
     bool activity_seen;
     uint64_t activity_lookups;
     uint64_t window_lookups;
@@ -34,6 +41,13 @@ typedef struct ResidentEntry {
     uint64_t previous_samples, previous_ns;
     uint64_t cost_samples;
     CachePolicyLog policy_log;
+    PrivateRegistration *private_views;
+    uint64_t private_lookups, private_decodes;
+    uint64_t private_samples, private_ns;
+    double private_time, admission_retry_after;
+    unsigned private_windows;
+    bool private_sampled;
+    CachePolicyLog private_log;
     char error[256];
     struct ResidentEntry *next;
 } ResidentEntry;
@@ -236,6 +250,7 @@ bool dependency_shared_acquire(DependencyResidentPool *p, Egtb *backing,
     e->growth_factor = p->growth_factor;
     uint64_t allocation = egtb_shared_cache_planned_allocation(backing, (size_t)p->shared_bytes);
     if (p->shared_budget && allocation > p->shared_budget - p->shared_allocated - p->recovery_reserve) {
+        egtb_progress_log("cache admission: database=%s mode=private reason=shared-budget retry=quiescent-pressure\n", entry_name(e));
         pthread_mutex_unlock(&p->mutex);
         return true; /* Explicit private-cache fallback when admission cannot fit. */
     }
@@ -258,6 +273,44 @@ bool dependency_shared_acquire(DependencyResidentPool *p, Egtb *backing,
     *out = shared;
     pthread_mutex_unlock(&p->mutex);
     return ok;
+}
+
+bool dependency_private_register(DependencyResidentPool *p, Egtb *backing,
+                                  EgtbView *view, EgtbSharedProbe **output)
+{
+    if (!p || !p->shared_bytes || !p->shared_budget) return true;
+    PrivateRegistration *r = calloc(1,sizeof(*r));
+    if (!r) { snprintf(error_text,sizeof(error_text),"cannot register private dependency"); return false; }
+    pthread_mutex_lock(&p->mutex);
+    ResidentEntry *e;
+    for (e=p->entries;e && e->backing!=backing;e=e->next) {}
+    if (!e || !view || !output) {
+        pthread_mutex_unlock(&p->mutex); free(r);
+        snprintf(error_text,sizeof(error_text),"invalid private dependency registration"); return false;
+    }
+    r->view=view; r->output=output; r->next=e->private_views; e->private_views=r;
+    e->private_sampled=false; /* registry totals changed */
+    egtb_view_enable_timing(view);
+    pthread_mutex_unlock(&p->mutex);
+    return true;
+}
+
+void dependency_private_unregister(DependencyResidentPool *p, EgtbSharedProbe **output)
+{
+    if (!p) return;
+    pthread_mutex_lock(&p->mutex);
+    for (ResidentEntry *e=p->entries;e;e=e->next) {
+        PrivateRegistration **link=&e->private_views;
+        while (*link) {
+            PrivateRegistration *r=*link;
+            if (r->output==output) {
+                *link=r->next; free(r); e->private_sampled=false;
+                pthread_mutex_unlock(&p->mutex); return;
+            }
+            link=&r->next;
+        }
+    }
+    pthread_mutex_unlock(&p->mutex);
 }
 
 bool dependency_shared_adaptive(DependencyResidentPool *p)
@@ -425,6 +478,8 @@ static bool reclaim_idle(DependencyResidentPool *p, ResidentEntry *receiver, dou
     bool ok = egtb_shared_cache_discard_resize(best->shared, (size_t)floor);
     p->growth_seconds += monotonic_seconds() - started;
     uint64_t actual = egtb_shared_cache_bytes(best->shared);
+    if (actual < old && old > best->recovery_payload)
+        best->recovery_payload = old;
     p->shared_used = p->shared_used - old + actual;
     p->shared_allocated = p->shared_allocated - largest + egtb_shared_cache_allocation(best->shared);
     best->sampled = best->pending_measurement = false;
@@ -437,6 +492,100 @@ static bool reclaim_idle(DependencyResidentPool *p, ResidentEntry *receiver, dou
         "result=%s recovery=lazy-refill-no-reservation\n",entry_name(best),entry_name(receiver),
         now-best->last_activity,(double)old/1048576,(double)actual/1048576,
         (double)p->shared_allocated/1048576,ok ? "reclaimed" : "allocation-failed-fallback");
+    return true;
+}
+
+/* All registered catalog probes are quiescent here. Prepare every replacement
+ * before publishing any pointer, so allocation failure leaves private lookup
+ * intact. Private views remain alive for their cumulative statistics. */
+static bool admit_private(DependencyResidentPool *p, ResidentEntry *e, double now)
+{
+    EgtbSharedCache *cache = NULL;
+    double started = monotonic_seconds();
+    bool ok = egtb_shared_cache_create(&cache, e->backing, (size_t)p->shared_bytes);
+    for (PrivateRegistration *r=e->private_views; ok && r; r=r->next)
+        ok = egtb_shared_probe_create(&r->prepared, cache);
+    if (!ok) {
+        for (PrivateRegistration *r=e->private_views; r; r=r->next) {
+            egtb_shared_probe_destroy(r->prepared); r->prepared=NULL;
+        }
+        egtb_shared_cache_destroy(cache);
+        e->admission_retry_after=now+60;
+        egtb_progress_log("cache admission: database=%s mode=private reason=allocation-failed retry-seconds=60\n",entry_name(e));
+    } else {
+        e->shared=cache;
+        e->growth_factor=p->growth_factor;
+        p->shared_allocated+=egtb_shared_cache_allocation(cache);
+        p->shared_used+=egtb_shared_cache_bytes(cache);
+        ++p->shared_count;
+        for (PrivateRegistration *r=e->private_views; r; r=r->next) {
+            *r->output=r->prepared; r->prepared=NULL;
+        }
+        e->last_activity=now; e->activity_seen=true; e->activity_time=now;
+        egtb_progress_log("cache admission: phase=%s database=%s mode=private->shared payload-MiB=%.2f allocated-MiB=%.2f\n",
+            p->phase ? p->phase : "unknown",entry_name(e),
+            (double)egtb_shared_cache_bytes(cache)/1048576,(double)p->shared_allocated/1048576);
+    }
+    p->growth_seconds+=monotonic_seconds()-started;
+    return ok;
+}
+
+static bool maintain_private(DependencyResidentPool *p, double now)
+{
+    ResidentEntry *best=NULL;
+    double best_score=-1;
+    for (ResidentEntry *e=p->entries; e; e=e->next) {
+        if (e->shared || !e->private_views) continue;
+        uint64_t lookups=0, decodes=0, samples=0, ns=0;
+        for (PrivateRegistration *r=e->private_views; r; r=r->next) {
+            EgtbCacheStatistics s; uint64_t n,t;
+            egtb_view_cache_statistics(r->view,&s);
+            egtb_view_load_timing(r->view,&n,&t);
+            lookups+=s.lookups; decodes+=s.decompressions; samples+=n; ns+=t;
+        }
+        if (!e->private_sampled || now<=e->private_time || lookups<e->private_lookups ||
+            decodes<e->private_decodes || samples<e->private_samples || ns<e->private_ns) {
+            e->private_sampled=true; e->private_windows=0;
+            e->private_time=now; e->private_lookups=lookups; e->private_decodes=decodes;
+            e->private_samples=samples; e->private_ns=ns;
+            continue;
+        }
+        uint64_t dl=lookups-e->private_lookups, dd=decodes-e->private_decodes;
+        uint64_t ds=samples-e->private_samples;
+        double elapsed=now-e->private_time;
+        /* Accumulate sparse checkpoint intervals, but expire quiet windows. */
+        if (dl<100000 && elapsed<60) continue;
+        double cost=ds ? (double)(ns-e->private_ns)/ds : 0;
+        double rate=dd/elapsed;
+        bool pressure=shared_cache_cost_eligible(rate,cost,ds,p->workers,p->minimum_load_share);
+        e->private_windows=pressure ? e->private_windows+1 : 0;
+        uint64_t allocation=egtb_shared_cache_planned_allocation(e->backing,(size_t)p->shared_bytes);
+        bool qualified=e->private_windows>=2 && now>=e->admission_retry_after;
+        const char *reason = ds<16 ? "insufficient-timed-loads" :
+            !pressure ? "below-load-floor" : e->private_windows<2 ? "collecting-pressure-windows" :
+            now<e->admission_retry_after ? "allocation-cooldown" :
+            allocation>p->shared_budget ? "initial-cache-exceeds-budget" :
+            allocation>p->shared_budget-p->shared_allocated-p->recovery_reserve ? "capacity-blocked" : "funded";
+        if (cache_policy_log_due(&e->private_log,now,qualified ? 1 : 0,allocation))
+            egtb_progress_log("cache private pressure: phase=%s database=%s lookups=%" PRIu64
+                " decompressions=%" PRIu64 " elapsed=%.3f load-share=%.3f%% timed-loads=%" PRIu64
+                " admission=%s reason=%s active=%s\n",p->phase ? p->phase : "unknown",entry_name(e),
+                dl,dd,elapsed,100*shared_cache_load_share(rate,cost,p->workers),ds,
+                qualified ? "candidate" : "measuring-or-below-floor",reason,cache_policy_name(p->policy));
+        if (qualified && allocation<=p->shared_budget && p->policy==CACHE_IDLE_RECLAIM) {
+            double score=shared_cache_cost_score(rate,cost,allocation);
+            if (score>best_score) {best=e; best_score=score;}
+        }
+        e->private_time=now; e->private_lookups=lookups; e->private_decodes=decodes;
+        e->private_samples=samples; e->private_ns=ns;
+    }
+    if (!best || p->donor) return false;
+    uint64_t needed=egtb_shared_cache_planned_allocation(best->backing,(size_t)p->shared_bytes);
+    if (needed>p->shared_budget-p->shared_allocated-p->recovery_reserve) {
+        if (!reclaim_idle(p,best,now)) return false;
+        if (needed>p->shared_budget-p->shared_allocated-p->recovery_reserve) return true;
+    }
+    admit_private(p,best,now);
     return true;
 }
 
@@ -460,6 +609,8 @@ void dependency_shared_phase_at(DependencyResidentPool *p, double now)
     pthread_mutex_lock(&p->mutex);
     if (p->donor) finish_transfer(p, now, true, "phase boundary");
     for (ResidentEntry *e = p->entries; e; e = e->next) {
+        e->private_sampled=false;
+        e->private_windows=0;
         if (!e->shared) continue;
         EgtbCacheStatistics s;
         egtb_shared_cache_statistics(e->shared, &s);
@@ -528,6 +679,13 @@ static CacheDecision policy_decide(DependencyResidentPool *p, ResidentEntry *e,
     long double target = (long double)old * factor;
     if (target < old + quantum) target = old + quantum;
     uint64_t payload = target >= SIZE_MAX ? SIZE_MAX : (uint64_t)target;
+    /* A returning idle donor should not repeat its entire cold-start ramp.
+     * Historical capacity is only a target hint: fresh measured pressure must
+     * clear the normal floor, and the budget clamp below remains authoritative. */
+    bool recovery = policy == CACHE_IDLE_RECLAIM && e->recovery_payload > payload &&
+        shared_cache_cost_eligible(e->pressure_rate, e->decode_ns,
+            e->cost_samples, p->workers, p->minimum_load_share);
+    if (recovery) payload = e->recovery_payload;
     /* A dense jump is allowed only if the complete new allocation consumes at
      * most half the currently free pool; old storage still coexists with it. */
     if (policy != CACHE_COST_GATED && funded) {
@@ -552,7 +710,8 @@ static CacheDecision policy_decide(DependencyResidentPool *p, ResidentEntry *e,
     d.allocation = egtb_shared_cache_planned_allocation(e->backing, (size_t)lo);
     if (d.allocation <= current) { d.reason = "capacity-budget"; d.payload = 0; return d; }
     d.score = shared_cache_cost_score(e->pressure_rate, e->decode_ns, d.allocation - current);
-    d.reason = policy != CACHE_COST_GATED && funded ? "spare-budget" : "load-cost";
+    d.reason = recovery ? "returning-idle-cache" :
+        policy != CACHE_COST_GATED && funded ? "spare-budget" : "load-cost";
     /* Report a bounded actual payload, even for the SIZE_MAX dense request. */
     uint64_t full = egtb_shared_cache_planned_allocation(e->backing, SIZE_MAX);
     if (d.allocation == full) {
@@ -660,6 +819,10 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
          * reclamation may be accepted after the complete observation period. */
         finish_transfer(p, now, p->receiver != NULL,
                         p->receiver ? "inconclusive deadline" : "idle observation complete");
+        pthread_mutex_unlock(&p->mutex);
+        return;
+    }
+    if (maintain_private(p,now)) {
         pthread_mutex_unlock(&p->mutex);
         return;
     }
@@ -852,6 +1015,13 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             if (growth_seconds < 0) growth_seconds = 0;
             p->growth_seconds += growth_seconds;
             uint64_t actual = egtb_shared_cache_bytes(best->shared);
+            if (best->recovery_payload > old) {
+                egtb_progress_log("cache recovery: database=%s previous-MiB=%.2f current-MiB=%.2f->%.2f result=%s\n",
+                    entry_name(best), (double)best->recovery_payload/1048576,
+                    (double)old/1048576, (double)actual/1048576,
+                    actual >= best->recovery_payload ? "restored" : "partial-budget-or-policy-limited");
+                if (actual >= best->recovery_payload) best->recovery_payload = 0;
+            }
             ++p->growths; best->sampled = false;
             best->pending_measurement = true;
             best->pressure_windows = best->measurement_windows = best->cooldown_windows = 0;
@@ -1012,6 +1182,10 @@ void dependency_resident_destroy(DependencyResidentPool *p)
     if (!p) return;
     while (p->entries) {
         ResidentEntry *e = p->entries; p->entries = e->next;
+        while (e->private_views) {
+            PrivateRegistration *r=e->private_views;
+            e->private_views=r->next; free(r);
+        }
         egtb_resident_destroy(e->resident);
         egtb_shared_cache_destroy(e->shared); free(e);
     }
