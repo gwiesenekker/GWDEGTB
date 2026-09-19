@@ -33,7 +33,7 @@ int main(int argc, char **argv)
     EgtbThreadOptions thread_options = {2, 64, NULL, &verified, 4096};
     EgtbSlicedOptions sliced_options = {
         2, 1024, 64, 4, 64, 20, 3,
-        draw_probe, NULL, NULL, NULL, NULL, true, 4096, 0
+        draw_probe, NULL, NULL, NULL, NULL, true, 4096, 0, false
     };
     bool ok = false;
     uint32_t page_size = 1024;
@@ -154,6 +154,27 @@ int main(int argc, char **argv)
         if (!egtb_close(sliced)) goto done;
         sliced = NULL;
         if (unlink(sliced_path) != 0) goto done;
+    }
+    /* Truncate a completed slice: the parallel resume scan must reject it and
+     * regenerate it, not blindly trust the checksummed manifest. */
+    {
+        char damaged[512];
+        snprintf(damaged, sizeof(damaged), "%s.work/slice-w%02d-b09.dtm",
+                 sliced_path, material.white_men ? 2 : 0);
+        FILE *f = fopen(damaged, "r+b");
+        if (!f || fseek(f, 0, SEEK_END) != 0) goto done;
+        long size = ftell(f);
+        if (fclose(f) != 0 || size <= 64 || truncate(damaged, size - 1) != 0) goto done;
+        memset(&sliced_statistics, 0, sizeof(sliced_statistics));
+        if (!egtb_generate_sliced(&sliced, sliced_path, &material, &indexer,
+                                  &sliced_options, &sliced_statistics) ||
+            sliced_statistics.initialization_seconds <= 0) goto done;
+        for (uint64_t i=0; i<eg_position_count(&indexer); ++i)
+            for (unsigned side=0; side<2; ++side) {
+                int16_t a, b;
+                if (!egtb_get(unsliced,i,(EgtbSide)side,&a) ||
+                    !egtb_get(sliced,i,(EgtbSide)side,&b) || a != b) goto done;
+            }
     }
     printf("sliced generation regression: PASS (%llu positions, %llu passes)\n",
            (unsigned long long)eg_position_count(&indexer),

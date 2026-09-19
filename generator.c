@@ -15,9 +15,9 @@
 
 static _Thread_local void (*quiescent_hook)(void *, unsigned);
 static _Thread_local void *quiescent_context;
-static _Thread_local void (*phase_hook)(void *);
+static _Thread_local void (*phase_hook)(void *, const char *);
 static _Thread_local void *phase_context;
-void egtb_generator_phase_hook(void (*hook)(void *), void *context)
+void egtb_generator_phase_hook(void (*hook)(void *, const char *), void *context)
 {
     phase_hook = hook; phase_context = context;
 }
@@ -1930,7 +1930,7 @@ static bool verify_consistent_impl(
         options->thread_count > EGTB_MAX_THREADS ||
         options->cache_pages == 0 || !egtb_is_readonly(database))
         return fail("invalid read-only consistency verification options");
-    if (phase_hook) phase_hook(phase_context);
+    if (phase_hook) phase_hook(phase_context, "verification");
     position_count = eg_position_count(indexer);
     page_count = egtb_page_count(database);
     if (position_count == 0 || page_count == 0 ||
@@ -3223,7 +3223,7 @@ static bool generate_threaded_impl(Egtb *database, const EgIndexer *indexer,
     }
 
     phase_started = monotonic_seconds();
-    if (phase_hook) phase_hook(phase_context);
+    if (phase_hook) phase_hook(phase_context, "initialization");
     if (!initialize_frontier_store_parallel(
             workers, threads, thread_count, &local.initialization))
         goto done;
@@ -3247,6 +3247,7 @@ static bool generate_threaded_impl(Egtb *database, const EgIndexer *indexer,
         local.maximum_dtm = 1;
 
     phase_started = monotonic_seconds();
+    if (phase_hook) phase_hook(phase_context, "backpropagation");
     for (;;) {
         int16_t loss_distance = (int16_t)(won_distance + 1);
         uint64_t loss_updates = 0, win_updates = 0;

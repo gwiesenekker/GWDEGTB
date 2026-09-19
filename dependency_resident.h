@@ -30,12 +30,14 @@ bool dependency_shared_configure(DependencyResidentPool *pool,
 /* Before acquisitions. Default 0.5%; zero disables the cost threshold but
  * still requires timing confidence and the existing hysteresis safeguards. */
 bool dependency_shared_minimum_load(DependencyResidentPool *pool, double percent);
+/* Select before acquisitions; every other registered policy is shadow-logged. */
+bool dependency_shared_policy(DependencyResidentPool *pool, const char *name);
 void dependency_shared_maintain(void *pool, unsigned workers);
 /* Same quiescent maintenance with an explicit monotonic time in seconds,
  * for deterministic policy tests. Do not mix clock domains within a pool. */
 void dependency_shared_maintain_at(DependencyResidentPool *pool, double now);
 /* Called only with all probes quiescent; cancels trials and resets idle grace. */
-void dependency_shared_phase(void *pool);
+void dependency_shared_phase(void *pool, const char *phase);
 void dependency_shared_phase_at(DependencyResidentPool *pool, double now);
 typedef struct {
     uint64_t allocated, recovery_reserve;

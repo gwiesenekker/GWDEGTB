@@ -1,9 +1,48 @@
 # Version history
 
 Published versions are Git tags. The `REVISION` file identifies the executable
-revision independently of individual commits; version 3.5 starts at 3.501.
+revision independently of individual commits; version 3.6 starts at 3.601.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
+
+## Version 3.6 — revision 3.601
+
+- Parallelize completed-slice resume integrity scans with the requested worker
+  count, private page readers, and per-slice progress/ETA. Checks remain mandatory
+  with verification=none; game-theoretic verification is separate.
+
+- Log per-checkpoint lookup counts/rates and idle time, including hit-only caches.
+- Add opt-in `idle-reclaim-v1`: reclaim genuinely idle caches directly to their
+  floor when a receiver is capacity-blocked, without rollback reservations.
+  Returning dependencies refill/regrow; phase grace and active-hit guards apply.
+
+- Allow quiescent dependency-cache discard-and-grow when migration overlap would
+  exceed the shared budget. Reserve a minimal working fallback before releasing
+  old storage; preserve probe identities and counters, and log the resize strategy.
+
+- Parallelize statistics-only scans using the requested generator thread count,
+  page-aligned private readers and histograms, and deterministic example reduction.
+
+- Add `--verification full|slices|none` and `EGTB_VERIFICATION` (default `full`).
+  Unverified publication is explicitly warned, statistics retain checksum-checked
+  page reads, and verified sliced resumes reject unchecked checkpoints.
+
+- Group cache-policy evaluations by database and throttle routine decisions and
+  selection summaries to once per minute, including when rejection reasons change.
+  New growth disagreements and actual cache changes still log immediately.
+
+- Add an optional tmux launcher for complete generation chains, preserving
+  EGTB settings, refusing duplicate session names and retaining failed-job output.
+
+- Name the existing dependency growth policy `cost-gated-v1` (default) and add
+  experimental `spare-budget-v1`, with lower-cost admission when unused budget
+  can fund growth and bounded direct-to-dense jumps.
+- Automatically shadow-evaluate the other policies on the active cache state;
+  log per-database eligibility reasons, measurements, proposals and selections.
+  Shadow proposals never mutate active cache or coordinator state.
+- Label initialization, backpropagation and verification explicitly and reset
+  measurement windows at their boundaries. Policy selection stays fixed per run.
+- Add policy selection, shadow-isolation, dense growth and budget tests.
 
 ## Version 3.5 — revision 3.501
 

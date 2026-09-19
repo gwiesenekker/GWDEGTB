@@ -521,6 +521,8 @@ int main(int argc, char **argv)
     bool created = false;
     bool sliced = false;
     bool restart = false;
+    const char *verification_mode = getenv("EGTB_VERIFICATION");
+    bool verify_final;
     bool ok = false;
     unsigned thread_count = 1;
     int material_argument = 1;
@@ -573,7 +575,11 @@ int main(int argc, char **argv)
     verification_cache_pages =
         (size_t)(verification_cache_bytes / page_size);
     while (material_argument < argc) {
-        if (strcmp(argv[material_argument], "--sliced") == 0) {
+        if (strcmp(argv[material_argument], "--verification") == 0 &&
+            material_argument + 1 < argc) {
+            verification_mode = argv[material_argument + 1];
+            material_argument += 2;
+        } else if (strcmp(argv[material_argument], "--sliced") == 0) {
             sliced = true;
             ++material_argument;
         } else if (strcmp(argv[material_argument], "--restart") == 0) {
@@ -592,12 +598,20 @@ int main(int argc, char **argv)
             break;
         }
     }
+    if (verification_mode == NULL || *verification_mode == '\0')
+        verification_mode = "full";
+    if (strcmp(verification_mode, "full") != 0 &&
+        strcmp(verification_mode, "slices") != 0 &&
+        strcmp(verification_mode, "none") != 0) {
+        fprintf(stderr, "invalid verification mode: expected full, slices, or none\n");
+        return EXIT_FAILURE;
+    }
     if (argc != material_argument + 4 ||
         !parse_count(argv[material_argument], &requested.white_kings) ||
         !parse_count(argv[material_argument + 1], &requested.white_men) ||
         !parse_count(argv[material_argument + 2], &requested.black_kings) ||
         !parse_count(argv[material_argument + 3], &requested.black_men)) {
-        fprintf(stderr, "usage: %s [--restart] [--sliced] [-j THREADS] "
+        fprintf(stderr, "usage: %s [--restart] [--sliced] [-j THREADS] [--verification full|slices|none] "
                         "NWHITE_KINGS NWHITE_MEN "
                         "NBLACK_KINGS NBLACK_MEN\n", argv[0]);
         return EXIT_FAILURE;
@@ -647,6 +661,12 @@ int main(int argc, char **argv)
                         "contains no men\n");
         sliced = false;
     }
+    verify_final = strcmp(verification_mode, "full") == 0 ||
+        (!sliced && strcmp(verification_mode, "slices") == 0);
+    printf("verification mode: %s\n", verification_mode);
+    if (!verify_final)
+        fprintf(stderr, "WARNING: final database will be NOT VERIFIED; "
+                "statistics and checksums are not consistency verification\n");
     printf("generating %s%s with %u thread%s, "
            "%u MiB dependency cache per worker/database\n",
            path, sliced ? " by man-row slices" : "", thread_count,
@@ -694,7 +714,8 @@ int main(int argc, char **argv)
             NULL,
             false,
             (size_t)compilation_buffer_bytes,
-            resident_limit_bytes
+            resident_limit_bytes,
+            strcmp(verification_mode, "none") == 0
         };
         if (!egtb_generate_sliced(&database, work_path, &material, &indexer,
                                   &sliced_options, &generation)) {
@@ -745,18 +766,36 @@ int main(int argc, char **argv)
         thread_count, verification_cache_pages, probe_contexts, NULL
     };
     EgtbConsistencyStatistics repair = {0};
-    if (!egtb_finish_compiled(&database, work_path, &indexer,
-            catalog_probe, &catalogs[0], &verify_options, resident_limit_bytes,
-            &resident, &final_verification, &repair, histogram, &examples)) {
-        fprintf(stderr, "cannot verify compiled database %s: %s\n",
-                work_path, egtb_generator_last_error());
-        goto done;
+    if (verify_final) {
+        if (!egtb_finish_compiled(&database, work_path, &indexer,
+                catalog_probe, &catalogs[0], &verify_options, resident_limit_bytes,
+                &resident, &final_verification, &repair, histogram, &examples)) {
+            fprintf(stderr, "cannot verify compiled database %s: %s\n",
+                    work_path, egtb_generator_last_error());
+            goto done;
+        }
+        generation.consistency_passes += 1 + repair.passes;
+        generation.consistency_updates[0] += repair.updates[0];
+        generation.consistency_updates[1] += repair.updates[1];
+        generation.maximum_dtm = final_verification.maximum_dtm;
+    } else {
+        egtb_progress_begin("statistics only (NOT VERIFIED)", positions, "positions");
+        printf("statistics scan: requested-threads=%u (capped by page count)\n", thread_count);
+        if (!egtb_scan_dtm_statistics_threads(database, NULL, &examples, histogram, thread_count)) {
+            fprintf(stderr, "statistics scan failed: %s\n", egtb_last_error());
+            goto done;
+        }
+        egtb_progress_end(true);
+        generation.maximum_dtm = 0;
+        for (unsigned code = 0; code < 65536; ++code) {
+            int value = (int16_t)code;
+            unsigned distance = value == EGTB_DRAW ? 0 : (unsigned)abs(value);
+            if ((histogram[code] || histogram[65536 + code]) &&
+                distance > generation.maximum_dtm)
+                generation.maximum_dtm = (uint16_t)distance;
+        }
     }
     verification_seconds = wall_seconds() - phase_started;
-    generation.consistency_passes += 1 + repair.passes;
-    generation.consistency_updates[0] += repair.updates[0];
-    generation.consistency_updates[1] += repair.updates[1];
-    generation.maximum_dtm = final_verification.maximum_dtm;
     catalog_cache_statistics(catalogs, thread_count, &verification_dependencies);
     /* Dependency views stay warm across compilation and verification. Report
      * this phase's increments, not the cumulative generation counters. */
@@ -789,7 +828,9 @@ int main(int argc, char **argv)
     printf("self-consistency: passes=%" PRIu64 " updates=%" PRIu64
            "/%" PRIu64 "\n", generation.consistency_passes,
            generation.consistency_updates[0], generation.consistency_updates[1]);
-    if (resident_bytes_used != 0)
+    if (!verify_final)
+        printf("final read-only consistency verification: SKIPPED — NOT VERIFIED (mode=%s)\n", verification_mode);
+    else if (resident_bytes_used != 0)
         printf("final read-only consistency verification: threads=%u "
                "resident=%" PRIu64 " MiB positions-checked=%" PRIu64
                " positions-skipped=%" PRIu64 "\n",
@@ -884,7 +925,7 @@ int main(int argc, char **argv)
                generation.slice_merge_seconds);
     }
     printf("  %-28s %10.3f s\n", "generation subtotal", generation_seconds);
-    printf("  %-28s %10.3f s\n", "verify + statistics/fallback",
+    printf("  %-28s %10.3f s\n", verify_final ? "verify + statistics/fallback" : "statistics only (unverified)",
            verification_seconds);
     printf("  %-28s %10.3f s\n",
            "storage metadata",

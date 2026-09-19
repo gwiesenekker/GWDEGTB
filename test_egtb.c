@@ -293,6 +293,20 @@ static bool test_direct_cache_views(void)
             free(expected);
             goto done;
         }
+        EgtbDtmExamples serial, parallel;
+        if (!egtb_find_dtm_examples(direct, NULL, &serial)) {
+            free(histogram); free(expected); goto done;
+        }
+        const unsigned counts[] = {1, 2, 3, 16, 256};
+        for (unsigned mode = 0; mode < 2; ++mode)
+            for (unsigned n = 0; n < sizeof(counts) / sizeof(counts[0]); ++n) {
+                if (!egtb_scan_dtm_statistics_threads(direct, mode ? resident : NULL,
+                        &parallel, histogram, counts[n]) ||
+                    memcmp(histogram, expected, 2 * 65536 * sizeof(*histogram)) ||
+                    memcmp(&serial, &parallel, sizeof(serial))) {
+                    free(histogram); free(expected); goto done;
+                }
+            }
         free(histogram);
         free(expected);
         if (totals[0] != positions || totals[1] != positions)
@@ -538,6 +552,21 @@ static bool test_complete_page_writes(void)
     database = NULL;
     if (!egtb_open_readonly(&database, path, 2))
         goto done;
+    {
+        /* More workers than pages, with a short final page. */
+        uint64_t *serial_bins = calloc(2 * 65536, sizeof(uint64_t));
+        uint64_t *parallel_bins = calloc(2 * 65536, sizeof(uint64_t));
+        EgtbDtmExamples serial_examples, parallel_examples;
+        bool matched = serial_bins && parallel_bins &&
+            egtb_scan_dtm_statistics(database, NULL, &serial_examples, serial_bins) &&
+            egtb_scan_dtm_statistics_threads(database, NULL, &parallel_examples,
+                                              parallel_bins, 256) &&
+            !memcmp(serial_bins, parallel_bins, 2 * 65536 * sizeof(uint64_t)) &&
+            !memcmp(&serial_examples, &parallel_examples, sizeof(serial_examples));
+        free(serial_bins);
+        free(parallel_bins);
+        if (!matched) goto done;
+    }
     for (uint64_t index = 0; index < positions; ++index) {
         int16_t white, black;
         int16_t expected_white = index / 512 == 1 ? EGTB_STORED_DRAW

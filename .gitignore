@@ -32,6 +32,7 @@
 /*.dtm.incomplete.failed.*
 /*.wdl
 /logs/
+/8p/
 /test_dtm16
 /test_wdl_compile
 /test_crc32c

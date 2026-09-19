@@ -20,6 +20,11 @@ export EGTB_DEPENDENCY_SHARED_CACHE_MIB=1
 export EGTB_DEPENDENCY_SHARED_CACHE_GIB=1
 "$binary" -j 2 1 1 1 1 > adaptive.log 2>&1
 grep -q 'shared dependency cache:.*grew' adaptive.log
+grep -q "shared-cache policy: active=${EGTB_DEPENDENCY_CACHE_POLICY:-cost-gated-v1}" adaptive.log
+grep -q 'cache policy decision:.*mode=shadow' adaptive.log
+for phase in initialization backpropagation verification; do
+    grep -q "cache policy phase: phase=$phase " adaptive.log
+done
 "$compare" baseline.dtm 1wX-1wO-1bX-1bO.dtm
 "$verify" -d "$directory" -j 2 1 1 1 1 > verify.log 2>&1
 grep -q 'DTM-values-checked=8956320' verify.log

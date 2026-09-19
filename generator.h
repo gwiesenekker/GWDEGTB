@@ -108,7 +108,7 @@ typedef bool (*EgtbExternalProbe)(
  * their original ownership ranges and private dependency contexts. */
 void egtb_generator_quiescent_hook(void (*hook)(void *, unsigned), void *context);
 /* Initialization (including slices) and read-only verification boundaries. */
-void egtb_generator_phase_hook(void (*hook)(void *), void *context);
+void egtb_generator_phase_hook(void (*hook)(void *, const char *), void *context);
 
 typedef void (*EgtbConsistencyReporter)(
     uint64_t index, EgtbSide side, const DraughtsPosition *position,

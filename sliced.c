@@ -461,13 +461,11 @@ done:
 
 static bool completed_slice_valid(const char *directory,
                                   const EgtbMaterial *material,
-                                  int white_row, int black_row)
+                                  int white_row, int black_row, unsigned threads)
 {
     char path[512];
     EgIndexer indexer = {0};
     Egtb *database = NULL;
-    EgtbView *view = NULL;
-    EgtbSequentialReader reader;
     bool valid = false;
     if (!make_slice_path(path, sizeof(path), directory,
                          white_row, black_row, "") ||
@@ -475,22 +473,22 @@ static bool completed_slice_valid(const char *directory,
         return false;
     if (initialize_slice_indexer(&indexer, material, white_row, black_row) &&
         egtb_open_readonly(&database, path, 1) &&
-        egtb_maximum_index(database) == eg_max_index(&indexer) &&
-        egtb_view_create(&view, database, 1, false) &&
-        egtb_sequential_reader_init(&reader, view, 0,
-                                    eg_position_count(&indexer))) {
-        valid = true;
-        for (uint64_t index = 0; index < eg_position_count(&indexer);
-             ++index) {
-            int16_t white, black;
-            if (!egtb_sequential_reader_next(&reader, &white, &black)) {
-                valid = false;
-                break;
-            }
-        }
+        egtb_maximum_index(database) == eg_max_index(&indexer)) {
+        char label[128];
+        snprintf(label, sizeof(label), "resume integrity check white-row=%d black-row=%d",
+                 white_row < 0 ? 0 : white_row + 1,
+                 black_row < 0 ? 0 : black_row + 1);
+        egtb_progress_log("%s: requested-threads=%u (capped by page count)\n", label, threads);
+        egtb_progress_begin(label, eg_position_count(&indexer), "positions");
+        /* Reuse the parallel page-aligned scan: private decode views, checksum
+         * validation, both sides and every position. No histogram allocation. */
+        EgtbDtmExamples ignored;
+        valid = egtb_scan_dtm_statistics_threads(database, NULL, &ignored, NULL, threads);
+        egtb_progress_end(valid);
     }
-    if (view != NULL)
-        egtb_view_close(view);
+    if (!valid)
+        egtb_progress_log("resume: slice white-row=%d black-row=%d unreadable or incompatible; will regenerate\n",
+                         white_row < 0 ? 0 : white_row + 1, black_row < 0 ? 0 : black_row + 1);
     if (database != NULL)
         egtb_close(database);
     eg_indexer_destroy(&indexer);
@@ -516,6 +514,7 @@ static int last_black_slice_row(const EgtbMaterial *material)
 static bool prepare_workspace(char *directory, size_t directory_size,
                               const char *path, const EgtbMaterial *material,
                               uint64_t full_positions, uint32_t page_size,
+                              bool skip_verification, unsigned threads,
                               bool completed[SLICE_ROWS][SLICE_ROWS],
                               EgtbGenerationStatistics
                                   slice_statistics[SLICE_ROWS][SLICE_ROWS])
@@ -545,7 +544,13 @@ static bool prepare_workspace(char *directory, size_t directory_size,
             int ws = white < 0 ? 0 : white;
             int bs = black < 0 ? 0 : black;
             completed[ws][bs] = completed_slice_valid(
-                directory, material, white, black);
+                directory, material, white, black, threads);
+            /* Zero passes explicitly denotes an unchecked checkpoint (and
+             * conservatively rejects orphan slices without manifest evidence). */
+            if (completed[ws][bs] && !skip_verification &&
+                slice_statistics[ws][bs].consistency_passes == 0)
+                return sliced_fail("slice %d/%d is NOT VERIFIED; use verification=none "
+                                   "or a fresh workspace for verified generation", ws, bs);
             if (black == black_last)
                 break;
         }
@@ -631,21 +636,26 @@ static bool generate_one_slice(const char *directory,
     EgtbConsistencyStatistics repair = {0};
     struct timespec verify_start, verify_end;
     clock_gettime(CLOCK_MONOTONIC, &verify_start);
-    if (!egtb_finish_compiled(&database, incomplete_path, &indexer,
-            slice_probe, &contexts[0], &verify_options, options->resident_limit_bytes, &resident,
-            &verification, &repair, NULL, NULL)) {
-        sliced_fail("generated slice failed verification: %s", egtb_generator_last_error());
-        goto done;
+    if (!options->skip_verification) {
+        if (!egtb_finish_compiled(&database, incomplete_path, &indexer,
+                slice_probe, &contexts[0], &verify_options, options->resident_limit_bytes, &resident,
+                &verification, &repair, NULL, NULL)) {
+            sliced_fail("generated slice failed verification: %s", egtb_generator_last_error());
+            goto done;
+        }
+        generated.consistency_passes = 1 + repair.passes;
+        generated.consistency_updates[0] = repair.updates[0];
+        generated.consistency_updates[1] = repair.updates[1];
+        generated.maximum_dtm = verification.maximum_dtm;
+    } else {
+        generated.consistency_passes = 0;
+        egtb_progress_log("WARNING: slice NOT VERIFIED (verification=none)\n");
     }
-    generated.consistency_passes = 1 + repair.passes;
-    generated.consistency_updates[0] = repair.updates[0];
-    generated.consistency_updates[1] = repair.updates[1];
-    generated.maximum_dtm = verification.maximum_dtm;
     clock_gettime(CLOCK_MONOTONIC, &verify_end);
     generated.consistency_seconds = (double)(verify_end.tv_sec - verify_start.tv_sec) +
         (double)(verify_end.tv_nsec - verify_start.tv_nsec) / 1e9;
     generated.total_seconds += generated.consistency_seconds;
-    if (!options->quiet) {
+    if (!options->quiet && !options->skip_verification) {
         if (resident != NULL)
             egtb_progress_log("slice verification: resident=%" PRIu64 " bytes shared across %u threads\n",
                               egtb_resident_bytes(resident), options->thread_count);
@@ -1039,6 +1049,7 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
         return sliced_fail("final database already exists: %s", path);
     if (!prepare_workspace(directory, sizeof(directory), path, material,
                            eg_position_count(full_indexer), options->page_size,
+                           options->skip_verification, options->thread_count,
                            completed, slice_statistics))
         return false;
     contexts = calloc(options->thread_count, sizeof(*contexts));

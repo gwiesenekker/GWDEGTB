@@ -22,6 +22,8 @@ typedef struct {
     /* Shared decoded current-slice data; zero disables resident verification.
      * This is a per-slice limit, not multiplied by the number of threads. */
     uint64_t resident_limit_bytes;
+    /* Zero/default preserves mandatory verification. */
+    bool skip_verification;
 } EgtbSlicedOptions;
 
 const char *egtb_sliced_last_error(void);

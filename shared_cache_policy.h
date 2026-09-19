@@ -4,6 +4,56 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <math.h>
+#include <string.h>
+
+typedef enum { CACHE_COST_GATED, CACHE_SPARE_BUDGET, CACHE_IDLE_RECLAIM, CACHE_POLICY_COUNT } CachePolicy;
+typedef struct {
+    bool printed;
+    double time;
+    unsigned disagreement;
+    uint64_t disagreement_capacity;
+    unsigned suppressed;
+} CachePolicyLog;
+
+/* Routine reason/target fluctuations never bypass the minute throttle.
+ * Remember disagreements across intervening agreeing/warm-up observations. */
+static inline bool cache_policy_log_due(CachePolicyLog *log, double now,
+                                        unsigned grow_mask, uint64_t capacity)
+{
+    unsigned all = (1u << CACHE_POLICY_COUNT) - 1;
+    bool disagreement = grow_mask && grow_mask != all;
+    bool fresh = disagreement && (log->disagreement != grow_mask ||
+                                   log->disagreement_capacity != capacity);
+    if (!log->printed || now < log->time || now - log->time >= 60 || fresh) {
+        log->printed = true; log->time = now;
+        if (disagreement) {
+            log->disagreement = grow_mask;
+            log->disagreement_capacity = capacity;
+        }
+        return true;
+    }
+    if (log->suppressed < UINT32_MAX) ++log->suppressed;
+    return false;
+}
+static inline const char *cache_policy_name(CachePolicy p)
+{
+    return p == CACHE_IDLE_RECLAIM ? "idle-reclaim-v1" :
+           p == CACHE_SPARE_BUDGET ? "spare-budget-v1" : "cost-gated-v1";
+}
+static inline bool cache_policy_parse(const char *name, CachePolicy *out)
+{
+    for (unsigned i = 0; i < CACHE_POLICY_COUNT; ++i)
+        if (name && !strcmp(name, cache_policy_name((CachePolicy)i))) {
+            *out = (CachePolicy)i; return true;
+        }
+    return false;
+}
+/* Stateless alternatives evaluate the SAME observed active-cache snapshot.
+ * Shadow evaluation never simulates unobserved post-resize hit rates. */
+static inline double cache_policy_floor(CachePolicy p, double normal, bool funded)
+{
+    return p != CACHE_COST_GATED && funded && normal > .001 ? .001 : normal;
+}
 
 /* Estimated worker elapsed load time, not CPU usage or predicted savings.
  * Require 16 timed loads (normally about 4096 actual misses) before admission. */

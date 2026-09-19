@@ -1,5 +1,39 @@
 # International draughts endgame database generator
 
+### Optional consistency verification
+
+`EGTB_VERIFICATION=full|slices|none` selects generation verification; the CLI
+`--verification full|slices|none` overrides the environment. Default: `full`.
+
+| Mode | Unsliced database | Man-row sliced database |
+| --- | --- | --- |
+| `full` | Exhaustive verification, repair if needed | Verify each slice and the merged database |
+| `slices` | Same as `full` | Verify each slice; skip merged consistency verification |
+| `none` | Skip consistency verification and repair | Skip slice and merged consistency verification and repair |
+
+For example, `export EGTB_VERIFICATION=none` applies to existing family scripts,
+including `4x4.sh`. In `slices` mode, all-kings material still receives full
+verification because it has no man-row slices.
+
+Skipped final verification prints **NOT VERIFIED** in startup and summary output.
+Statistics and examples are still collected in a parallel, checksum-checked
+page scan using `-j` workers (capped by page count); each worker has a private
+sequential reader and a 1 MiB histogram. No forward moves or successor probes
+are performed by that scan. Histogram counts and lowest-index example choices
+are independent of the worker count.
+Structural checks and durable publication remain enabled. The DTM file format
+is unchanged: retain the generation log to record its verification status.
+Matching statistics alone do not prove correctness. Unchecked dependencies can
+propagate incorrect values into later databases.
+
+Unchecked slice checkpoints persist `consistency_passes=0` in the checksummed
+manifest. They can resume with `none`, but `full`/`slices` refuse to trust them
+(including orphan slices without verification evidence). Use a fresh workspace
+for a verified regeneration. Completed slices from verified runs remain reusable
+with any mode. Later, run `verify_dtm` on the final databases in dependency order;
+this checks rather than repairs them. Keep unverified results labelled as such
+until these checks have succeeded.
+
 This C library can calculate Distance-To-Mate (DTM) EGTBs for International Polish Draughts.
 
 GWDEGTB supports exact two-through-eight-piece endgame databases on the 50
@@ -8,8 +42,36 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current version: **3.5** (executable revision **3.501**).
+Current published version: **3.6**; executable revision **3.601**.
 See [Version history](CHANGELOG.md) for changes in each tagged version.
+
+### Keep remote generation running with tmux
+
+Run the launcher **on the generation server**, after connecting with SSH:
+
+```sh
+ssh 8p
+cd /tmp2/gwies/endgame7
+./run_tmux.sh numactl --interleave=all ./all.sh
+# Or, with EGTB_* settings already exported:
+# ./run_tmux.sh numactl --interleave=all ./4x3.sh
+```
+
+`all.sh` is your own settings/job-selection script, not supplied by the project.
+The launcher starts session `egtb` and attaches when invoked from a terminal.
+Detach with **Ctrl+B, then D**; reconnect with `tmux attach -t egtb`.
+SSH disconnection does not stop the tmux-hosted job. The command's exit status
+is printed and a shell remains open after completion or failure. An existing
+session causes the launcher to refuse a second run; inspect/close that session
+before starting another. Inside tmux, the launcher simply runs its command.
+It does not detect generators running outside that session or on another socket.
+
+Exported `EGTB_*` settings and `PATH` are passed from the launching shell, even
+when the tmux server has an older environment; stale server `EGTB_*` variables
+are cleared for the new command. NUMA policy belongs **inside** the launcher,
+as above, rather than `numactl ... ./run_tmux.sh`. Family scripts remain unchanged
+and do not automatically create nested sessions. Use `-s NAME` for another
+session name. `make test-tmux` tests the launcher on a private tmux socket.
 
 The summary includes per-material dependency cache statistics, summed across
 workers, separately for generation and final verification. `Full MiB` is the
@@ -466,7 +528,11 @@ verified under an `.incomplete` name, atomically renamed, and recorded in an
 atomically replaced CRC32C-protected manifest. Restarting the same command
 validates the manifest checksum and every completed slice header and page
 checksum, restores its generation statistics, and resumes at the first missing
-slice. Legacy version-1 manifests are accepted once and upgraded atomically.
+slice. Since revision 3.508, each completed slice is scanned using the requested
+thread count, capped by its page count, with private page-aligned readers and
+per-slice progress/ETA (`resume integrity check`). These checksum/decode checks
+also run with `--verification none`; they are not game-theoretic verification.
+Legacy version-1 manifests are accepted once and upgraded atomically.
 The workspace is deleted only after the final full database passes
 verification. Set `EGTB_KEEP_SLICES=1` to retain it deliberately, for example
 when testing restart behavior.
@@ -739,6 +805,68 @@ shared admission, wide DTM values, partial/draw pages and corruption rejection.
 
 #### Adaptive fractional growth and lazy dense mode
 
+Revision 3.502 adds named cache policies. Select one for the whole process:
+
+```sh
+export EGTB_DEPENDENCY_CACHE_POLICY=cost-gated-v1  # Default
+# Alternative experiment:
+# export EGTB_DEPENDENCY_CACHE_POLICY=spare-budget-v1
+# export EGTB_DEPENDENCY_CACHE_POLICY=idle-reclaim-v1
+```
+
+`cost-gated-v1` retains the existing load-cost admission and fractional growth.
+`spare-budget-v1` uses a 0.1% admission floor when a larger allocation fits
+within unused shared budget, using discard growth if needed (or the configured floor if lower).
+Growth needing redistribution still requires the original configured floor,
+normally 0.5%. An eligible database goes directly to dense-lazy mode if its full
+new allocation, including metadata, consumes at most half the currently free pool.
+Otherwise it uses fractional growth. Both retain confidence, warm-up, cooldown,
+recovery reservation and allocate-before-free safety checks.
+
+Revision 3.507 adds experimental `idle-reclaim-v1`, using the same growth admission
+as `spare-budget-v1`. When a pressure-qualified receiver is capacity-blocked, it
+selects the largest eligible idle cache and discards it down to 1 MiB (or the
+configured initial size if smaller). Eligibility requires no lookups for 60
+seconds, renewed grace at each phase boundary, no pending growth assessment,
+and no shrink within the last 300 seconds. Even a cache hit resets idle time.
+It retains a minimal allocation-failure fallback, counts metadata against the
+budget, and respects `EGTB_DEPENDENCY_SHARED_CACHE_REBALANCE=0`.
+This is not a reversible transfer: there is no rollback reservation or promised
+benefit. Returning donors refill and may grow immediately; receiver growth is
+reevaluated at the next checkpoint. It does not reclaim resident arrays or shrink
+active caches. The default policy remains unchanged.
+
+Policy logs include `lookups-window`, `window-seconds`, `lookups/s`, and
+`idle-seconds`. Lookup windows are intervals between maintenance checkpoints;
+`decompressions/s` is the separately smoothed pressure rate, not the same window.
+Routine logging remains throttled to once per minute. All policies report the
+idle donor eligibility in active/shadow mode; shadow reports do not simulate
+the access pattern after reclamation.
+
+Every other registered policy is automatically evaluated in shadow mode; no
+shadow-policy variable is needed. Policies are pure functions of the same active
+cache measurements and common executor guards: they do not mutate counters,
+cooldowns, allocations or redistribution trials. Per-policy logging state is
+separate. These are **one-checkpoint counterfactual decisions**, not simulated
+alternative cache histories or predictions of runtime. A/B runs remain necessary.
+
+`cache policy evaluation` groups all policies for one database, with phase,
+smoothed decompression rate, sampled load cost, load share, confidence and free
+budget. Its following `cache policy decision` lines give active/shadow mode,
+reason, target and threshold. Routine evaluations are limited to once per minute
+per database, even if rejection reasons fluctuate. A new grow-versus-keep
+disagreement is logged immediately; the same disagreement at the same cache
+capacity remains suppressed across intervening warm-up/keep decisions. Counts
+of suppressed evaluations are included. Phase changes restart the logging window.
+`cache policy selection` identifies each policy's highest-scoring growth candidate;
+only the active choice can be executed. Selection summaries are also limited to
+once per minute. An outstanding redistribution trial can defer it. Actual growth,
+shrink, rollback and phase changes are always logged immediately.
+Phases are explicitly labelled initialization, backpropagation and verification
+(including slice runs); boundaries restart measurements and settle pending trials.
+Policy selection remains fixed for the run; automatic phase-specific switching
+is not implemented. Unknown policy names fail configuration.
+
 To enable growth, also set a **total** shared-cache budget:
 
 ```sh
@@ -778,10 +906,12 @@ acceleration. Existing sample confidence, measurement and memory guards apply.
 The environment setting
 `EGTB_DEPENDENCY_SHARED_CACHE_GROWTH` accepts 1.1..4. Sizes round down to complete
 pages with equal capacity per side; growth requests advance by at least one
-page per side. If the requested allocation exceeds remaining migration headroom,
-the coordinator chooses the largest smaller allocation that fits, provided it
-still increases capacity. This uses partial headroom, but cannot fill the final
-budget to 100%: old and new allocations must coexist during migration.
+page per side. Ordinary growth is capped by steady-state capacity, reserving a
+minimal fallback cache. If old and new allocations can coexist within budget,
+pages are migrated. Otherwise, at the quiescent checkpoint, the old storage is
+discarded before allocating the larger cache, which refills lazily. Logs identify
+`strategy=discard-and-grow` versus `strategy=migrate`. Reversible coordinator
+transfers retain their existing migration and recovery reservations.
 
 Arbitrary slot counts use exact remainder addressing (reciprocal multiplication
 for 32-bit page numbers, a mask for powers of two, and a safe wider fallback).
@@ -827,12 +957,14 @@ these are observational comparisons, not measured causal speedups. This first
 policy only grows caches; shrinking, reclamation and bidirectional hysteresis
 remain future work.
 
-The total budget includes shared page payload, 64-byte slot metadata, **and
-old/new allocation overlap during migration**. Therefore growth may stop before
-the final allocation alone would consume the budget. New dependencies that
+The total budget includes shared page payload, 64-byte slot metadata, and
+old/new allocation overlap when migrating (or minimal fallback storage when
+discarding). New dependencies that
 cannot obtain their initial allocation fall back to private caches; those
 caches, codec workspaces, resident arrays, bitmaps and directories are outside
-this budget. Allocation failure during growth retains the old working cache.
+this budget. Migration failure retains the old cache. Discard-growth failure
+retains a preallocated minimal working cache; accounting is updated and further
+growth of that cache is disabled. This cannot protect against OS OOM termination.
 This is not a whole-process RAM limit.
 
 Cache-policy benchmark, 2026-09-12: Ryzen 9 5950X, two workers, ext4 `/tmp`,

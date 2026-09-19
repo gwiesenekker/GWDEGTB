@@ -12,8 +12,43 @@
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "line %d: %s: %s\n", \
     __LINE__, #x, egtb_last_error()); exit(1); } } while (0)
 enum { N = 4099, THREADS = 16, READS = 100000 };
+#ifdef EGTB_TEST_ALLOC_FAILURE
+/* Optional linker-wrapped build; arm only while all probes are quiescent. */
+static unsigned fail_malloc_countdown;
+void *__real_malloc(size_t bytes);
+void *__wrap_malloc(size_t bytes)
+{
+    if (fail_malloc_countdown && --fail_malloc_countdown == 0) return NULL;
+    return __real_malloc(bytes);
+}
+#endif
 static void cost_policy(void)
 {
+    CachePolicyLog log = {0};
+    CHECK(cache_policy_log_due(&log,0,0,256));
+    for (unsigned i=1; i<60; ++i)
+        CHECK(!cache_policy_log_due(&log,i,0,256));
+    CHECK(log.suppressed == 59);
+    CHECK(cache_policy_log_due(&log,60,0,256));
+    CHECK(cache_policy_log_due(&log,61,2,256)); /* New disagreement: immediate. */
+    CHECK(!cache_policy_log_due(&log,62,0,256)); /* Temporary agreement. */
+    CHECK(!cache_policy_log_due(&log,63,2,256)); /* Same disagreement: suppressed. */
+    CHECK(!cache_policy_log_due(&log,64,7,256)); /* All propose growth. */
+    CHECK(cache_policy_log_due(&log,121,2,256));
+    CHECK(cache_policy_log_due(&log,122,2,512)); /* New capacity: new experiment. */
+    CHECK(cache_policy_log_due(&log,1,0,512)); /* Clock reset is safe. */
+    CachePolicy policy;
+    CHECK(cache_policy_parse("cost-gated-v1", &policy) && policy == CACHE_COST_GATED);
+    CHECK(cache_policy_parse("spare-budget-v1", &policy) && policy == CACHE_SPARE_BUDGET);
+    CHECK(!cache_policy_parse("unknown", &policy));
+    CHECK(cache_policy_floor(CACHE_COST_GATED,.005,true) == .005);
+    CHECK(cache_policy_floor(CACHE_SPARE_BUDGET,.005,true) == .001);
+    CHECK(cache_policy_floor(CACHE_SPARE_BUDGET,.005,false) == .005);
+    CHECK(cache_policy_floor(CACHE_SPARE_BUDGET,0,true) == 0);
+    CHECK(!shared_cache_cost_eligible(42100,5000,16,64,
+        cache_policy_floor(CACHE_COST_GATED,.005,true)));
+    CHECK(shared_cache_cost_eligible(42100,5000,16,64,
+        cache_policy_floor(CACHE_SPARE_BUDGET,.005,true)));
     uint64_t rng = 12345;
     const uint64_t divisors[] = {1, 2, 3, 5, 7, 31, 65537, UINT32_MAX,
                                  UINT64_C(4294967297), UINT64_MAX};
@@ -45,6 +80,8 @@ static void cost_policy(void)
     CHECK(shared_cache_cost_score(1000, 20000, 0) == 0);
     DependencyResidentPool *pool;
     CHECK(dependency_resident_create(&pool, 0, 0));
+    CHECK(dependency_shared_policy(pool,"spare-budget-v1"));
+    CHECK(!dependency_shared_policy(pool,"unknown"));
     CHECK(dependency_shared_minimum_load(pool, 0));
     CHECK(dependency_shared_minimum_load(pool, 100));
     CHECK(!dependency_shared_minimum_load(pool, -1));
@@ -64,6 +101,17 @@ static void cost_policy(void)
     CHECK(dependency_resident_configure(&pool));
     dependency_resident_destroy(pool);
     CHECK(saved ? setenv(key, saved, 1) == 0 : unsetenv(key) == 0);
+    free(saved);
+    key = "EGTB_DEPENDENCY_CACHE_POLICY";
+    old = getenv(key); saved = old ? strdup(old) : NULL;
+    CHECK(!old || saved);
+    CHECK(setenv(key,"unknown",1) == 0);
+    CHECK(!dependency_resident_configure(&pool));
+    CHECK(pool == NULL);
+    CHECK(setenv(key,"spare-budget-v1",1) == 0);
+    CHECK(dependency_resident_configure(&pool));
+    dependency_resident_destroy(pool);
+    CHECK(saved ? setenv(key,saved,1) == 0 : unsetenv(key) == 0);
     free(saved);
     key = "EGTB_DEPENDENCY_SHARED_CACHE_GROWTH";
     old = getenv(key); saved = old ? strdup(old) : NULL;
@@ -267,12 +315,13 @@ static void adaptive(Egtb *db)
     puts("adaptive growth/dense migration/budget tests passed");
 }
 
-static void fractional_budget(Egtb *db)
+static void fractional_budget(Egtb *db, const char *policy)
 {
     DependencyResidentPool *pool;
     EgtbSharedCache *cache;
     EgtbSharedProbe *probe;
     CHECK(dependency_resident_create(&pool, 0, 0));
+    CHECK(dependency_shared_policy(pool,policy));
     CHECK(dependency_shared_configure(pool, 1024, 3456));
     CHECK(dependency_shared_minimum_load(pool, 0));
     const EgtbResident *resident;
@@ -288,12 +337,57 @@ static void fractional_budget(Egtb *db)
         }
         dependency_shared_maintain_at(pool, window + 1);
     }
-    /* Requested 1536 cannot coexist with 1024 in this budget, but 1280 can. */
-    CHECK(egtb_shared_cache_bytes(cache) == 1280);
-    CHECK(egtb_shared_cache_planned_allocation(db, 1024) +
-          egtb_shared_cache_allocation(cache) == 3456);
+    /* Requested 1536 cannot coexist with 1024, but discard growth fits. */
+    CHECK(egtb_shared_cache_bytes(cache) == 1536);
+    CHECK(egtb_shared_cache_allocation(cache) +
+          egtb_shared_cache_planned_allocation(db, 256) <= 3456);
+    for (unsigned i=0; i<N; ++i) for (unsigned side=0; side<2; ++side) {
+        int16_t value;
+        CHECK(egtb_shared_probe_get(probe,i,(EgtbSide)side,&value));
+        CHECK(value == expected(i,side));
+    }
     egtb_shared_probe_destroy(probe);
     dependency_resident_destroy(pool);
+}
+
+static void named_policies(Egtb *db)
+{
+    for (unsigned policy=0; policy<CACHE_POLICY_COUNT; ++policy) {
+        DependencyResidentPool *pool;
+        EgtbSharedCache *cache; EgtbSharedProbe *probe;
+        const EgtbResident *resident;
+        CHECK(dependency_resident_create(&pool,0,0));
+        CHECK(dependency_shared_policy(pool,cache_policy_name((CachePolicy)policy)));
+        CHECK(dependency_shared_configure(pool,256,100000));
+        CHECK(dependency_shared_minimum_load(pool,0));
+        CHECK(dependency_resident_acquire(pool,db,&resident) && !resident);
+        CHECK(dependency_shared_acquire(pool,db,&cache) && cache);
+        CHECK(!dependency_shared_policy(pool,"cost-gated-v1"));
+        CHECK(egtb_shared_probe_create(&probe,cache));
+        for (unsigned window=0; window<3; ++window) {
+            for (unsigned j=0; j<100001; ++j) {
+                int16_t value;
+                uint64_t index = j&1 ? 256 : 0;
+                CHECK(egtb_shared_probe_get(probe,index,EGTB_WHITE_TO_MOVE,&value));
+                CHECK(value == expected(index,0));
+            }
+            dependency_shared_maintain_at(pool,window+1);
+        }
+        /* The shadow dense proposal must NOT resize the active cost-gated cache. */
+        CHECK(egtb_shared_cache_dense(cache) == (policy != CACHE_COST_GATED));
+        if (policy == CACHE_COST_GATED) CHECK(egtb_shared_cache_bytes(cache) == 512);
+        for (unsigned i=0; i<N; ++i) for (unsigned side=0; side<2; ++side) {
+            int16_t value;
+            CHECK(egtb_shared_probe_get(probe,i,(EgtbSide)side,&value));
+            CHECK(value == expected(i,side));
+        }
+        DependencyCoordinatorStatistics stats;
+        dependency_shared_coordinator_statistics(pool,&stats);
+        CHECK(stats.allocated <= 100000);
+        egtb_shared_probe_destroy(probe);
+        dependency_resident_destroy(pool);
+    }
+    puts("named policies: active selection, shadow isolation, dense growth and values passed");
 }
 
 static void fractional_growth(Egtb *db)
@@ -331,6 +425,25 @@ static void fractional_growth(Egtb *db)
     CHECK(!egtb_shared_cache_dense(c) && egtb_shared_cache_bytes(c) == 768);
     CHECK(!egtb_shared_cache_resize(c, 1));
     CHECK(egtb_shared_cache_bytes(c) == 768);
+    CHECK(egtb_shared_cache_discard_grow(c, 1152));
+    CHECK(egtb_shared_cache_bytes(c) == 1024); /* whole page pairs */
+    egtb_shared_probe_statistics(p, &before);
+    CHECK(egtb_shared_probe_get(p, 0, EGTB_WHITE_TO_MOVE, &value));
+    CHECK(value == expected(0, 0));
+    egtb_shared_probe_statistics(p, &after);
+    CHECK(after.cache.misses == before.cache.misses + 1);
+    stress(db, c, NULL);
+    CHECK(egtb_shared_cache_discard_grow(c, 100000));
+    CHECK(egtb_shared_cache_dense(c));
+#ifdef EGTB_TEST_ALLOC_FAILURE
+    CHECK(egtb_shared_cache_resize(c, 768));
+    fail_malloc_countdown = 1; /* Fallback allocation fails: old cache survives. */
+    CHECK(!egtb_shared_cache_discard_grow(c, 1536));
+    CHECK(egtb_shared_cache_bytes(c) == 768);
+    fail_malloc_countdown = 2; /* Fallback succeeds, target fails. */
+    CHECK(!egtb_shared_cache_discard_grow(c, 1536));
+    CHECK(egtb_shared_cache_bytes(c) == 256);
+#endif
     for (unsigned i=0; i<N; ++i) for (unsigned side=0; side<2; ++side) {
         CHECK(egtb_shared_probe_get(p, i, (EgtbSide)side, &value));
         CHECK(value == expected(i, side));
@@ -391,6 +504,53 @@ static void pressure_priority(Egtb *a, Egtb *b)
     for (unsigned k=0; k<2; ++k) egtb_shared_probe_destroy(p[k]);
     dependency_resident_destroy(pool);
     puts("decompression pressure per additional MiB priority test passed");
+}
+
+static void idle_reclamation(Egtb *a, Egtb *b)
+{
+    for (unsigned mode=0; mode<3; ++mode) {
+        DependencyResidentPool *pool;
+        EgtbSharedCache *c[2]; EgtbSharedProbe *probe[2];
+        Egtb *db[2]={a,b}; const EgtbResident *r;
+        CHECK(dependency_resident_create(&pool,0,0));
+        CHECK(dependency_shared_policy(pool,"idle-reclaim-v1"));
+        CHECK(dependency_shared_configure(pool,256,1536));
+        CHECK(dependency_shared_minimum_load(pool,0));
+        for (unsigned k=0;k<2;++k) {
+            CHECK(dependency_resident_acquire(pool,db[k],&r));
+            CHECK(dependency_shared_acquire(pool,db[k],&c[k]));
+            CHECK(egtb_shared_probe_create(&probe[k],c[k]));
+        }
+        int16_t v;
+        for (unsigned w=0;w<6;++w) {
+            for (unsigned j=0;j<100001;++j)
+                CHECK(egtb_shared_probe_get(probe[0],w<3 && (j&1) ? 64:0,EGTB_WHITE_TO_MOVE,&v));
+            dependency_shared_maintain_at(pool,w+1);
+        }
+        CHECK(egtb_shared_cache_bytes(c[0])==512);
+        if (mode==2) dependency_shared_phase_at(pool,67);
+        for (unsigned w=0;w<3;++w) {
+            if (mode==1) CHECK(egtb_shared_probe_get(probe[0],0,EGTB_WHITE_TO_MOVE,&v));
+            for (unsigned j=0;j<100001;++j)
+                CHECK(egtb_shared_probe_get(probe[1],j&1 ? 64:0,EGTB_WHITE_TO_MOVE,&v));
+            dependency_shared_maintain_at(pool,67+w);
+        }
+        DependencyCoordinatorStatistics s;
+        dependency_shared_coordinator_statistics(pool,&s);
+        CHECK(s.allocated<=1536 && !s.assessing && s.recovery_reserve==0);
+        CHECK(s.shrinks==(mode==0 ? 1:0));
+        CHECK(egtb_shared_cache_bytes(c[0])==(mode==0 ? 256:512));
+        /* An active hit-only donor and fresh phase grace must both be protected. */
+        for (unsigned k=0;k<2;++k) {
+            for (unsigned i=0;i<N;++i) for (unsigned side=0;side<2;++side) {
+                CHECK(egtb_shared_probe_get(probe[k],i,(EgtbSide)side,&v));
+                CHECK(v==expected(i,side));
+            }
+            egtb_shared_probe_destroy(probe[k]);
+        }
+        dependency_resident_destroy(pool);
+    }
+    puts("idle reclamation: constrained budget, active hits, phase grace and refill passed");
 }
 
 static void coordinator(Egtb *a, Egtb *b)
@@ -522,7 +682,9 @@ int main(void)
     CHECK(egtb_close(db));
     CHECK(egtb_open_readonly(&db, path, 1));
     fractional_growth(db);
-    fractional_budget(db);
+    fractional_budget(db,"cost-gated-v1");
+    fractional_budget(db,"spare-budget-v1");
+    named_policies(db);
     adaptive(db);
     burst_pressure(db);
     char alias[256]; Egtb *other;
@@ -530,6 +692,7 @@ int main(void)
     CHECK(egtb_open_readonly(&other, alias, 1));
     pressure_priority(db, other);
     coordinator(db, other);
+    idle_reclamation(db, other);
     CHECK(egtb_close(other));
     CHECK(!egtb_shared_cache_create(&cache, db, 1));
     CHECK(egtb_shared_cache_create(&cache, db, 256)); /* One slot per side. */

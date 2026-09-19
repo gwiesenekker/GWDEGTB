@@ -1859,6 +1859,42 @@ bool egtb_shared_cache_grow(EgtbSharedCache *c, size_t bytes)
     return egtb_shared_cache_resize(c, bytes);
 }
 
+/* Swap only storage: probes, statistics and registry stay attached to c. */
+static void shared_swap_storage(EgtbSharedCache *c, EgtbSharedCache *next)
+{
+    SharedSlot *slots = c->slots;
+    _Atomic uint64_t *words = c->words;
+    c->slots = next->slots; c->words = next->words;
+    c->per_side = next->per_side; c->capacity = next->capacity;
+    c->dense = next->dense; c->modulo = next->modulo;
+    next->slots = slots; next->words = words;
+}
+
+bool egtb_shared_cache_discard_grow(EgtbSharedCache *c, size_t bytes)
+{
+    if (!c) return fail("invalid shared cache discard growth");
+    if (shared_per_side(c->backing, bytes) <= c->per_side) return true;
+    return egtb_shared_cache_discard_resize(c, bytes);
+}
+
+bool egtb_shared_cache_discard_resize(EgtbSharedCache *c, size_t bytes)
+{
+    if (!c || !shared_per_side(c->backing, bytes))
+        return fail("invalid shared cache discard resize");
+    if (shared_per_side(c->backing, bytes) == c->per_side) return true;
+    EgtbSharedCache *fallback, *next;
+    size_t minimum = c->backing->memory_page_size * (c->backing->planar ? 2u : 1u);
+    /* Allocate the safety net before discarding anything. If the large allocation
+     * fails, existing probes can still serve every lookup through this cache. */
+    if (!egtb_shared_cache_create(&fallback, c->backing, minimum)) return false;
+    shared_swap_storage(c, fallback);
+    egtb_shared_cache_destroy(fallback);
+    if (!egtb_shared_cache_create(&next, c->backing, bytes)) return false;
+    shared_swap_storage(c, next);
+    egtb_shared_cache_destroy(next);
+    return true;
+}
+
 bool egtb_shared_cache_resize(EgtbSharedCache *c, size_t bytes)
 {
     if (!c) return fail("invalid shared cache resize");
@@ -2568,18 +2604,29 @@ static void consider_dtm_example(EgtbDtmExamples *examples, uint64_t index,
 bool egtb_find_dtm_examples(Egtb *backing, const EgtbResident *resident,
                             EgtbDtmExamples *examples)
 {
-    uint64_t positions, pending = 0;
+    return egtb_scan_dtm_statistics(backing, resident, examples, NULL);
+}
+
+static bool scan_dtm_range(Egtb *backing, const EgtbResident *resident,
+                           EgtbDtmExamples *examples, uint64_t *histogram,
+                           uint64_t first, uint64_t end)
+{
+    uint64_t pending = 0;
     if (backing == NULL || examples == NULL ||
         (resident != NULL && !egtb_resident_matches(resident, backing)))
         return fail("invalid DTM examples scan");
     memset(examples, 0, sizeof(*examples));
+    if (histogram != NULL) memset(histogram, 0, 2 * 65536 * sizeof(*histogram));
     examples->draw_side = EGTB_BLACK_TO_MOVE;
-    positions = backing->maximum_index + 1;
     if (resident != NULL) {
-        for (uint64_t index = 0; index < positions; ++index) {
+        for (uint64_t index = first; index < end; ++index) {
             int16_t white, black;
             if (!egtb_resident_get_pair(resident, index, &white, &black))
                 return false;
+            if (histogram != NULL) {
+                ++histogram[(uint16_t)white];
+                ++histogram[65536 + (uint16_t)black];
+            }
             consider_dtm_example(examples, index, EGTB_WHITE_TO_MOVE, white);
             consider_dtm_example(examples, index, EGTB_BLACK_TO_MOVE, black);
             egtb_progress_tick(&pending);
@@ -2592,12 +2639,16 @@ bool egtb_find_dtm_examples(Egtb *backing, const EgtbResident *resident,
         EgtbSequentialReader reader;
         bool ok = false;
         if (!egtb_view_create(&view, backing, 1, false) ||
-            !egtb_sequential_reader_init(&reader, view, 0, positions))
+            !egtb_sequential_reader_init(&reader, view, first, end))
             goto done;
-        for (uint64_t index = 0; index < positions; ++index) {
+        for (uint64_t index = first; index < end; ++index) {
             int16_t white, black;
             if (!egtb_sequential_reader_next(&reader, &white, &black))
                 goto done;
+            if (histogram != NULL) {
+                ++histogram[(uint16_t)white];
+                ++histogram[65536 + (uint16_t)black];
+            }
             consider_dtm_example(examples, index, EGTB_WHITE_TO_MOVE, white);
             consider_dtm_example(examples, index, EGTB_BLACK_TO_MOVE, black);
             egtb_progress_tick(&pending);
@@ -2609,6 +2660,103 @@ done:
             ok = false;
         return ok;
     }
+}
+
+typedef struct {
+    Egtb *backing;
+    const EgtbResident *resident;
+    uint64_t first, end;
+    uint64_t *histogram;
+    EgtbDtmExamples examples;
+    bool ok;
+    char error[512];
+} DtmScanWorker;
+
+static void *scan_dtm_worker(void *argument)
+{
+    DtmScanWorker *w = argument;
+    w->ok = scan_dtm_range(w->backing, w->resident, &w->examples,
+                          w->histogram, w->first, w->end);
+    if (!w->ok) snprintf(w->error, sizeof(w->error), "%s", egtb_last_error());
+    return NULL;
+}
+
+bool egtb_scan_dtm_statistics_threads(Egtb *backing, const EgtbResident *resident,
+    EgtbDtmExamples *examples, uint64_t *histogram, unsigned thread_count)
+{
+    if (!backing || !examples || !thread_count || thread_count > 256 ||
+        (resident && !egtb_resident_matches(resident, backing)))
+        return fail("invalid threaded DTM statistics scan");
+    uint64_t pages = backing->side_page_count;
+    if (thread_count > pages) thread_count = (unsigned)pages;
+    if (thread_count == 1)
+        return scan_dtm_range(backing, resident, examples, histogram,
+                              0, backing->maximum_index + 1);
+    DtmScanWorker *workers = calloc(thread_count, sizeof(*workers));
+    pthread_t *threads = calloc(thread_count, sizeof(*threads));
+    unsigned started = 0;
+    bool ok = false;
+    if (!workers || !threads) {
+        fail("cannot allocate DTM statistics workers");
+        goto done;
+    }
+    /* Allocate all private histograms before starting any reader. */
+    for (unsigned i = 0; i < thread_count; ++i) {
+        workers[i].backing = backing;
+        workers[i].resident = resident;
+        uint64_t first_page = pages / thread_count * i +
+                              (pages % thread_count * i) / thread_count;
+        uint64_t end_page = pages / thread_count * (i + 1) +
+                            (pages % thread_count * (i + 1)) / thread_count;
+        workers[i].first = first_page * backing->entries_per_page;
+        workers[i].end = i + 1 == thread_count ? backing->maximum_index + 1 :
+                         end_page * backing->entries_per_page;
+        if (histogram && !(workers[i].histogram = calloc(2 * 65536, sizeof(uint64_t)))) {
+            fail("cannot allocate DTM statistics histogram");
+            goto done;
+        }
+    }
+    for (; started < thread_count; ++started) {
+        int error = pthread_create(&threads[started], NULL, scan_dtm_worker, &workers[started]);
+        if (error) {
+            fail("cannot start DTM statistics worker: %s", strerror(error));
+            break;
+        }
+    }
+    for (unsigned i = 0; i < started; ++i) pthread_join(threads[i], NULL);
+    if (started != thread_count) goto done;
+    for (unsigned i = 0; i < thread_count; ++i)
+        if (!workers[i].ok) {
+            fail("DTM statistics worker %u failed: %s", i, workers[i].error);
+            goto done;
+        }
+    memset(examples, 0, sizeof(*examples));
+    examples->draw_side = EGTB_BLACK_TO_MOVE;
+    if (histogram) memset(histogram, 0, 2 * 65536 * sizeof(*histogram));
+    for (unsigned i = 0; i < thread_count; ++i) {
+        EgtbDtmExamples *e = &workers[i].examples;
+        for (unsigned side = 0; side < 2; ++side) {
+            EgtbDtmExample win = e->longest_win[side], loss = e->longest_loss[side];
+            if (win.available) consider_dtm_example(examples, win.index, (EgtbSide)side, win.dtm);
+            if (loss.available) consider_dtm_example(examples, loss.index, (EgtbSide)side, loss.dtm);
+        }
+        if (e->draw.available) consider_dtm_example(examples, e->draw.index, e->draw_side, EGTB_DRAW);
+        if (histogram)
+            for (size_t b = 0; b < 2 * 65536; ++b) histogram[b] += workers[i].histogram[b];
+    }
+    ok = true;
+done:
+    if (workers)
+        for (unsigned i = 0; i < thread_count; ++i) free(workers[i].histogram);
+    free(workers);
+    free(threads);
+    return ok;
+}
+
+bool egtb_scan_dtm_statistics(Egtb *backing, const EgtbResident *resident,
+                              EgtbDtmExamples *examples, uint64_t *histogram)
+{
+    return egtb_scan_dtm_statistics_threads(backing, resident, examples, histogram, 1);
 }
 
 const char *egtb_path(const Egtb *egtb)

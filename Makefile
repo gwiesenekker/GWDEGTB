@@ -41,6 +41,12 @@ test_shared_cache: test_shared_cache.o dependency_resident.o egtb.o progress.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 .PHONY: test-restart
+.PHONY: test-verification-modes
+test-verification-modes: generate_egtb verify_dtm
+	sh ./test_verification_modes.sh "$(CURDIR)/generate_egtb" "$(CURDIR)/verify_dtm"
+.PHONY: test-tmux
+test-tmux:
+	./test_tmux.sh
 .PHONY: test-adaptive
 test-adaptive: generate_egtb verify_dtm test_dependency_resident
 	sh ./test_adaptive.sh "$(CURDIR)/generate_egtb" "$(CURDIR)/verify_dtm" "$(CURDIR)/test_dependency_resident"

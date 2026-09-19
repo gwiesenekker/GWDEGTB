@@ -120,6 +120,13 @@ bool egtb_shared_cache_grow(EgtbSharedCache *cache, size_t payload_bytes);
 /* Grow OR shrink, with all probes quiescent. Failed allocation preserves the
  * old cache. Callers owning a shared budget must account for both allocations. */
 bool egtb_shared_cache_resize(EgtbSharedCache *cache, size_t payload_bytes);
+/* Quiescent growth without old/new overlap. Reserves a minimal fallback first.
+ * On allocation failure the cache remains usable, but may have minimal capacity.
+ * Budget for planned target allocation PLUS one logical page per side and its
+ * slot metadata (the fallback allocation). */
+bool egtb_shared_cache_discard_grow(EgtbSharedCache *cache, size_t payload_bytes);
+/* Same fallback contract, but permits shrinking too. */
+bool egtb_shared_cache_discard_resize(EgtbSharedCache *cache, size_t payload_bytes);
 void egtb_shared_cache_statistics(EgtbSharedCache *cache, EgtbCacheStatistics *stats);
 void egtb_shared_cache_timing(EgtbSharedCache *cache, uint64_t *samples, uint64_t *nanoseconds);
 bool egtb_shared_probe_create(EgtbSharedProbe **out, EgtbSharedCache *cache);
@@ -220,6 +227,14 @@ bool egtb_resident_dtm_histogram(const EgtbResident *resident,
  */
 bool egtb_find_dtm_examples(Egtb *backing, const EgtbResident *resident,
                             EgtbDtmExamples *examples);
+/* Sequential checksum-checked statistics scan, without game consistency checks.
+ * histogram has 2*65536 entries and is cleared by this function. */
+bool egtb_scan_dtm_statistics(Egtb *backing, const EgtbResident *resident,
+                              EgtbDtmExamples *examples, uint64_t *histogram);
+/* 1..256 workers, capped by page count. Private readers and histograms;
+ * lowest-index example tie-breaking is independent of worker count. */
+bool egtb_scan_dtm_statistics_threads(Egtb *backing, const EgtbResident *resident,
+    EgtbDtmExamples *examples, uint64_t *histogram, unsigned thread_count);
 
 uint64_t egtb_maximum_index(const Egtb *egtb);
 uint64_t egtb_page_count(const Egtb *egtb);
