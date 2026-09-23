@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "egtb_platform.h"
 #include "wdl.h"
 #include "crc32c.h"
 #include <stdatomic.h>
@@ -8,14 +9,10 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include <zstd.h>
 #include <zdict.h>
@@ -127,7 +124,7 @@ static bool seek_file(FILE *file, uint64_t offset)
 {
     if (offset > (uint64_t)INT64_MAX)
         return fail("WDL file offset is too large");
-    if (fseeko(file, (off_t)offset, SEEK_SET) != 0)
+    if (compat_fseeko(file, (int64_t)offset, SEEK_SET) != 0)
         return fail("WDL file seek failed: %s", strerror(errno));
     return true;
 }
@@ -190,7 +187,7 @@ typedef struct {
     ZSTD_CDict *dictionary;
     uint64_t positions;
     uint64_t next_offset;
-    pthread_mutex_t mutex;
+    my_mutex_t mutex;
     atomic_bool cancelled;
 } WdlCompileShared;
 
@@ -209,7 +206,7 @@ static bool pwrite_all(int fd, uint64_t offset, const void *data, size_t bytes)
     if (offset > INT64_MAX || bytes > (uint64_t)INT64_MAX - offset)
         return fail("WDL output offset overflow");
     while (bytes) {
-        ssize_t n = pwrite(fd, p, bytes, (off_t)offset);
+        int64_t n = compat_pwrite(fd, p, bytes, (int64_t)offset);
         if (n < 0 && errno == EINTR)
             continue;
         if (n <= 0)
@@ -294,12 +291,12 @@ static void *compile_wdl_pages(void *opaque)
                 ++w->storage.stored_pages;
             }
         }
-        pthread_mutex_lock(&s->mutex);
+        compat_mutex_lock(&s->mutex);
         offset = s->next_offset;
         bool fits = offset <= INT64_MAX && used <= (uint64_t)INT64_MAX - offset;
         if (fits)
             s->next_offset += used;
-        pthread_mutex_unlock(&s->mutex);
+        compat_mutex_unlock(&s->mutex);
         if (!fits) {
             fail("WDL output offset overflow");
             goto failed;
@@ -465,7 +462,7 @@ bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
 {
     Egtb *dtm = NULL;
     WdlCompileWorker *workers = NULL;
-    pthread_t *threads = NULL;
+    my_thread_t *threads = NULL;
     unsigned created = 0;
     unsigned char header[WDL_HEADER_SIZE] = {0};
     char *temporary = NULL;
@@ -516,14 +513,14 @@ bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
         fail("cannot allocate WDL compilation data");
         goto done;
     }
-    int error = pthread_mutex_init(&shared.mutex, NULL);
+    int error = compat_mutex_init(&shared.mutex);
     if (error) {
         fail("cannot initialize WDL writer mutex: %s", strerror(error));
         goto done;
     }
     mutex_ready = true;
     snprintf(temporary, strlen(wdl_path) + 24, "%s.tmp.XXXXXX", wdl_path);
-    shared.descriptor = mkstemp(temporary);
+    shared.descriptor = compat_mkstemp(temporary);
     if (shared.descriptor < 0) {
         fail("cannot create temporary WDL file: %s", strerror(errno));
         goto done;
@@ -540,7 +537,7 @@ bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
     put_u64(header + 48, packed_bytes);
     put_u32(header + 56, (uint32_t)dictionary_size);
     if (dictionary_size) put_u32(header + 60, crc32c(dictionary, dictionary_size));
-    if (ftruncate(shared.descriptor, (off_t)data_offset) != 0) {
+    if (compat_ftruncate(shared.descriptor, (int64_t)data_offset) != 0) {
         fail("cannot initialize WDL output: %s", strerror(errno));
         goto done;
     }
@@ -553,7 +550,7 @@ bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
         workers[i].shared = &shared;
         workers[i].first_page = i * quotient + (i < remainder ? i : remainder);
         workers[i].end_page = workers[i].first_page + quotient + (i < remainder);
-        error = pthread_create(&threads[i], NULL, compile_wdl_pages, &workers[i]);
+        error = compat_thread_create(&threads[i], compile_wdl_pages, &workers[i]);
         if (error) {
             fail("cannot create WDL compilation worker: %s", strerror(error));
             atomic_store_explicit(&shared.cancelled, true, memory_order_relaxed);
@@ -562,7 +559,7 @@ bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
         ++created;
     }
     for (unsigned i = 0; i < created; ++i)
-        pthread_join(threads[i], NULL);
+        compat_thread_join(threads[i]);
     if (created != thread_count)
         goto done;
     for (unsigned i = 0; i < thread_count; ++i) {
@@ -584,11 +581,11 @@ bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
         goto done;
     }
     dtm = NULL;
-    if (fsync(shared.descriptor) != 0) {
+    if (compat_fsync(shared.descriptor) != 0) {
         fail("cannot flush WDL output: %s", strerror(errno));
         goto done;
     }
-    if (close(shared.descriptor) != 0) {
+    if (compat_close(shared.descriptor) != 0) {
         shared.descriptor = -1;
         fail("cannot close WDL output: %s", strerror(errno));
         goto done;
@@ -607,13 +604,13 @@ bool wdl_compile_threaded(const char *dtm_path, const char *wdl_path,
     ok = true;
 done:
     if (shared.descriptor >= 0)
-        close(shared.descriptor);
+        compat_close(shared.descriptor);
     if (!ok && temporary_created)
-        unlink(temporary);
+        compat_unlink(temporary);
     if (dtm)
         egtb_close(dtm);
     if (mutex_ready)
-        pthread_mutex_destroy(&shared.mutex);
+        compat_mutex_destroy(&shared.mutex);
     free(temporary);
     free(threads);
     free(workers);
@@ -653,7 +650,7 @@ static bool open_existing(Wdl **out, const char *path, size_t cache_pages,
 {
     unsigned char header[WDL_HEADER_SIZE];
     unsigned char directory[WDL_DIRECTORY_ENTRY_SIZE * 4096];
-    struct stat status;
+    CompatStat status;
     Wdl *wdl = NULL;
     uint64_t calculated_pages, page, directory_offset;
     size_t i;
@@ -714,7 +711,7 @@ static bool open_existing(Wdl **out, const char *path, size_t cache_pages,
         fail("inconsistent WDL header");
         goto failure;
     }
-    if (fstat(fileno(wdl->file), &status) != 0) {
+    if (compat_fstat(compat_fileno(wdl->file), &status) != 0) {
         fail("cannot stat WDL file: %s", strerror(errno));
         goto failure;
     }
@@ -951,7 +948,7 @@ static bool pread_worker(int descriptor, uint64_t offset, void *data,
 {
     unsigned char *destination = data;
     while (size != 0) {
-        ssize_t got = pread(descriptor, destination, size, (off_t)offset);
+        int64_t got = compat_pread(descriptor, destination, size, (int64_t)offset);
         if (got < 0 && errno == EINTR)
             continue;
         if (got <= 0) {
@@ -973,7 +970,7 @@ static void *decompress_wdl_pages(void *opaque)
     ZSTD_DCtx *decompressor = ZSTD_createDCtx();
     unsigned char *compressed = malloc(ZSTD_compressBound(WDL_PAGE_SIZE));
     unsigned char decoded[WDL_PAGE_SIZE];
-    int descriptor = fileno(wdl->file);
+    int descriptor = compat_fileno(wdl->file);
     if (decompressor == NULL || compressed == NULL) {
         snprintf(worker->error, sizeof(worker->error),
                  "cannot allocate WDL decompression workspace");
@@ -1031,7 +1028,7 @@ bool wdl_decompress_into_threaded(Wdl *wdl, void *data, size_t size,
                                   unsigned thread_count)
 {
     WdlDecompressWorker *workers = NULL;
-    pthread_t *threads = NULL;
+    my_thread_t *threads = NULL;
     unsigned created = 0;
     bool ok = false;
 
@@ -1058,7 +1055,7 @@ bool wdl_decompress_into_threaded(Wdl *wdl, void *data, size_t size,
                                      (worker < extra ? worker : extra);
         workers[worker].end_page = workers[worker].first_page +
                                    pages_per_worker + (worker < extra);
-        int error = pthread_create(&threads[worker], NULL,
+        int error = compat_thread_create(&threads[worker],
                                    decompress_wdl_pages, &workers[worker]);
         if (error != 0) {
             fail("cannot create WDL decompression worker %u: %s",
@@ -1069,7 +1066,7 @@ bool wdl_decompress_into_threaded(Wdl *wdl, void *data, size_t size,
     }
 join:
     for (unsigned worker = 0; worker < created; ++worker) {
-        int error = pthread_join(threads[worker], NULL);
+        int error = compat_thread_join(threads[worker]);
         if (error != 0) {
             fail("cannot join WDL decompression worker %u: %s",
                  worker, strerror(error));
@@ -1093,10 +1090,10 @@ done:
 
 bool wdl_file_size(const char *path, size_t *size)
 {
-    struct stat status;
+    CompatStat status;
     if (path == NULL || size == NULL)
         return fail("invalid WDL file-size argument");
-    if (stat(path, &status) != 0)
+    if (compat_stat(path, &status) != 0)
         return fail("cannot stat %s: %s", path, strerror(errno));
     if (status.st_size < 0 || (uint64_t)status.st_size > SIZE_MAX)
         return fail("WDL file does not fit in address space");
@@ -1119,7 +1116,7 @@ static void *load_wdl_range(void *argument)
     while (offset < w->end && !atomic_load_explicit(w->cancelled, memory_order_relaxed)) {
         size_t count = w->end - offset;
         if (count > 1024u * 1024u) count = 1024u * 1024u;
-        ssize_t got = pread(w->descriptor, w->data + offset, count, (off_t)offset);
+        int64_t got = compat_pread(w->descriptor, w->data + offset, count, (int64_t)offset);
         if (got < 0 && errno == EINTR)
             continue;
         if (got <= 0) {
@@ -1135,17 +1132,17 @@ static void *load_wdl_range(void *argument)
 bool wdl_file_load_into_threaded(const char *path, void *data, size_t size,
                                  unsigned thread_count)
 {
-    struct stat status;
+    CompatStat status;
     if (!path || !data || !thread_count || thread_count > WDL_MAX_DECOMPRESSION_THREADS)
         return fail("invalid compressed WDL loading argument");
-    int descriptor = open(path, O_RDONLY);
+    int descriptor = compat_open(path, O_RDONLY, 0);
     if (descriptor < 0) return fail("cannot open %s: %s", path, strerror(errno));
     bool ok = false;
     WdlLoadWorker *workers = NULL;
-    pthread_t *threads = NULL;
+    my_thread_t *threads = NULL;
     atomic_bool cancelled;
     atomic_init(&cancelled, false);
-    if (fstat(descriptor, &status) != 0) {
+    if (compat_fstat(descriptor, &status) != 0) {
         fail("cannot stat %s: %s", path, strerror(errno)); goto done;
     }
     if (status.st_size < 0 || (uint64_t)status.st_size != size) {
@@ -1166,7 +1163,7 @@ bool wdl_file_load_into_threaded(const char *path, void *data, size_t size,
             .cancelled = &cancelled};
         workers[i].end = workers[i].first + quotient + (i < remainder);
         if (thread_count == 1) { load_wdl_range(&workers[i]); break; }
-        int error = pthread_create(&threads[i], NULL, load_wdl_range, &workers[i]);
+        int error = compat_thread_create(&threads[i], load_wdl_range, &workers[i]);
         if (error) {
             fail("cannot create WDL loading worker: %s", strerror(error));
             atomic_store_explicit(&cancelled, true, memory_order_relaxed);
@@ -1174,7 +1171,7 @@ bool wdl_file_load_into_threaded(const char *path, void *data, size_t size,
         }
         ++created;
     }
-    for (unsigned i = 0; i < created; ++i) pthread_join(threads[i], NULL);
+    for (unsigned i = 0; i < created; ++i) compat_thread_join(threads[i]);
     if (thread_count > 1 && created != thread_count) goto done;
     for (unsigned i = 0; i < thread_count; ++i)
         if (workers[i].error) {
@@ -1185,7 +1182,7 @@ bool wdl_file_load_into_threaded(const char *path, void *data, size_t size,
 done:
     free(threads);
     free(workers);
-    if (close(descriptor) != 0 && ok)
+    if (compat_close(descriptor) != 0 && ok)
         return fail("cannot close %s: %s", path, strerror(errno));
     return ok;
 }

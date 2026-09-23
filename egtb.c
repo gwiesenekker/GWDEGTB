@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "egtb_platform.h"
 #include "egtb.h"
 #include "progress.h"
 #include "crc32c.h"
@@ -9,16 +10,12 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 #include <zstd.h>
 
@@ -84,7 +81,7 @@ struct Egtb {
     bool compile_ready;
     unsigned view_count;
     unsigned writable_views;
-    pthread_mutex_t mutex;
+    my_mutex_t mutex;
     bool mutex_initialized;
     struct EgtbView *views;
     PageCache cache;
@@ -129,7 +126,7 @@ struct EgtbResident {
 static const unsigned char egtb_magic[8] = {'I','P','D','E','G','T','B','\0'};
 static Egtb *readonly_registry;
 static _Thread_local char last_error[256];
-static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static my_mutex_t registry_mutex = COMPAT_MUTEX_INITIALIZER;
 
 _Static_assert(sizeof(EgtbEntry) == 4, "EgtbEntry must occupy four bytes");
 
@@ -292,9 +289,9 @@ static bool pread_at(int descriptor, uint64_t offset, void *data, size_t size)
         size > (size_t)((uint64_t)INT64_MAX - offset))
         return fail("file read offset is too large");
     while (completed < size) {
-        ssize_t result = pread(descriptor, destination + completed,
+        int64_t result = compat_pread(descriptor, destination + completed,
                                size - completed,
-                               (off_t)(offset + completed));
+                               (int64_t)(offset + completed));
         if (result < 0) {
             if (errno == EINTR)
                 continue;
@@ -309,7 +306,7 @@ static bool pread_at(int descriptor, uint64_t offset, void *data, size_t size)
 
 static bool read_at(FILE *file, uint64_t offset, void *data, size_t size)
 {
-    int descriptor = fileno(file);
+    int descriptor = compat_fileno(file);
     if (descriptor < 0)
         return fail("cannot obtain EGTB file descriptor");
     return pread_at(descriptor, offset, data, size);
@@ -319,14 +316,14 @@ static bool write_at(FILE *file, uint64_t offset, const void *data, size_t size)
 {
     const unsigned char *source = data;
     size_t completed = 0;
-    int descriptor = fileno(file);
+    int descriptor = compat_fileno(file);
     if (descriptor < 0 || offset > (uint64_t)INT64_MAX ||
         size > (size_t)((uint64_t)INT64_MAX - offset))
         return fail("file write offset is too large");
     while (completed < size) {
-        ssize_t result = pwrite(descriptor, source + completed,
+        int64_t result = compat_pwrite(descriptor, source + completed,
                                 size - completed,
-                                (off_t)(offset + completed));
+                                (int64_t)(offset + completed));
         if (result < 0) {
             if (errno == EINTR)
                 continue;
@@ -659,10 +656,10 @@ static bool append_block(Egtb *egtb, uint32_t checksum,
                          const void *compressed, uint16_t length,
                          uint16_t capacity, uint64_t *offset)
 {
-    struct stat status;
+    CompatStat status;
     unsigned char header[EGTB_BLOCK_HEADER_SIZE];
-    int descriptor = fileno(egtb->file);
-    if (descriptor < 0 || fstat(descriptor, &status) != 0)
+    int descriptor = compat_fileno(egtb->file);
+    if (descriptor < 0 || compat_fstat(descriptor, &status) != 0)
         return fail("cannot determine EGTB length");
     if (status.st_size < 0)
         return fail("EGTB has a negative file length");
@@ -736,13 +733,13 @@ static bool store_page_with_runtime(Egtb *egtb, ZSTD_CCtx *compressor,
         uint64_t new_offset = 0;
         bool appended;
         if (synchronize_append)
-            pthread_mutex_lock(&egtb->mutex);
+            compat_mutex_lock(&egtb->mutex);
         appended = append_block(egtb, checksum, compressed, length,
                                 minimum, &new_offset);
         if (appended)
             egtb->offsets[page] = new_offset;
         if (synchronize_append)
-            pthread_mutex_unlock(&egtb->mutex);
+            compat_mutex_unlock(&egtb->mutex);
         if (!appended)
             return false;
     }
@@ -771,10 +768,10 @@ struct EgtbPageWriter {
 
 bool egtb_prepare_compact(Egtb *db)
 {
-    struct stat st;
+    CompatStat st;
     if (db == NULL || db->readonly || db->view_count != 0 ||
         db->format_version != EGTB_FORMAT_VERSION ||
-        fstat(fileno(db->file), &st) != 0 ||
+        compat_fstat(compat_fileno(db->file), &st) != 0 ||
         (uint64_t)st.st_size != db->data_offset)
         return fail("compact compiler requires a fresh v4 database");
     for (uint64_t p = 0; p < db->page_count; ++p)
@@ -794,11 +791,11 @@ static bool flush_compile_batch(EgtbPageWriter *w)
 {
     Egtb *db = w->database;
     if (w->used == 0) return true;
-    pthread_mutex_lock(&db->mutex);
+    compat_mutex_lock(&db->mutex);
     uint64_t offset = db->compile_end;
     bool fits = offset <= INT64_MAX - w->used;
     if (fits) db->compile_end += w->used;
-    pthread_mutex_unlock(&db->mutex);
+    compat_mutex_unlock(&db->mutex);
     if (!fits) return fail("compiled file offset overflow");
     /* write_at is an EINTR/short-write-safe positional writer. */
     if (!write_at(db->file, offset, w->batch, w->used)) return false;
@@ -887,34 +884,14 @@ bool egtb_page_writer_close(EgtbPageWriter *w)
 
 bool egtb_sync_parent(const char *path)
 {
-    if (path == NULL || *path == '\0') return fail("invalid parent path");
-    char *parent = strdup(path);
-    if (parent == NULL) return fail("cannot allocate parent path");
-    char *slash = strrchr(parent, '/');
-    if (slash == NULL) { free(parent); parent = strdup("."); }
-    else if (slash == parent) slash[1] = '\0';
-    else *slash = '\0';
-    if (parent == NULL) return fail("cannot allocate parent path");
-    int fd = open(parent, O_RDONLY | O_DIRECTORY);
-    free(parent);
-    if (fd < 0) return fail("cannot open parent directory: %s", strerror(errno));
-    bool ok = fsync(fd) == 0;
-    int saved = errno;
-    if (close(fd) != 0 && ok) { ok = false; saved = errno; }
-    return ok || fail("cannot sync parent directory: %s", strerror(saved));
+    if (!path || !*path) return fail("invalid parent path");
+    return compat_sync_parent(path) == 0 || fail("cannot sync parent directory: %s", strerror(errno));
 }
 
 bool egtb_publish(const char *temporary, const char *path)
 {
-    if (temporary == NULL || path == NULL) return fail("invalid publication paths");
-    int fd = open(temporary, O_RDONLY);
-    if (fd < 0) return fail("cannot open completed file: %s", strerror(errno));
-    bool ok = fsync(fd) == 0;
-    int saved = errno;
-    if (close(fd) != 0 && ok) { ok = false; saved = errno; }
-    if (!ok) return fail("cannot sync completed file: %s", strerror(saved));
-    if (rename(temporary, path) != 0) return fail("cannot publish file: %s", strerror(errno));
-    return egtb_sync_parent(path) && egtb_sync_parent(temporary);
+    if (!temporary || !path) return fail("invalid publication paths");
+    return compat_publish_file(temporary, path) == 0 || fail("cannot publish file: %s", strerror(errno));
 }
 
 static bool flush_cache_entry(Egtb *egtb, size_t index)
@@ -1042,13 +1019,13 @@ static void destroy_egtb(Egtb *egtb)
     free(egtb->lengths);
     free(egtb->path);
     if (egtb->mutex_initialized)
-        pthread_mutex_destroy(&egtb->mutex);
+        compat_mutex_destroy(&egtb->mutex);
     free(egtb);
 }
 
 static bool initialize_mutex(Egtb *egtb)
 {
-    int error = pthread_mutex_init(&egtb->mutex, NULL);
+    int error = compat_mutex_init(&egtb->mutex);
     if (error != 0)
         return fail("cannot initialize EGTB mutex: %s", strerror(error));
     egtb->mutex_initialized = true;
@@ -1214,21 +1191,21 @@ static bool create_with_version(Egtb **out, const char *path,
         return fail("cannot allocate EGTB directory");
     }
     strcpy(egtb->path, path);
-    descriptor = open(path, O_RDWR | O_CREAT | O_EXCL, 0666);
+    descriptor = compat_open(path, O_RDWR | O_CREAT | O_EXCL, 0666);
     if (descriptor < 0) {
         destroy_egtb(egtb);
         return fail("cannot create %s: %s", path, strerror(errno));
     }
-    egtb->file = fdopen(descriptor, "w+b");
+    egtb->file = compat_fdopen(descriptor, "w+b");
     if (egtb->file == NULL) {
-        close(descriptor);
+        compat_close(descriptor);
         destroy_egtb(egtb);
         return fail("cannot create file stream: %s", strerror(errno));
     }
-    if (!write_header(egtb) || ftruncate(descriptor, (off_t)egtb->data_offset) != 0 ||
+    if (!write_header(egtb) || compat_ftruncate(descriptor, (int64_t)egtb->data_offset) != 0 ||
         !allocate_runtime(egtb, options->cache_pages)) {
         destroy_egtb(egtb);
-        unlink(path);
+        compat_unlink(path);
         return fail("cannot initialize EGTB file");
     }
     *out = egtb;
@@ -1247,24 +1224,24 @@ bool egtb_open_readonly(Egtb **out, const char *path, size_t cache_pages)
     Egtb *current;
     if (out == NULL || path == NULL)
         return fail("invalid read-only open argument");
-    pthread_mutex_lock(&registry_mutex);
+    compat_mutex_lock(&registry_mutex);
     for (current = readonly_registry; current != NULL;
          current = current->registry_next) {
         if (strcmp(current->path, path) == 0) {
             ++current->references;
             *out = current;
-            pthread_mutex_unlock(&registry_mutex);
+            compat_mutex_unlock(&registry_mutex);
             return true;
         }
     }
     if (!open_common(out, path, true, cache_pages)) {
-        pthread_mutex_unlock(&registry_mutex);
+        compat_mutex_unlock(&registry_mutex);
         return false;
     }
     (*out)->registered = true;
     (*out)->registry_next = readonly_registry;
     readonly_registry = *out;
-    pthread_mutex_unlock(&registry_mutex);
+    compat_mutex_unlock(&registry_mutex);
     return true;
 }
 
@@ -1273,15 +1250,15 @@ bool egtb_open_readwrite(Egtb **out, const char *path, size_t cache_pages)
     Egtb *current;
     if (out == NULL || path == NULL)
         return fail("invalid read/write open argument");
-    pthread_mutex_lock(&registry_mutex);
+    compat_mutex_lock(&registry_mutex);
     for (current = readonly_registry; current != NULL;
          current = current->registry_next) {
         if (strcmp(current->path, path) == 0) {
-            pthread_mutex_unlock(&registry_mutex);
+            compat_mutex_unlock(&registry_mutex);
             return fail("EGTB is already open read-only");
         }
     }
-    pthread_mutex_unlock(&registry_mutex);
+    compat_mutex_unlock(&registry_mutex);
     return open_common(out, path, false, cache_pages);
 }
 
@@ -1311,20 +1288,20 @@ bool egtb_close(Egtb *egtb)
         return true;
     if (egtb->registered) {
         Egtb **link = &readonly_registry;
-        pthread_mutex_lock(&registry_mutex);
+        compat_mutex_lock(&registry_mutex);
         if (egtb->references > 1) {
             --egtb->references;
-            pthread_mutex_unlock(&registry_mutex);
+            compat_mutex_unlock(&registry_mutex);
             return true;
         }
         if (egtb->view_count != 0) {
-            pthread_mutex_unlock(&registry_mutex);
+            compat_mutex_unlock(&registry_mutex);
             return fail("cannot close an EGTB with active cache views");
         }
         while (*link != egtb)
             link = &(*link)->registry_next;
         *link = egtb->registry_next;
-        pthread_mutex_unlock(&registry_mutex);
+        compat_mutex_unlock(&registry_mutex);
     } else if (egtb->view_count != 0)
         return fail("cannot close an EGTB with active cache views");
     if (!egtb->readonly)
@@ -1434,7 +1411,7 @@ static bool view_load_page(EgtbView *view, uint64_t page, EgtbEntry *entries)
     uint64_t offset = egtb->offsets[page];
     uint16_t length = egtb->lengths[page];
     uint32_t expected_checksum;
-    int descriptor = fileno(egtb->file);
+    int descriptor = compat_fileno(egtb->file);
     if (offset == 0) {
         fill_draw_page(egtb, entries);
         return true;
@@ -1515,12 +1492,12 @@ view_cache_miss(EgtbView *view, uint64_t page, size_t slot, EgtbEntry *data)
     entry->valid = false;
     struct timespec begin, end;
     bool timed = view->sample_loads && (view->statistics.misses & 255) == 1 &&
-                 clock_gettime(CLOCK_MONOTONIC, &begin) == 0;
+                 compat_monotonic(&begin) == 0;
     uint64_t before = view->statistics.decompressions;
     if (!view_load_page(view, page, data))
         return NULL;
     if (timed && view->statistics.decompressions > before &&
-        clock_gettime(CLOCK_MONOTONIC, &end) == 0) {
+        compat_monotonic(&end) == 0) {
         int64_t ns = (int64_t)(end.tv_sec-begin.tv_sec)*INT64_C(1000000000)+end.tv_nsec-begin.tv_nsec;
         if (ns >= 0) { ++view->load_samples; view->load_ns += (uint64_t)ns; }
     }
@@ -1574,15 +1551,15 @@ bool egtb_view_create_range(EgtbView **out, Egtb *backing,
         return fail("invalid or conflicting cache-view request");
     if (writable && backing->writable_views == 0 && !egtb_flush(backing))
         return false;
-    pthread_mutex_lock(&backing->mutex);
+    compat_mutex_lock(&backing->mutex);
     for (other = backing->views; other != NULL; other = other->next) {
         if ((writable || other->writable) &&
             first_page < other->end_page && end_page > other->first_page) {
-            pthread_mutex_unlock(&backing->mutex);
+            compat_mutex_unlock(&backing->mutex);
             return fail("cache-view page ranges overlap");
         }
     }
-    pthread_mutex_unlock(&backing->mutex);
+    compat_mutex_unlock(&backing->mutex);
     range_pages = end_page - first_page;
     if (backing->planar) {
         uint64_t physical_range = 2 * range_pages;
@@ -1635,13 +1612,13 @@ bool egtb_view_create_range(EgtbView **out, Egtb *backing,
         free(view);
         return fail("cannot allocate direct-mapped cache view");
     }
-    pthread_mutex_lock(&backing->mutex);
+    compat_mutex_lock(&backing->mutex);
     view->next = backing->views;
     backing->views = view;
     ++backing->view_count;
     if (writable)
         ++backing->writable_views;
-    pthread_mutex_unlock(&backing->mutex);
+    compat_mutex_unlock(&backing->mutex);
     *out = view;
     return true;
 }
@@ -1659,13 +1636,13 @@ bool egtb_view_flush(EgtbView *view)
         if (!view_flush_slot(view, slot))
             return false;
     }
-    pthread_mutex_lock(&egtb->mutex);
+    compat_mutex_lock(&egtb->mutex);
     if (!write_header(egtb) || !write_directory(egtb) ||
         fflush(egtb->file) != 0) {
-        pthread_mutex_unlock(&egtb->mutex);
+        compat_mutex_unlock(&egtb->mutex);
         return fail("cannot flush EGTB cache view");
     }
-    pthread_mutex_unlock(&egtb->mutex);
+    compat_mutex_unlock(&egtb->mutex);
     return true;
 }
 
@@ -1680,7 +1657,7 @@ bool egtb_view_close(EgtbView *view)
         ok = egtb_view_flush(view);
     if (backing != NULL) {
         EgtbView **link;
-        pthread_mutex_lock(&backing->mutex);
+        compat_mutex_lock(&backing->mutex);
         link = &backing->views;
         while (*link != NULL && *link != view)
             link = &(*link)->next;
@@ -1692,7 +1669,7 @@ bool egtb_view_close(EgtbView *view)
             --backing->writable_views;
         if (backing->writable_views == 0)
             cache_invalidate(&backing->cache);
-        pthread_mutex_unlock(&backing->mutex);
+        compat_mutex_unlock(&backing->mutex);
     }
     ZSTD_freeCCtx(view->compressor);
     ZSTD_freeDCtx(view->decompressor);
@@ -1750,7 +1727,7 @@ struct EgtbSharedCache {
     size_t per_side, capacity, words_per_page;
     CacheModulo modulo;
     bool dense;
-    pthread_mutex_t probes_mutex;
+    my_mutex_t probes_mutex;
     EgtbSharedProbe *probes;
 };
 
@@ -1802,13 +1779,13 @@ bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes
         return fail("shared cache metadata size overflow");
     EgtbSharedCache *c = calloc(1, sizeof(*c));
     if (!c) return fail("cannot allocate shared cache");
-    if (pthread_mutex_init(&c->probes_mutex, NULL)) {
+    if (compat_mutex_init(&c->probes_mutex)) {
         free(c); return fail("cannot initialize shared cache registry");
     }
     c->backing = backing; c->per_side = per_side; c->capacity = capacity;
     c->modulo = cache_modulo_init(per_side);
     c->dense = dense; c->words_per_page = backing->memory_page_size / 8;
-    c->slots = aligned_alloc(64, capacity * sizeof(SharedSlot));
+    c->slots = compat_aligned_alloc(64, capacity * sizeof(SharedSlot));
     c->words = malloc(capacity * backing->memory_page_size);
     if (!c->slots || !c->words) {
         egtb_shared_cache_destroy(c);
@@ -1828,8 +1805,8 @@ void egtb_shared_cache_destroy(EgtbSharedCache *c)
 {
     if (!c) return;
     for (EgtbSharedProbe *p = c->probes; p; p = p->next) p->cache = NULL;
-    pthread_mutex_destroy(&c->probes_mutex);
-    free(c->words); free(c->slots); free(c);
+    compat_mutex_destroy(&c->probes_mutex);
+    free(c->words); compat_aligned_free(c->slots); free(c);
 }
 
 uint64_t egtb_shared_cache_bytes(const EgtbSharedCache *c)
@@ -1848,26 +1825,26 @@ void egtb_shared_cache_timing(EgtbSharedCache *c, uint64_t *samples, uint64_t *n
 {
     *samples = *ns = 0;
     /* Same quiescent lifetime requirement as cache_statistics. */
-    pthread_mutex_lock(&c->probes_mutex);
+    compat_mutex_lock(&c->probes_mutex);
     for (EgtbSharedProbe *p = c->probes; p; p = p->next) {
         *samples += p->statistics.timed_decodes;
         *ns += p->statistics.decode_nanoseconds;
     }
-    pthread_mutex_unlock(&c->probes_mutex);
+    compat_mutex_unlock(&c->probes_mutex);
 }
 
 void egtb_shared_cache_statistics(EgtbSharedCache *c, EgtbCacheStatistics *stats)
 {
     memset(stats, 0, sizeof(*stats));
     /* No lookup is active; registry mutex only protects create/destroy. */
-    pthread_mutex_lock(&c->probes_mutex);
+    compat_mutex_lock(&c->probes_mutex);
     for (EgtbSharedProbe *p = c->probes; p; p = p->next) {
         stats->lookups += p->statistics.cache.lookups;
         stats->hits += p->statistics.cache.hits;
         stats->misses += p->statistics.cache.misses;
         stats->decompressions += p->scratch->statistics.decompressions;
     }
-    pthread_mutex_unlock(&c->probes_mutex);
+    compat_mutex_unlock(&c->probes_mutex);
 }
 
 bool egtb_shared_cache_grow(EgtbSharedCache *c, size_t bytes)
@@ -1959,9 +1936,9 @@ bool egtb_shared_probe_create(EgtbSharedProbe **out, EgtbSharedCache *cache)
     if (!egtb_view_create(&p->scratch, cache->backing, 1, false)) {
         free(p); return false;
     }
-    pthread_mutex_lock(&cache->probes_mutex);
+    compat_mutex_lock(&cache->probes_mutex);
     p->next = cache->probes; cache->probes = p;
-    pthread_mutex_unlock(&cache->probes_mutex);
+    compat_mutex_unlock(&cache->probes_mutex);
     *out = p;
     return true;
 }
@@ -1971,11 +1948,11 @@ void egtb_shared_probe_destroy(EgtbSharedProbe *p)
     if (!p) return;
     EgtbSharedCache *c = p->cache;
     if (c) {
-        pthread_mutex_lock(&c->probes_mutex);
+        compat_mutex_lock(&c->probes_mutex);
         EgtbSharedProbe **link = &c->probes;
         while (*link && *link != p) link = &(*link)->next;
         if (*link) *link = p->next;
-        pthread_mutex_unlock(&c->probes_mutex);
+        compat_mutex_unlock(&c->probes_mutex);
     }
     egtb_view_close(p->scratch); free(p);
 }
@@ -1999,12 +1976,12 @@ static bool EGTB_COLD_NOINLINE shared_probe_miss(EgtbSharedProbe *p,
      * This includes file reads, CRC and decoding, not just Zstd CPU time. */
     struct timespec begin, end;
     bool timed = (p->statistics.cache.misses & 255) == 1 &&
-                 clock_gettime(CLOCK_MONOTONIC, &begin) == 0;
+                 compat_monotonic(&begin) == 0;
     uint64_t decoded_before = p->scratch->statistics.decompressions;
     /* Never let Zstd or memcpy write shared atomic storage. */
     if (!view_load_page(p->scratch, physical, data)) return false;
     if (timed && p->scratch->statistics.decompressions > decoded_before &&
-        clock_gettime(CLOCK_MONOTONIC, &end) == 0) {
+        compat_monotonic(&end) == 0) {
         int64_t ns = (int64_t)(end.tv_sec - begin.tv_sec) * INT64_C(1000000000) +
                      end.tv_nsec - begin.tv_nsec;
         if (ns >= 0) {
@@ -2375,7 +2352,7 @@ static void *load_resident_pages(void *opaque)
             continue;
         }
         if (length > compressed_capacity ||
-            !pread_at(fileno(egtb->file), offset, compressed,
+            !pread_at(compat_fileno(egtb->file), offset, compressed,
                       EGTB_BLOCK_HEADER_SIZE + (size_t)length)) {
             snprintf(worker->error, sizeof(worker->error), "%s",
                      egtb_last_error());
@@ -2426,7 +2403,7 @@ static bool resident_load_impl(EgtbResident **out, Egtb *backing,
 {
     EgtbResident *resident = NULL;
     ResidentLoadWorker *workers = NULL;
-    pthread_t *threads = NULL;
+    my_thread_t *threads = NULL;
     uint64_t bytes, pages_per_worker, extra_pages;
     unsigned i, created_threads = 0;
     bool ok = false;
@@ -2469,7 +2446,7 @@ static bool resident_load_impl(EgtbResident **out, Egtb *backing,
             ++created_threads;
             break;
         } else {
-            int error = pthread_create(&threads[i], NULL,
+            int error = compat_thread_create(&threads[i],
                                        load_resident_pages, &workers[i]);
             if (error != 0) {
                 fail("cannot create resident loader %u: %s", i,
@@ -2480,7 +2457,7 @@ static bool resident_load_impl(EgtbResident **out, Egtb *backing,
         ++created_threads;
     }
     for (i = 0; thread_count > 1 && i < created_threads; ++i) {
-        int error = pthread_join(threads[i], NULL);
+        int error = compat_thread_join(threads[i]);
         if (error != 0) {
             fail("cannot join resident loader %u: %s", i, strerror(error));
             goto done;
@@ -2711,7 +2688,7 @@ bool egtb_scan_dtm_statistics_threads(Egtb *backing, const EgtbResident *residen
         return scan_dtm_range(backing, resident, examples, histogram,
                               0, backing->maximum_index + 1);
     DtmScanWorker *workers = calloc(thread_count, sizeof(*workers));
-    pthread_t *threads = calloc(thread_count, sizeof(*threads));
+    my_thread_t *threads = calloc(thread_count, sizeof(*threads));
     unsigned started = 0;
     bool ok = false;
     if (!workers || !threads) {
@@ -2735,13 +2712,13 @@ bool egtb_scan_dtm_statistics_threads(Egtb *backing, const EgtbResident *residen
         }
     }
     for (; started < thread_count; ++started) {
-        int error = pthread_create(&threads[started], NULL, scan_dtm_worker, &workers[started]);
+        int error = compat_thread_create(&threads[started], scan_dtm_worker, &workers[started]);
         if (error) {
             fail("cannot start DTM statistics worker: %s", strerror(error));
             break;
         }
     }
-    for (unsigned i = 0; i < started; ++i) pthread_join(threads[i], NULL);
+    for (unsigned i = 0; i < started; ++i) compat_thread_join(threads[i]);
     if (started != thread_count) goto done;
     for (unsigned i = 0; i < thread_count; ++i)
         if (!workers[i].ok) {
@@ -2837,7 +2814,7 @@ bool egtb_resize_cache(Egtb *egtb, size_t cache_pages)
 bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics)
 {
     uint64_t page = 0;
-    off_t end;
+    int64_t end;
 
     if (egtb == NULL || statistics == NULL)
         return fail("invalid EGTB storage-statistics argument");
@@ -2890,7 +2867,7 @@ bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics)
     statistics->live_block_bytes = statistics->compressed_payload_bytes +
                                    statistics->live_pages *
                                        EGTB_BLOCK_HEADER_SIZE;
-    if (fseeko(egtb->file, 0, SEEK_END) != 0 || (end = ftello(egtb->file)) < 0)
+    if (compat_fseeko(egtb->file, 0, SEEK_END) != 0 || (end = compat_ftello(egtb->file)) < 0)
         return fail("cannot determine EGTB file size");
     statistics->file_bytes = (uint64_t)end;
     return true;
@@ -2929,14 +2906,14 @@ static bool compact_database(const char *path, int compression_level,
         goto done;
     }
     snprintf(temporary, path_length + 24, "%s.compact.XXXXXX", path);
-    descriptor = mkstemp(temporary);
+    descriptor = compat_mkstemp(temporary);
     if (descriptor < 0) {
         fail("cannot create compaction file: %s", strerror(errno));
         goto done;
     }
-    close(descriptor);
+    compat_close(descriptor);
     descriptor = -1;
-    unlink(temporary);
+    compat_unlink(temporary);
     options.cache_pages = 1;
     options.reserve_percent = 0;
     options.compression_level = copy_blocks ? source->compression_level
@@ -2970,7 +2947,7 @@ static bool compact_database(const char *path, int compression_level,
     }
     if (!egtb_flush(target))
         goto done;
-    if (fsync(fileno(target->file)) != 0) {
+    if (compat_fsync(compat_fileno(target->file)) != 0) {
         fail("cannot synchronize compacted EGTB: %s", strerror(errno));
         goto done;
     }
@@ -2981,7 +2958,7 @@ static bool compact_database(const char *path, int compression_level,
     target = NULL;
     destroy_egtb(source);
     source = NULL;
-    if (rename(temporary, path) != 0) {
+    if (compat_replace_file(temporary, path) != 0) {
         fail("cannot replace compacted EGTB: %s", strerror(errno));
         goto done;
     }
@@ -2994,7 +2971,7 @@ done:
     if (source != NULL)
         destroy_egtb(source);
     if (!ok && temporary != NULL)
-        unlink(temporary);
+        compat_unlink(temporary);
     free(temporary);
     return ok;
 }

@@ -102,8 +102,11 @@ remain warm. Slice-internal cache traffic is not part of these material tables.
 
 ## Requirements and build
 
-The code targets a POSIX system and requires a C11 compiler, POSIX threads, and
-the Zstandard development library. On Debian or Ubuntu the required package is
+The generator targets Linux/POSIX and requires a C11 compiler, POSIX threads, and
+the Zstandard development library. The GWD-facing library also has a Windows
+Clang/MSVC-ABI port using the shared `../compat` directory; see
+[Windows library build and integration](WINDOWS.md). Native Windows validation
+is performed separately from the Linux regression suite. On Debian or Ubuntu the required package is
 `libzstd-dev`. The Makefile defaults to Clang when `CC` has not been selected;
 use `make CC=gcc ...` to override it.
 

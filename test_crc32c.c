@@ -32,7 +32,7 @@ int main(void)
                 crc32c_portable(data + offset, length) != expected)
                 return 1;
 #ifdef EGTB_CRC32C_X86
-            if (__builtin_cpu_supports("sse4.2") &&
+            if (compat_cpu_has_sse42() &&
                 crc32c_hardware(data + offset, length) != expected)
                 return 1;
 #endif

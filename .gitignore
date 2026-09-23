@@ -44,5 +44,9 @@ test_compact_pipeline
 /test_dependency_resident
 /test_shared_cache
 /test_active_transfer
-/test_slice_order
 /test_wdl_dictionary
+/test_slice_order
+test_compat_include
+test_compat_runtime
+test_platform_guards
+build-windows/

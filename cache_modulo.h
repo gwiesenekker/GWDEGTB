@@ -1,6 +1,7 @@
 #ifndef CACHE_MODULO_H
 #define CACHE_MODULO_H
 #include <stdint.h>
+#include "compat.h"
 
 typedef struct { uint64_t divisor, reciprocal; int power_two; } CacheModulo;
 static inline CacheModulo cache_modulo_init(uint64_t n)
@@ -16,7 +17,7 @@ static inline uint64_t cache_modulo(uint64_t page, CacheModulo m)
      * deliberately wraps to 64 bits; multiply-high alone is NOT modulo. */
     if (page <= UINT32_MAX && m.divisor <= UINT32_MAX) {
         uint64_t low = m.reciprocal * page;
-        return (uint64_t)(((__uint128_t)low * m.divisor) >> 64);
+        return compat_mulhi_u64(low, m.divisor);
     }
     /* Do not silently truncate wider page numbers in future/large formats. */
     return page % m.divisor;

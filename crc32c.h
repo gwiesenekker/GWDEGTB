@@ -3,12 +3,12 @@
 
 /* Internal checksum implementation. Both paths use reflected Castagnoli,
  * initial state ~0 and final complement; existing disk checksums are unchanged. */
+#include "compat.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
-#include <pthread.h>
 
-static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
+static compat_once_t crc32c_once = COMPAT_ONCE_INITIALIZER;
 static uint32_t crc32c_table[256];
 
 static void initialize_crc32c_table(void)
@@ -26,7 +26,7 @@ static uint32_t crc32c_portable(const void *data, size_t size)
 {
     const unsigned char *bytes = data;
     uint32_t crc = UINT32_MAX;
-    pthread_once(&crc32c_once, initialize_crc32c_table);
+    compat_once(&crc32c_once, initialize_crc32c_table);
     for (size_t i = 0; i < size; ++i)
         crc = crc32c_table[(crc ^ bytes[i]) & 0xff] ^ (crc >> 8);
     return ~crc;
@@ -59,7 +59,7 @@ static uint32_t crc32c(const void *data, size_t size)
 {
 #if defined(EGTB_CRC32C_X86) && !defined(EGTB_CRC32C_FORCE_PORTABLE)
     /* Runtime guard also makes generic x86 builds safe on older CPUs. */
-    if (__builtin_cpu_supports("sse4.2"))
+    if (compat_cpu_has_sse42())
         return crc32c_hardware(data, size);
 #endif
     return crc32c_portable(data, size);

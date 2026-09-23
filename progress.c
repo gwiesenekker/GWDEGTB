@@ -1,16 +1,16 @@
 #define _POSIX_C_SOURCE 200809L
+#include "egtb_platform.h"
 #include "progress.h"
 
 #include <inttypes.h>
-#include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <time.h>
 
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t wake;
-static pthread_t reporter;
+static my_mutex_t mutex = COMPAT_MUTEX_INITIALIZER;
+static compat_cond_t wake;
+static my_thread_t reporter;
 static bool enabled, stopping, active;
 static unsigned interval;
 static char phase[160], units[32];
@@ -20,17 +20,20 @@ static double started, last_report;
 
 static double now_seconds(void)
 {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    struct timespec now = {0};
+    if (compat_monotonic(&now) != 0) return 0.0;
     return (double)now.tv_sec + (double)now.tv_nsec / 1e9;
 }
 
 static void timestamp(void)
 {
     time_t now = time(NULL);
-    struct tm local;
+    struct tm local = {0};
     char text[48];
-    localtime_r(&now, &local);
+    if (compat_localtime(&now, &local) != 0) {
+        printf("[timestamp unavailable] ");
+        return;
+    }
     strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S %z", &local);
     printf("[%s] ", text);
 }
@@ -67,39 +70,30 @@ static void report(const char *status)
 static void *run_reporter(void *unused)
 {
     (void)unused;
-    pthread_mutex_lock(&mutex);
+    compat_mutex_lock(&mutex);
     while (!stopping) {
-        struct timespec deadline;
-        clock_gettime(CLOCK_MONOTONIC, &deadline);
-        deadline.tv_sec += interval;
-        pthread_cond_timedwait(&wake, &mutex, &deadline);
+        int error = compat_cond_wait_ms(&wake, &mutex, interval * 1000u);
+        if (error != 0 && error != ETIMEDOUT) break;
         if (!stopping && active && now_seconds() - last_report >= interval) {
             report("running");
             last_report = now_seconds();
         }
     }
-    pthread_mutex_unlock(&mutex);
+    compat_mutex_unlock(&mutex);
     return NULL;
 }
 
 bool egtb_progress_start(unsigned interval_seconds)
 {
-    pthread_condattr_t attributes;
-    if (enabled || interval_seconds == 0)
-        return true;
-    if (pthread_condattr_init(&attributes) != 0)
-        return false;
-    int error = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
-    if (error == 0)
-        error = pthread_cond_init(&wake, &attributes);
-    pthread_condattr_destroy(&attributes);
-    if (error != 0)
-        return false;
+    if (enabled || interval_seconds == 0) return true;
+    if (interval_seconds > 4294967u) return false;
+    int error = compat_cond_init(&wake);
+    if (error) return false;
     interval = interval_seconds;
     stopping = active = false;
-    error = pthread_create(&reporter, NULL, run_reporter, NULL);
+    error = compat_thread_create(&reporter, run_reporter, NULL);
     if (error != 0) {
-        pthread_cond_destroy(&wake);
+        compat_cond_destroy(&wake);
         return false;
     }
     enabled = true;
@@ -110,7 +104,7 @@ void egtb_progress_begin(const char *label, uint64_t total, const char *unit)
 {
     if (!enabled)
         return;
-    pthread_mutex_lock(&mutex);
+    compat_mutex_lock(&mutex);
     snprintf(phase, sizeof(phase), "%s", label);
     snprintf(units, sizeof(units), "%s", unit);
     total_work = total;
@@ -119,8 +113,8 @@ void egtb_progress_begin(const char *label, uint64_t total, const char *unit)
     last_report = started;
     active = true;
     report("started");
-    pthread_cond_signal(&wake);
-    pthread_mutex_unlock(&mutex);
+    compat_cond_signal(&wake);
+    compat_mutex_unlock(&mutex);
 }
 
 void egtb_progress_add(uint64_t completed)
@@ -138,35 +132,35 @@ void egtb_progress_end(bool success)
 {
     if (!enabled)
         return;
-    pthread_mutex_lock(&mutex);
+    compat_mutex_lock(&mutex);
     if (active) {
         report(success ? "completed" : "failed");
         active = false;
     }
-    pthread_mutex_unlock(&mutex);
+    compat_mutex_unlock(&mutex);
 }
 
 void egtb_progress_log(const char *format, ...)
 {
     va_list arguments;
-    pthread_mutex_lock(&mutex);
+    compat_mutex_lock(&mutex);
     timestamp();
     va_start(arguments, format);
     vprintf(format, arguments);
     va_end(arguments);
     fflush(stdout);
-    pthread_mutex_unlock(&mutex);
+    compat_mutex_unlock(&mutex);
 }
 
 void egtb_progress_stop(void)
 {
     if (!enabled)
         return;
-    pthread_mutex_lock(&mutex);
+    compat_mutex_lock(&mutex);
     stopping = true;
-    pthread_cond_signal(&wake);
-    pthread_mutex_unlock(&mutex);
-    pthread_join(reporter, NULL);
+    compat_cond_signal(&wake);
+    compat_mutex_unlock(&mutex);
+    compat_thread_join(reporter);
     enabled = false;
-    pthread_cond_destroy(&wake);
+    compat_cond_destroy(&wake);
 }

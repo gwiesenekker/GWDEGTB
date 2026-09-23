@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "egtb_platform.h"
 #include "gwdegtb.h"
 
 #include "endgame_index.h"
@@ -8,14 +9,11 @@
 #include "wdl.h"
 
 #include <errno.h>
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <zstd.h>
 
@@ -73,7 +71,7 @@ static _Atomic(CompressedWdl *)
 static bool
     dtm_open_attempted[MATERIAL_DIMENSION][MATERIAL_DIMENSION]
                       [MATERIAL_DIMENSION][MATERIAL_DIMENSION];
-static pthread_mutex_t registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static my_mutex_t registry_mutex = COMPAT_MUTEX_INITIALIZER;
 static _Thread_local char last_error[256];
 
 static bool fail(const char *format, ...)
@@ -347,10 +345,10 @@ bool gwdegtb_wdl_attach(const char *database_name,
     resident->bitmap = (unsigned char *)data;
     resident->bytes = size;
 
-    pthread_mutex_lock(&registry_mutex);
+    compat_mutex_lock(&registry_mutex);
     slot = registry_slot(&canonical);
     old = atomic_exchange_explicit(slot, resident, memory_order_acq_rel);
-    pthread_mutex_unlock(&registry_mutex);
+    compat_mutex_unlock(&registry_mutex);
     if (old != NULL) {
         eg_indexer_destroy(&old->indexer);
         free(old);
@@ -374,7 +372,7 @@ bool gwdegtb_wdl_is_loaded(unsigned white_kings, unsigned white_men,
 void gwdegtb_wdl_unload_all(void)
 {
     unsigned wk, wm, bk, bm;
-    pthread_mutex_lock(&registry_mutex);
+    compat_mutex_lock(&registry_mutex);
     for (wk = 0; wk < MATERIAL_DIMENSION; ++wk)
         for (wm = 0; wm < MATERIAL_DIMENSION; ++wm)
             for (bk = 0; bk < MATERIAL_DIMENSION; ++bk)
@@ -388,7 +386,7 @@ void gwdegtb_wdl_unload_all(void)
                     eg_indexer_destroy(&resident->indexer);
                     free(resident);
                 }
-    pthread_mutex_unlock(&registry_mutex);
+    compat_mutex_unlock(&registry_mutex);
 }
 
 static inline bool prepare_compact_position(
@@ -503,7 +501,7 @@ static bool ensure_compressed_wdl(const char *directory,
     *path = database_path(directory, canonical, "wdl");
     if (*path == NULL)
         return fail("cannot allocate compressed WDL path");
-    if (access(*path, F_OK) == 0)
+    if (compat_access(*path, F_OK) == 0)
         return true;
     if (!wdl_open_threaded(&wdl, *path, 1, DEFAULT_WDL_COMPRESSION_LEVEL,
                            DEFAULT_DTM_CACHE_PAGES, thread_count))
@@ -521,21 +519,21 @@ static bool compressed_wdl_can_be_provided(const char *directory,
     const char *base = directory != NULL && directory[0] != '\0'
                            ? directory : ".";
     char *wdl_path = NULL, *dtm_path = NULL;
-    struct stat status;
+    CompatStat status;
     bool ok = false;
 
     *available = false;
-    if (stat(base, &status) != 0)
+    if (compat_stat(base, &status) != 0)
         return fail("cannot access WDL directory %s: %s", base,
                     strerror(errno));
-    if (!S_ISDIR(status.st_mode))
+    if (!status.is_directory)
         return fail("WDL directory is not a directory: %s", base);
     wdl_path = database_path(directory, canonical, "wdl");
     if (wdl_path == NULL) {
         fail("cannot allocate compressed WDL path");
         goto done;
     }
-    if (access(wdl_path, F_OK) == 0) {
+    if (compat_access(wdl_path, F_OK) == 0) {
         *available = true;
         ok = true;
         goto done;
@@ -549,7 +547,7 @@ static bool compressed_wdl_can_be_provided(const char *directory,
         fail("cannot allocate DTM path");
         goto done;
     }
-    if (access(dtm_path, F_OK) == 0)
+    if (compat_access(dtm_path, F_OK) == 0)
         *available = true;
     else if (errno != ENOENT) {
         fail("cannot access %s: %s", dtm_path, strerror(errno));
@@ -680,10 +678,10 @@ bool gwdegtb_wdl_compressed_attach(const char *database_name,
                               canonical.white_men << 4 |
                               canonical.black_kings << 8 |
                               canonical.black_men << 12;
-    pthread_mutex_lock(&registry_mutex);
+    compat_mutex_lock(&registry_mutex);
     slot = compressed_registry_slot(&canonical);
     old = atomic_exchange_explicit(slot, compressed, memory_order_acq_rel);
-    pthread_mutex_unlock(&registry_mutex);
+    compat_mutex_unlock(&registry_mutex);
     destroy_compressed_wdl(old);
     return true;
 failure:
@@ -708,7 +706,7 @@ bool gwdegtb_wdl_compressed_is_loaded(unsigned white_kings,
 
 void gwdegtb_wdl_compressed_unload_all(void)
 {
-    pthread_mutex_lock(&registry_mutex);
+    compat_mutex_lock(&registry_mutex);
     for (unsigned wk = 0; wk < MATERIAL_DIMENSION; ++wk)
         for (unsigned wm = 0; wm < MATERIAL_DIMENSION; ++wm)
             for (unsigned bk = 0; bk < MATERIAL_DIMENSION; ++bk)
@@ -719,7 +717,7 @@ void gwdegtb_wdl_compressed_unload_all(void)
                         slot, NULL, memory_order_acq_rel);
                     destroy_compressed_wdl(compressed);
                 }
-    pthread_mutex_unlock(&registry_mutex);
+    compat_mutex_unlock(&registry_mutex);
 }
 
 bool gwdegtb_wdl_probe_create(size_t cache_bytes,
@@ -967,7 +965,7 @@ static DiskDtm *find_or_open_disk_dtm(const char *directory,
     if (dtm != NULL)
         return dtm;
 
-    pthread_mutex_lock(&registry_mutex);
+    compat_mutex_lock(&registry_mutex);
     dtm = atomic_load_explicit(slot, memory_order_relaxed);
     if (dtm == NULL && !*attempted) {
         *attempted = true;
@@ -975,14 +973,14 @@ static DiskDtm *find_or_open_disk_dtm(const char *directory,
         if (dtm != NULL)
             atomic_store_explicit(slot, dtm, memory_order_release);
     }
-    pthread_mutex_unlock(&registry_mutex);
+    compat_mutex_unlock(&registry_mutex);
     return dtm;
 }
 
 void gwdegtb_dtm_close_all(void)
 {
     unsigned wk, wm, bk, bm;
-    pthread_mutex_lock(&registry_mutex);
+    compat_mutex_lock(&registry_mutex);
     for (wk = 0; wk < MATERIAL_DIMENSION; ++wk)
         for (wm = 0; wm < MATERIAL_DIMENSION; ++wm)
             for (bk = 0; bk < MATERIAL_DIMENSION; ++bk)
@@ -994,7 +992,7 @@ void gwdegtb_dtm_close_all(void)
                     destroy_disk_dtm(dtm);
                 }
     memset(dtm_open_attempted, 0, sizeof(dtm_open_attempted));
-    pthread_mutex_unlock(&registry_mutex);
+    compat_mutex_unlock(&registry_mutex);
 }
 
 int16_t gwdegtb_dtm_lookup_compact(

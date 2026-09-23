@@ -6,11 +6,34 @@
 #include "material.h"
 #include "wdl.h"
 
-#include <pthread.h>
+#include "compat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
 #include <unistd.h>
+#else
+/* Test-only helpers; the installed library never changes the environment. */
+static char *test_mkdtemp(char *path)
+{
+    int fd = compat_mkstemp(path);
+    if (fd < 0) return NULL;
+    if (compat_close(fd) || compat_unlink(path) || _mkdir(path)) return NULL;
+    return path;
+}
+static int test_setenv(const char *name, const char *value, int replace)
+{
+    if (!replace && getenv(name)) return 0;
+    return _putenv_s(name, value);
+}
+#define mkdtemp test_mkdtemp
+#define setenv test_setenv
+#define unsetenv(name) _putenv_s(name, "")
+#define rmdir _rmdir
+#ifndef R_OK
+#define R_OK 4
+#endif
+#endif
 
 static uint64_t compact_to_gwd(uint64_t compact)
 {
@@ -103,7 +126,7 @@ static void *probe_worker(void *argument)
 
 int main(void)
 {
-    char directory[] = "/tmp/gwdegtb-resident-XXXXXX";
+    char directory[] = "./gwdegtb-resident-XXXXXX";
     char dtm_path[256] = {0}, wdl_path[256] = {0};
     EgtbCreateOptions options = {8, 20, 3};
     Egtb *dtm = NULL;
@@ -114,7 +137,7 @@ int main(void)
     unsigned char *shared_bitmap = NULL;
     unsigned char *compressed_image = NULL;
     GwdegtbWdlProbe *probes[2] = {NULL, NULL};
-    pthread_t probe_threads[2];
+    my_thread_t probe_threads[2];
     ProbeWorker probe_workers[2];
     unsigned probe_threads_created = 0;
     unsigned probe_threads_joined = 0;
@@ -134,7 +157,7 @@ int main(void)
     if (!gwdegtb_wdl_compressed_info(directory,
                                      "1wX-0wO-0bX-1bO",
                                      &compressed_bytes) ||
-        compressed_bytes != 0 || access(wdl_path, F_OK) == 0)
+        compressed_bytes != 0 || compat_access(wdl_path, F_OK) == 0)
         goto done;
     if (!eg_indexer_init(&indexer, 0, 1, 1, 0))
         goto done;
@@ -152,7 +175,7 @@ int main(void)
     if (!egtb_close(dtm))
         goto done;
     dtm = NULL;
-    if (access(wdl_path, F_OK) == 0)
+    if (compat_access(wdl_path, F_OK) == 0)
         goto done;
 
     if (gwdegtb_wdl_is_loaded(1, 0, 0, 1) ||
@@ -170,10 +193,10 @@ int main(void)
     if (bitmap == NULL ||
         gwdegtb_wdl_decompress(directory, "1wX-0wO-0bX-1bO",
                                bitmap, bitmap_bytes - 1) ||
-        access(wdl_path, F_OK) == 0 ||
+        compat_access(wdl_path, F_OK) == 0 ||
         !gwdegtb_wdl_decompress(directory, "0wX-1wO-1bX-0bO.wdl",
                                 bitmap, bitmap_bytes) ||
-        access(wdl_path, R_OK) != 0 ||
+        compat_access(wdl_path, R_OK) != 0 ||
         gwdegtb_wdl_is_loaded(1, 0, 0, 1) ||
         !gwdegtb_wdl_attach("1wX-0wO-0bX-1bO", bitmap, bitmap_bytes) ||
         !gwdegtb_wdl_is_loaded(1, 0, 0, 1) ||
@@ -205,12 +228,12 @@ int main(void)
 
     /* Explicit thread counts override even an invalid environment setting,
      * including generation performed by info before allocation. */
-    if (unlink(wdl_path) != 0 || setenv("EGTB_WDL_THREADS", "invalid", 1) != 0 ||
+    if (compat_unlink(wdl_path) != 0 || setenv("EGTB_WDL_THREADS", "invalid", 1) != 0 ||
         !gwdegtb_wdl_compressed_info_threads(directory, "1wX-0wO-0bX-1bO",
                                               &compressed_bytes, 4) ||
         compressed_bytes == 0)
         goto done;
-    if (unlink(wdl_path) != 0) goto done; /* load also generates if missing */
+    if (compat_unlink(wdl_path) != 0) goto done; /* load also generates if missing */
     compressed_image = malloc(compressed_bytes);
     if (compressed_image == NULL ||
         gwdegtb_wdl_compressed_load(directory, "1wX-0wO-0bX-1bO",
@@ -235,13 +258,13 @@ int main(void)
         probe_workers[worker].first = worker * position_count / 2;
         probe_workers[worker].end = (worker + 1) * position_count / 2;
         probe_workers[worker].failed = false;
-        if (pthread_create(&probe_threads[worker], NULL, probe_worker,
+        if (compat_thread_create(&probe_threads[worker], probe_worker,
                            &probe_workers[worker]) != 0)
             goto done;
         ++probe_threads_created;
     }
     for (unsigned worker = 0; worker < probe_threads_created; ++worker)
-        if (pthread_join(probe_threads[worker], NULL) != 0)
+        if (compat_thread_join(probe_threads[worker]) != 0)
             goto done;
         else
             ++probe_threads_joined;
@@ -402,7 +425,7 @@ int main(void)
 
 done:
     while (probe_threads_joined < probe_threads_created)
-        pthread_join(probe_threads[probe_threads_joined++], NULL);
+        compat_thread_join(probe_threads[probe_threads_joined++]);
     for (unsigned worker = 0; worker < 2; ++worker)
         gwdegtb_wdl_probe_destroy(probes[worker]);
     gwdegtb_wdl_compressed_unload_all();
@@ -416,9 +439,9 @@ done:
     if (indexer_ready)
         eg_indexer_destroy(&indexer);
     if (wdl_path[0] != '\0')
-        unlink(wdl_path);
+        compat_unlink(wdl_path);
     if (dtm_path[0] != '\0')
-        unlink(dtm_path);
+        compat_unlink(dtm_path);
     rmdir(directory);
     if (!ok) {
         fprintf(stderr, "resident GWD WDL test failed: %s / %s\n",
