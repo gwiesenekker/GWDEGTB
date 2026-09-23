@@ -51,6 +51,8 @@ typedef struct {
     uint64_t allocated, recovery_reserve;
     unsigned shrinks, transfers, rollbacks;
     bool assessing;
+    uint64_t borrowed_payload;
+    unsigned loan_repayments;
 } DependencyCoordinatorStatistics;
 void dependency_shared_coordinator_statistics(DependencyResidentPool *pool,
                                               DependencyCoordinatorStatistics *out);

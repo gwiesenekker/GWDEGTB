@@ -514,7 +514,8 @@ static void idle_reclamation(Egtb *a, Egtb *b)
         Egtb *db[2]={a,b}; const EgtbResident *r;
         CHECK(dependency_resident_create(&pool,0,0));
         CHECK(dependency_shared_policy(pool,"idle-reclaim-v1"));
-        CHECK(dependency_shared_configure(pool,256,1536));
+        /* Preserve the old 1536-byte growth ceiling after 5% headroom. */
+        CHECK(dependency_shared_configure(pool,256,1616));
         CHECK(dependency_shared_minimum_load(pool,0));
         for (unsigned k=0;k<2;++k) {
             CHECK(dependency_resident_acquire(pool,db[k],&r));
@@ -553,12 +554,12 @@ static void idle_reclamation(Egtb *a, Egtb *b)
     puts("idle reclamation: constrained budget, active hits, phase grace and refill passed");
 }
 
-static void returning_idle_cache(Egtb *a, Egtb *b)
+static void returning_idle_cache(Egtb *a, Egtb *b, bool headroom_only,
+                                 unsigned count, uint64_t budget)
 {
     DependencyResidentPool *pool;
     EgtbSharedCache *c[2]; EgtbSharedProbe *p[2];
     Egtb *db[2]={a,b}; const EgtbResident *resident;
-    const uint64_t budget=25000;
     CHECK(dependency_resident_create(&pool,0,0));
     CHECK(dependency_shared_policy(pool,"idle-reclaim-v1"));
     CHECK(dependency_shared_configure(pool,256,budget));
@@ -571,37 +572,72 @@ static void returning_idle_cache(Egtb *a, Egtb *b)
     int16_t value;
     for (unsigned w=0;w<24;++w) {
         for (unsigned j=0;j<100001;++j)
-            CHECK(egtb_shared_probe_get(p[0],(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+            CHECK(egtb_shared_probe_get(p[0],(j*1597u)%count,EGTB_WHITE_TO_MOVE,&value));
         dependency_shared_maintain_at(pool,w+1);
     }
     uint64_t remembered=egtb_shared_cache_bytes(c[0]);
     CHECK(remembered>4096);
+    dependency_shared_phase_at(pool,25); /* End any last-growth assessment. */
     bool shrunk=false;
     for (unsigned w=0;w<24 && !shrunk;++w) {
         for (unsigned j=0;j<100001;++j)
-            CHECK(egtb_shared_probe_get(p[1],(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+            CHECK(egtb_shared_probe_get(p[1],(j*1597u)%count,EGTB_WHITE_TO_MOVE,&value));
         dependency_shared_maintain_at(pool,100+w);
         shrunk=egtb_shared_cache_bytes(c[0])==256;
     }
     CHECK(shrunk);
+    if (headroom_only) {
+        for (unsigned w=0;w<24;++w) {
+            for (unsigned j=0;j<100001;++j)
+                CHECK(egtb_shared_probe_get(p[1],(j*1597u)%count,EGTB_WHITE_TO_MOVE,&value));
+            dependency_shared_maintain_at(pool,130+w);
+        }
+    }
     /* The remembered target must survive a phase boundary. Keep the receiver
      * active with hits: recovery may use free budget, not evict this cache. */
     dependency_shared_phase_at(pool,200);
     uint64_t receiver=egtb_shared_cache_bytes(c[1]);
-    for (unsigned w=0;w<3;++w) {
+    DependencyCoordinatorStatistics before;
+    dependency_shared_coordinator_statistics(pool,&before);
+    if (headroom_only) CHECK(before.borrowed_payload>0);
+    CHECK(egtb_shared_probe_get(p[0],0,EGTB_WHITE_TO_MOVE,&value));
+    dependency_shared_maintain_at(pool,200.5);
+    CHECK(egtb_shared_cache_bytes(c[0])==256); /* A lookup alone is not pressure. */
+    for (unsigned w=0;w<(headroom_only ? 2u : 1u);++w) {
         CHECK(egtb_shared_probe_get(p[1],0,EGTB_WHITE_TO_MOVE,&value));
         for (unsigned j=0;j<100001;++j)
-            CHECK(egtb_shared_probe_get(p[0],(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+            CHECK(egtb_shared_probe_get(p[0],(j*1597u)%count,EGTB_WHITE_TO_MOVE,&value));
         dependency_shared_maintain_at(pool,201+w);
-        if (w<2) CHECK(egtb_shared_cache_bytes(c[0])==256);
     }
     /* Ordinary accelerated growth would reach only 864 bytes here. */
-    CHECK(egtb_shared_cache_bytes(c[0])>4096);
+    CHECK(egtb_shared_cache_bytes(c[0])>(headroom_only ? 256u : 4096u));
     CHECK(egtb_shared_cache_bytes(c[0])<=remembered);
-    CHECK(egtb_shared_cache_bytes(c[1])==receiver);
+    CHECK(egtb_shared_cache_bytes(c[1])==receiver-before.borrowed_payload);
     DependencyCoordinatorStatistics stats;
     dependency_shared_coordinator_statistics(pool,&stats);
     CHECK(stats.allocated<=budget && stats.shrinks==1);
+    if (headroom_only) {
+        printf("headroom recovery: allocated=%" PRIu64 " budget=%" PRIu64 " receiver=%" PRIu64 " recovered=%" PRIu64 "\n",
+               stats.allocated,budget,receiver,egtb_shared_cache_bytes(c[0]));
+        /* Ordinary growth must also leave its failure fallback allocated.
+         * Crossing that effective ceiling proves reserve access, even when
+         * page rounding leaves the raw 95% boundary uncrossed. */
+        uint64_t fallback=egtb_shared_cache_planned_allocation(a,256);
+        if (budget==25000) CHECK(stats.allocated+fallback>budget-budget/20);
+        CHECK(stats.loan_repayments==1 && stats.borrowed_payload==0);
+        /* Keep both dependencies under pressure across repeated loan cooldowns.
+         * The bootstrap budget need not be a whole slot allocation: having
+         * reached its rounded target must not recall another cache's loan. */
+        for (unsigned w=0;w<16;++w) {
+            for (unsigned k=0;k<2;++k)
+                for (unsigned j=0;j<100001;++j)
+                    CHECK(egtb_shared_probe_get(p[k],(j*1597u)%count,EGTB_WHITE_TO_MOVE,&value));
+            dependency_shared_maintain_at(pool,300+w*70);
+        }
+        dependency_shared_coordinator_statistics(pool,&stats);
+        CHECK(stats.loan_repayments==1);
+        CHECK(stats.allocated<=budget);
+    }
     for (unsigned k=0;k<2;++k) {
         for (unsigned i=0;i<N;++i) for (unsigned s=0;s<2;++s) {
             CHECK(egtb_shared_probe_get(p[k],i,(EgtbSide)s,&value));
@@ -611,6 +647,65 @@ static void returning_idle_cache(Egtb *a, Egtb *b)
     }
     dependency_resident_destroy(pool);
     puts("returning idle cache: phase persistence, pressure gate, direct recovery and budget passed");
+}
+
+static void headroom_private_admission(Egtb *a, Egtb *b, unsigned mode)
+{
+    DependencyResidentPool *pool;
+    const EgtbResident *resident;
+    EgtbSharedCache *cache, *pending;
+    EgtbSharedProbe *probe, *promoted=NULL;
+    EgtbView *view;
+    CHECK(dependency_resident_create(&pool,0,0));
+    CHECK(dependency_shared_policy(pool,"idle-reclaim-v1"));
+    CHECK(dependency_shared_configure(pool,256,25000));
+    CHECK(dependency_shared_minimum_load(pool,0.000001));
+    CHECK(dependency_resident_acquire(pool,a,&resident));
+    CHECK(dependency_shared_acquire(pool,a,&cache) && cache);
+    CHECK(egtb_shared_probe_create(&probe,cache));
+    int16_t value;
+    for (unsigned w=0;w<24;++w) {
+        for (unsigned j=0;j<100001;++j)
+            CHECK(egtb_shared_probe_get(probe,(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+        dependency_shared_maintain_at(pool,w+1);
+    }
+    DependencyCoordinatorStatistics before,after;
+    dependency_shared_coordinator_statistics(pool,&before);
+    CHECK(before.borrowed_payload>0);
+    uint64_t base=egtb_shared_cache_bytes(cache)-before.borrowed_payload;
+    dependency_shared_phase_at(pool,25);
+    CHECK(dependency_resident_acquire(pool,b,&resident));
+    CHECK(dependency_shared_acquire(pool,b,&pending) && !pending);
+    CHECK(egtb_view_create(&view,b,1,false));
+    CHECK(dependency_private_register(pool,b,view,&promoted));
+    for (unsigned w=0;w<3;++w) {
+        if (mode==0) CHECK(egtb_shared_probe_get(probe,0,EGTB_WHITE_TO_MOVE,&value));
+        for (unsigned j=0;j<100001;++j)
+            CHECK(egtb_view_get(view,(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+        dependency_shared_maintain_at(pool,(mode==1 ? 100 : 30)+w);
+    }
+    dependency_shared_coordinator_statistics(pool,&after);
+    CHECK(promoted && after.loan_repayments==1 && after.borrowed_payload==0);
+    CHECK(after.allocated<=25000 && egtb_shared_cache_bytes(cache)==(mode==1 ? 256 : base));
+    CHECK(after.shrinks==(mode==1 ? 1u : 0u));
+    /* Sustained borrower pressure cannot immediately take the loan back. */
+    for (unsigned w=0;w<5;++w) {
+        for (unsigned j=0;j<100001;++j)
+            CHECK(egtb_shared_probe_get(probe,(j*1597u)%N,EGTB_WHITE_TO_MOVE,&value));
+        dependency_shared_maintain_at(pool,(mode==1 ? 103 : 33)+w);
+    }
+    dependency_shared_coordinator_statistics(pool,&after);
+    CHECK(after.borrowed_payload==0);
+    for (unsigned i=0;i<N;++i) for (unsigned s=0;s<2;++s) {
+        CHECK(egtb_shared_probe_get(probe,i,(EgtbSide)s,&value) && value==expected(i,s));
+        CHECK(egtb_shared_probe_get(promoted,i,(EgtbSide)s,&value) && value==expected(i,s));
+    }
+    dependency_private_unregister(pool,&promoted);
+    egtb_shared_probe_destroy(promoted);
+    CHECK(egtb_view_close(view));
+    egtb_shared_probe_destroy(probe);
+    dependency_resident_destroy(pool);
+    puts("headroom loan: private admission repayment, protected base, cooldown and values passed");
 }
 
 static void private_admission(Egtb *a, Egtb *b)
@@ -818,7 +913,23 @@ int main(void)
     coordinator(db, other);
     idle_reclamation(db, other);
     private_admission(db, other);
-    returning_idle_cache(db, other);
+    returning_idle_cache(db, other, false, N, 25000);
+    returning_idle_cache(db, other, true, N, 25000);
+    headroom_private_admission(db, other, 0); /* Active borrower: base preserved. */
+    headroom_private_admission(db, other, 1); /* Idle borrower: directly to floor. */
+    headroom_private_admission(db, other, 2); /* Idle grace: base preserved. */
+    char large_path[256], large_alias[256]; Egtb *large, *large_other;
+    snprintf(large_path,sizeof(large_path),"%s/large.dtm",dir);
+    CHECK(egtb_create(&large,large_path,4*N-1,128,&options));
+    for (unsigned i=0;i<4*N;++i) for (unsigned s=0;s<2;++s)
+        CHECK(egtb_set(large,i,(EgtbSide)s,expected(i,s)));
+    CHECK(egtb_close(large));
+    CHECK(egtb_open_readonly(&large,large_path,1));
+    snprintf(large_alias,sizeof(large_alias),"%s/./large.dtm",dir);
+    CHECK(egtb_open_readonly(&large_other,large_alias,1));
+    returning_idle_cache(large,large_other,true,4*N,80003);
+    CHECK(egtb_close(large_other)); CHECK(egtb_close(large));
+    CHECK(unlink(large_path)==0);
     CHECK(egtb_close(other));
     CHECK(!egtb_shared_cache_create(&cache, db, 1));
     CHECK(egtb_shared_cache_create(&cache, db, 256)); /* One slot per side. */

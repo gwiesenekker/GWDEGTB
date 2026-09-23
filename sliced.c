@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "sliced.h"
+#include "slice_order.h"
 
 #include "revision.h"
 #include "progress.h"
@@ -1062,47 +1063,54 @@ bool egtb_generate_sliced(Egtb **out, const char *path,
     white_last = last_white_slice_row(material);
     black_first = material->black_men == 0 ? -1 : 8;
     black_last = last_black_slice_row(material);
-    for (int white = white_first;; ++white) {
-        for (int black = black_first;; --black) {
-            int ws = white < 0 ? 0 : white;
-            int bs = black < 0 ? 0 : black;
-            bool resumed = completed[ws][bs];
-            if (!completed[ws][bs]) {
-                EgtbGenerationStatistics generated = {0};
-                if (!generate_one_slice(directory, material, white, black,
-                                        options, contexts, probe_contexts,
-                                        &generated))
-                    goto done;
-                slice_statistics[ws][bs] = generated;
-                completed[ws][bs] = true;
-                if (!write_manifest(directory, material,
-                                    eg_position_count(full_indexer),
-                                    options->page_size, completed,
-                                    slice_statistics))
-                    goto done;
-            } else if (!options->quiet) {
-                egtb_progress_log("resuming: slice white-row=%d black-row=%d already complete\n",
-                       white < 0 ? 0 : white + 1,
-                       black < 0 ? 0 : black + 1);
-            }
-            EgtbGenerationStatistics current = slice_statistics[ws][bs];
-            if (resumed) {
-                /* Keep outcome/pass counts, but do not charge historic work
-                 * to this invocation's wall-clock timing. */
-                current.initialization_seconds = 0;
-                current.backpropagation_seconds = 0;
-                current.compilation_seconds = 0;
-                current.consistency_seconds = 0;
-                current.final_scan_seconds = 0;
-                current.total_seconds = 0;
-                ++total.resumed_slices;
-            }
-            add_generation_statistics(&total, &current);
-            if (black == black_last)
-                break;
+    SliceOrderEntry order[81];
+    const char *order_name = getenv("EGTB_SLICE_ORDER");
+    if (!order_name || !*order_name) order_name = "row";
+    unsigned order_count = slice_order_build(order_name,
+        (unsigned)(white_last-white_first+1),
+        (unsigned)(black_first-black_last+1), order);
+    if (!order_count) {
+        sliced_fail("invalid EGTB_SLICE_ORDER: expected row, column, tile2, tile3 or diagonal");
+        goto done;
+    }
+    if (!options->quiet) egtb_progress_log("slice traversal: %s\n",order_name);
+    for (unsigned step=0; step<order_count; ++step) {
+        int white = white_first + (int)order[step].white;
+        int black = black_first - (int)order[step].black;
+        int ws = white < 0 ? 0 : white;
+        int bs = black < 0 ? 0 : black;
+        bool resumed = completed[ws][bs];
+        if (!completed[ws][bs]) {
+            EgtbGenerationStatistics generated = {0};
+            if (!generate_one_slice(directory, material, white, black,
+                                    options, contexts, probe_contexts,
+                                    &generated))
+                goto done;
+            slice_statistics[ws][bs] = generated;
+            completed[ws][bs] = true;
+            if (!write_manifest(directory, material,
+                                eg_position_count(full_indexer),
+                                options->page_size, completed,
+                                slice_statistics))
+                goto done;
+        } else if (!options->quiet) {
+            egtb_progress_log("resuming: slice white-row=%d black-row=%d already complete\n",
+                   white < 0 ? 0 : white + 1,
+                   black < 0 ? 0 : black + 1);
         }
-        if (white == white_last)
-            break;
+        EgtbGenerationStatistics current = slice_statistics[ws][bs];
+        if (resumed) {
+            /* Keep outcome/pass counts, but do not charge historic work
+             * to this invocation's wall-clock timing. */
+            current.initialization_seconds = 0;
+            current.backpropagation_seconds = 0;
+            current.compilation_seconds = 0;
+            current.consistency_seconds = 0;
+            current.final_scan_seconds = 0;
+            current.total_seconds = 0;
+            ++total.resumed_slices;
+        }
+        add_generation_statistics(&total, &current);
     }
     if (!options->quiet) {
         egtb_progress_log("compiling completed slices into %s\n", path);

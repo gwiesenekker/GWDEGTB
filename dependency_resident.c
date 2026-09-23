@@ -32,6 +32,7 @@ typedef struct ResidentEntry {
     double pressure_rate, last_window_seconds, decode_ns;
     double growth_factor; /* Per-cache policy state; initialized from pool default. */
     uint64_t recovery_payload; /* Capacity discarded by idle reclamation, not a reservation. */
+    uint64_t loan_base; /* Non-borrowed payload; zero means no outstanding loan. */
     bool activity_seen;
     uint64_t activity_lookups;
     uint64_t window_lookups;
@@ -48,9 +49,18 @@ typedef struct ResidentEntry {
     unsigned private_windows;
     bool private_sampled;
     CachePolicyLog private_log;
+    CachePolicyLog active_log;
     char error[256];
     struct ResidentEntry *next;
 } ResidentEntry;
+
+typedef struct ActiveHistory {
+    ResidentEntry *donor, *receiver;
+    uint64_t donor_bytes, receiver_bytes;
+    double pressure, retry_after;
+    bool failed;
+    struct ActiveHistory *next;
+} ActiveHistory;
 
 struct DependencyResidentPool {
     pthread_mutex_t mutex;
@@ -75,7 +85,17 @@ struct DependencyResidentPool {
     double donor_observed_at;
     double trial_deadline;
     bool rollback_requested;
+    bool active_trial;
+    ActiveHistory *active_history, *trial_history;
+    double resize_seconds_per_byte;
+    unsigned trial_windows;
+    double trial_time, trial_cost[2], trial_rate[2], trial_resize_seconds;
+    uint64_t trial_lookups[2], trial_decodes[2], trial_samples[2], trial_ns[2];
+    uint64_t trial_total_lookups[2], trial_total_decodes[2];
+    uint64_t trial_total_samples[2], trial_total_ns[2];
     bool rebalance;
+    double borrow_after;
+    unsigned loan_repayments;
     unsigned shrinks, transfers, rollbacks;
 };
 
@@ -221,6 +241,19 @@ bool dependency_shared_configure(DependencyResidentPool *p, size_t initial, uint
     return true;
 }
 
+/* Keep the tiny discard-resize fallback fundable while a loan exists. */
+static uint64_t admission_available(DependencyResidentPool *p)
+{
+    uint64_t available=p->shared_budget-p->shared_allocated-p->recovery_reserve;
+    for (ResidentEntry *e=p->entries; e; e=e->next) {
+        if (!e->loan_base || !e->shared) continue;
+        uint64_t fallback=egtb_shared_cache_planned_allocation(e->backing,
+            2*(size_t)egtb_cache_page_size(e->backing));
+        available=available>fallback ? available-fallback : 0;
+    }
+    return available;
+}
+
 bool dependency_shared_acquire(DependencyResidentPool *p, Egtb *backing,
                                EgtbSharedCache **out)
 {
@@ -249,7 +282,7 @@ bool dependency_shared_acquire(DependencyResidentPool *p, Egtb *backing,
     e->shared_decided = true;
     e->growth_factor = p->growth_factor;
     uint64_t allocation = egtb_shared_cache_planned_allocation(backing, (size_t)p->shared_bytes);
-    if (p->shared_budget && allocation > p->shared_budget - p->shared_allocated - p->recovery_reserve) {
+    if (p->shared_budget && allocation > admission_available(p)) {
         egtb_progress_log("cache admission: database=%s mode=private reason=shared-budget retry=quiescent-pressure\n", entry_name(e));
         pthread_mutex_unlock(&p->mutex);
         return true; /* Explicit private-cache fallback when admission cannot fit. */
@@ -326,10 +359,23 @@ static bool coordinated_resize(DependencyResidentPool *p, ResidentEntry *e,
     uint64_t allocation = egtb_shared_cache_allocation(e->shared);
     uint64_t next = egtb_shared_cache_planned_allocation(e->backing, (size_t)bytes);
     if (next == allocation) return true;
-    if (next > p->shared_budget - p->shared_allocated) return false;
+    bool discard = p->active_trial && next > p->shared_budget - p->shared_allocated;
+    uint64_t fallback = egtb_shared_cache_planned_allocation(e->backing,
+        2 * (size_t)egtb_cache_page_size(e->backing));
+    if (discard) {
+        uint64_t free = p->shared_budget - p->shared_allocated;
+        if (fallback > free || next > free + allocation - fallback) return false;
+    } else if (next > p->shared_budget - p->shared_allocated) return false;
     double started = monotonic_seconds();
-    if (!egtb_shared_cache_resize(e->shared, (size_t)bytes)) return false;
-    p->growth_seconds += monotonic_seconds() - started;
+    bool ok = discard ? egtb_shared_cache_discard_resize(e->shared, (size_t)bytes) :
+                        egtb_shared_cache_resize(e->shared, (size_t)bytes);
+    double seconds = monotonic_seconds() - started;
+    p->growth_seconds += seconds;
+    /* Ignore tiny allocations dominated by timer/allocator startup noise. */
+    if (allocation + next >= 1048576 && seconds > 0) {
+        double cost = seconds / ((double)allocation + next);
+        if (cost > p->resize_seconds_per_byte) p->resize_seconds_per_byte = cost;
+    }
     p->shared_used = p->shared_used - old + egtb_shared_cache_bytes(e->shared);
     p->shared_allocated = p->shared_allocated - allocation +
                           egtb_shared_cache_allocation(e->shared);
@@ -338,7 +384,7 @@ static bool coordinated_resize(DependencyResidentPool *p, ResidentEntry *e,
     e->pressure_windows = e->cooldown_windows = 0;
     e->last_window_seconds = 0;
     e->last_window_lookups = e->last_window_decompressions = 0;
-    return true;
+    return ok;
 }
 
 static void finish_transfer(DependencyResidentPool *p, double now, bool rollback,
@@ -349,11 +395,13 @@ static void finish_transfer(DependencyResidentPool *p, double now, bool rollback
         uint64_t peak = p->shared_allocated + p->recovery_reserve;
         /* Undo receiver first: the preflight reserved this exact recovery path. */
         if (p->receiver && !coordinated_resize(p, p->receiver, p->receiver_bytes)) {
+            p->recovery_reserve = peak - p->shared_allocated;
             egtb_progress_log("cache rebalance: recovery deferred (receiver=%s): %s\n", entry_name(p->receiver), egtb_last_error());
             return;
         }
         p->recovery_reserve = peak - p->shared_allocated;
         if (!coordinated_resize(p, p->donor, p->donor_bytes)) {
+            p->recovery_reserve = peak - p->shared_allocated;
             egtb_progress_log("cache rebalance: recovery deferred (donor=%s): %s\n", entry_name(p->donor), egtb_last_error());
             return;
         }
@@ -367,9 +415,240 @@ static void finish_transfer(DependencyResidentPool *p, double now, bool rollback
                      (double)p->shared_allocated / 1048576);
     p->donor->resize_after = now + 300;
     if (p->receiver) p->receiver->resize_after = now + 60;
+    if (p->active_trial) {
+        if (p->trial_history) {
+            p->trial_history->failed = rollback;
+            p->trial_history->retry_after = now + 1800;
+        }
+        p->donor->sampled = false;
+        p->donor->last_window_seconds = p->donor->pressure_rate = 0;
+        p->donor->pressure_windows = 0;
+        if (p->receiver) {
+            p->receiver->sampled = false;
+            p->receiver->last_window_seconds = p->receiver->pressure_rate = 0;
+            p->receiver->pressure_windows = 0;
+        }
+    }
     p->donor = p->receiver = NULL;
     p->recovery_reserve = 0;
     p->rollback_requested = false;
+    p->active_trial = false;
+    p->trial_history = NULL;
+}
+
+static bool capacity_changed(uint64_t now, uint64_t before)
+{
+    uint64_t delta = now > before ? now-before : before-now;
+    return before && (long double)delta >= (long double)before / 4;
+}
+
+static ActiveHistory *active_history(DependencyResidentPool *p, ResidentEntry *d,
+                                     ResidentEntry *r)
+{
+    for (ActiveHistory *h=p->active_history;h;h=h->next)
+        if (h->donor==d && h->receiver==r) return h;
+    return NULL;
+}
+
+static bool active_retry_allowed(const ActiveHistory *h, uint64_t donor,
+                                  uint64_t receiver, double pressure, double now)
+{
+    return !h || !h->failed || (now>=h->retry_after &&
+        (capacity_changed(donor,h->donor_bytes) ||
+         capacity_changed(receiver,h->receiver_bytes) ||
+         (h->pressure>0 && pressure>=2*h->pressure)));
+}
+
+static void active_rejection(DependencyResidentPool *p, ResidentEntry *d,
+                              ResidentEntry *r, const char *reason, double now,
+                              double seconds, double savings)
+{
+    uint64_t signature = !strcmp(reason,"failed-pair-unchanged") ? 1 : 2;
+    if (!cache_policy_log_due(&r->active_log,now,signature,0)) return;
+    egtb_progress_log("cache active admission: phase=%s donor=%s receiver=%s decision=keep "
+        "reason=%s estimated-roundtrip-seconds=%.3f projected-saving-worker-s/s=%.6f "
+        "payback-window=300s (estimate, not measured benefit)\n",
+        p->phase,entry_name(d),entry_name(r),reason,seconds,savings);
+}
+
+static bool active_resize_affordable(DependencyResidentPool *p, uint64_t da,
+    uint64_t dn, uint64_t ra, uint64_t rn, uint64_t receiver_bytes,
+    uint64_t amount, double pressure, double *seconds, double *savings)
+{
+    /* Cold-start estimate: 4 GiB/s of old+new allocation footprint. Keep the
+     * larger measured cost once available, and budget a complete rollback too.
+     * This is deliberately a heuristic, not a miss-curve prediction. */
+    double cost=1.0/(4.0*1024*1024*1024);
+    if (p->resize_seconds_per_byte>cost) cost=p->resize_seconds_per_byte;
+    *seconds=2*((double)da+dn+ra+rn)*cost;
+    double fraction=(double)amount/receiver_bytes;
+    if (fraction>0.25) fraction=0.25;
+    *savings=pressure*fraction;
+    return *savings>0 && *savings*300 > *seconds*p->workers;
+}
+
+/* Active transfers use discard-resize when overlap cannot fit. Reserve the
+ * larger endpoint plus a minimal fallback for either cache, including metadata.
+ * No admissions or other resizing run while this experiment is outstanding. */
+static bool start_active_transfer(DependencyResidentPool *p, ResidentEntry *r, double now)
+{
+    if (!p->rebalance || p->donor || !r || now < r->resize_after ||
+        r->pending_measurement || r->last_window_seconds <= 0) return false;
+    ResidentEntry *best = NULL;
+    double lowest = 0;
+    for (ResidentEntry *d=p->entries; d; d=d->next) {
+        if (!d->shared || d==r || !d->sampled || d->pending_measurement ||
+            now<d->resize_after || !d->window_lookups || d->last_window_seconds<=0 ||
+            d->cost_samples<16 || d->last_window_lookups<100000) continue;
+        uint64_t bytes=egtb_shared_cache_bytes(d->shared);
+        uint64_t step=bytes/20;
+        uint64_t q=2*(uint64_t)egtb_cache_page_size(d->backing);
+        if (step>p->shared_budget/100) step=p->shared_budget/100;
+        if (step>egtb_shared_cache_bytes(r->shared)/2)
+            step=egtb_shared_cache_bytes(r->shared)/2;
+        step=step/q*q;
+        /* A tiny reclaimed cache must not hide a usable large donor. */
+        if (!step || bytes-step<p->shared_bytes) continue;
+        double load=d->baseline_rate*d->decode_ns;
+        if (load*4 >= r->baseline_rate*r->decode_ns) continue;
+        double pressure=r->baseline_rate*r->decode_ns/1e9;
+        uint64_t rb=egtb_shared_cache_bytes(r->shared);
+        if (!active_retry_allowed(active_history(p,d,r),bytes,rb,pressure,now)) {
+            active_rejection(p,d,r,"failed-pair-unchanged",now,0,0);
+            continue;
+        }
+        double seconds,savings;
+        if (!active_resize_affordable(p,egtb_shared_cache_allocation(d->shared),
+                egtb_shared_cache_planned_allocation(d->backing,(size_t)(bytes-step)),
+                egtb_shared_cache_allocation(r->shared),
+                egtb_shared_cache_planned_allocation(r->backing,(size_t)(rb+step)),
+                rb,step,pressure,&seconds,&savings)) {
+            active_rejection(p,d,r,"resize-cost-payback",now,seconds,savings);
+            continue;
+        }
+        if (!best || load<lowest) { best=d; lowest=load; }
+    }
+    if (!best) return false;
+    uint64_t old=egtb_shared_cache_bytes(best->shared);
+    uint64_t rold=egtb_shared_cache_bytes(r->shared);
+    uint64_t amount=old/20;
+    if (amount>p->shared_budget/100) amount=p->shared_budget/100;
+    if (amount>rold/2) amount=rold/2;
+    uint64_t quantum=2*(uint64_t)egtb_cache_page_size(best->backing);
+    amount=amount/quantum*quantum;
+    if (!amount || old-amount<p->shared_bytes || rold>SIZE_MAX-amount) return false;
+    uint64_t da=egtb_shared_cache_allocation(best->shared);
+    uint64_t ra=egtb_shared_cache_allocation(r->shared);
+    uint64_t dn=egtb_shared_cache_planned_allocation(best->backing,(size_t)(old-amount));
+    uint64_t rn=egtb_shared_cache_planned_allocation(r->backing,(size_t)(rold+amount));
+    if (dn>=da || rn<=ra) return false;
+    uint64_t final=p->shared_allocated-da+dn-ra+rn;
+    uint64_t peak=final>p->shared_allocated ? final : p->shared_allocated;
+    uint64_t fallback=egtb_shared_cache_planned_allocation(best->backing,(size_t)quantum);
+    uint64_t rf=egtb_shared_cache_planned_allocation(r->backing,
+        2*(size_t)egtb_cache_page_size(r->backing));
+    if (rf>fallback) fallback=rf;
+    if (peak>p->shared_budget || fallback>p->shared_budget-peak) return false;
+    peak+=fallback;
+    ActiveHistory *history=active_history(p,best,r);
+    if (!history) {
+        history=calloc(1,sizeof(*history));
+        if (!history) return false; /* No mutation unless outcome can be remembered. */
+        history->donor=best; history->receiver=r;
+        history->next=p->active_history; p->active_history=history;
+    }
+    history->donor_bytes=old; history->receiver_bytes=rold;
+    history->pressure=r->baseline_rate*r->decode_ns/1e9;
+    p->trial_history=history;
+    p->active_trial=true;
+    p->donor=best; p->receiver=r;
+    p->donor_bytes=old; p->receiver_bytes=rold;
+    p->trial_windows=0; p->trial_time=now; p->trial_deadline=now+180;
+    ResidentEntry *entries[2]={best,r};
+    for (unsigned k=0;k<2;++k) {
+        ResidentEntry *e=entries[k];
+        p->trial_cost[k]=e->baseline_density*e->decode_ns/1e6;
+        p->trial_rate[k]=e->last_window_lookups/e->last_window_seconds;
+        p->trial_total_lookups[k]=p->trial_total_decodes[k]=0;
+        p->trial_total_samples[k]=p->trial_total_ns[k]=0;
+        EgtbCacheStatistics s;
+        egtb_shared_cache_statistics(e->shared,&s);
+        p->trial_lookups[k]=s.lookups; p->trial_decodes[k]=s.decompressions;
+        egtb_shared_cache_timing(e->shared,&p->trial_samples[k],&p->trial_ns[k]);
+    }
+    double started=p->growth_seconds;
+    bool ok=coordinated_resize(p,best,old-amount);
+    p->recovery_reserve=peak-p->shared_allocated;
+    if (ok) ok=coordinated_resize(p,r,rold+amount);
+    p->recovery_reserve=peak-p->shared_allocated;
+    p->trial_resize_seconds=p->growth_seconds-started;
+    if (!ok) { finish_transfer(p,now,true,"active allocation failed"); return true; }
+    ++p->shrinks; ++p->growths; ++p->transfers;
+    egtb_progress_log("cache active transfer: phase=%s donor=%s receiver=%s donor-MiB=%.2f->%.2f "
+        "receiver-MiB=%.2f->%.2f reserve-MiB=%.2f deadline=180s\n",p->phase,
+        entry_name(best),entry_name(r),(double)old/1048576,
+        (double)egtb_shared_cache_bytes(best->shared)/1048576,(double)rold/1048576,
+        (double)egtb_shared_cache_bytes(r->shared)/1048576,(double)p->recovery_reserve/1048576);
+    return true;
+}
+
+static void measure_active_transfer(DependencyResidentPool *p, double now)
+{
+    if (p->rollback_requested || now>=p->trial_deadline) {
+        finish_transfer(p,now,true,p->rollback_requested ? "deferred recovery" : "active trial inconclusive");
+        return;
+    }
+    ResidentEntry *entries[2]={p->donor,p->receiver};
+    EgtbCacheStatistics s[2]; uint64_t samples[2],ns[2];
+    for (unsigned k=0;k<2;++k) {
+        egtb_shared_cache_statistics(entries[k]->shared,&s[k]);
+        egtb_shared_cache_timing(entries[k]->shared,&samples[k],&ns[k]);
+        if (s[k].lookups<p->trial_lookups[k] || s[k].decompressions<p->trial_decodes[k] ||
+            samples[k]<p->trial_samples[k] || ns[k]<p->trial_ns[k] || now<p->trial_time) {
+            finish_transfer(p,now,true,"active counters reset"); return;
+        }
+    }
+    if (now-p->trial_time<5 || s[0].lookups-p->trial_lookups[0]<100000 ||
+        s[1].lookups-p->trial_lookups[1]<100000) return;
+    for (unsigned k=0;k<2;++k) {
+        if (p->trial_windows) {
+            p->trial_total_lookups[k]+=s[k].lookups-p->trial_lookups[k];
+            p->trial_total_decodes[k]+=s[k].decompressions-p->trial_decodes[k];
+            p->trial_total_samples[k]+=samples[k]-p->trial_samples[k];
+            p->trial_total_ns[k]+=ns[k]-p->trial_ns[k];
+        }
+        p->trial_lookups[k]=s[k].lookups; p->trial_decodes[k]=s[k].decompressions;
+        p->trial_samples[k]=samples[k]; p->trial_ns[k]=ns[k];
+    }
+    p->trial_time=now;
+    if (++p->trial_windows<3) return; /* One refill window, then two measurement windows. */
+    double after[2];
+    for (unsigned k=0;k<2;++k) {
+        if (p->trial_total_decodes[k]>=256 && p->trial_total_samples[k]<16) {
+            finish_transfer(p,now,true,"active timing inconclusive"); return;
+        }
+        double cost=p->trial_total_samples[k] ?
+            (double)p->trial_total_ns[k]/p->trial_total_samples[k] : entries[k]->decode_ns;
+        after[k]=(double)p->trial_total_decodes[k]/p->trial_total_lookups[k]*cost;
+    }
+    /* Normalize to pre-trial traffic: faster lookup throughput is not a cost
+     * regression. This remains observational evidence, not a controlled replay. */
+    double penalty=(after[0]-p->trial_cost[0])*p->trial_rate[0]/1e9;
+    double saving=(p->trial_cost[1]-after[1])*p->trial_rate[1]/1e9;
+    if (penalty<0) penalty=0; /* Do not credit an unrelated donor improvement. */
+    bool accept=saving>penalty*1.1 && saving>0 &&
+        (saving-penalty)*300>p->trial_resize_seconds*p->workers;
+    egtb_progress_log("cache active measurement: donor=%s receiver=%s added-worker-s/s=%.6f "
+        "saved-worker-s/s=%.6f resize-seconds=%.6f decision=%s (observed workload)\n",
+        entry_name(p->donor),entry_name(p->receiver),penalty,saving,p->trial_resize_seconds,
+        accept ? "accept" : "rollback");
+    if (accept) {
+        if (p->donor->loan_base>=egtb_shared_cache_bytes(p->donor->shared))
+            p->donor->loan_base=0;
+        /* A transferred allocation is owned capacity, not a headroom loan. */
+        p->receiver->loan_base=0;
+    }
+    finish_transfer(p,now,!accept,accept ? "active net benefit" : "active net benefit insufficient");
 }
 
 static bool start_transfer(DependencyResidentPool *p, ResidentEntry *receiver,
@@ -461,25 +740,20 @@ static const char *idle_reclaim_reason(DependencyResidentPool *p, ResidentEntry 
     return "eligible-if-receiver-needs-memory";
 }
 
-static bool reclaim_idle(DependencyResidentPool *p, ResidentEntry *receiver, double now)
+static bool reclaim_idle_entry(DependencyResidentPool *p, ResidentEntry *best,
+                               ResidentEntry *receiver, double now)
 {
-    ResidentEntry *best = NULL;
-    uint64_t largest = 0;
-    for (ResidentEntry *e = p->entries; e; e = e->next) {
-        if (!e->shared || e == receiver ||
-            strcmp(idle_reclaim_reason(p,e,now), "eligible-if-receiver-needs-memory")) continue;
-        uint64_t allocation = egtb_shared_cache_allocation(e->shared);
-        if (allocation > largest) { best = e; largest = allocation; }
-    }
-    if (!best) return false;
+    uint64_t largest = egtb_shared_cache_allocation(best->shared);
     uint64_t floor = p->shared_bytes < 1048576 ? p->shared_bytes : 1048576;
     uint64_t old = egtb_shared_cache_bytes(best->shared);
+    uint64_t remembered = best->loan_base ? best->loan_base : old;
     double started = monotonic_seconds();
     bool ok = egtb_shared_cache_discard_resize(best->shared, (size_t)floor);
     p->growth_seconds += monotonic_seconds() - started;
     uint64_t actual = egtb_shared_cache_bytes(best->shared);
-    if (actual < old && old > best->recovery_payload)
-        best->recovery_payload = old;
+    if (best->loan_base && actual <= best->loan_base) best->loan_base = 0;
+    if (actual < remembered && remembered > best->recovery_payload)
+        best->recovery_payload = remembered;
     p->shared_used = p->shared_used - old + actual;
     p->shared_allocated = p->shared_allocated - largest + egtb_shared_cache_allocation(best->shared);
     best->sampled = best->pending_measurement = false;
@@ -492,6 +766,74 @@ static bool reclaim_idle(DependencyResidentPool *p, ResidentEntry *receiver, dou
         "result=%s recovery=lazy-refill-no-reservation\n",entry_name(best),entry_name(receiver),
         now-best->last_activity,(double)old/1048576,(double)actual/1048576,
         (double)p->shared_allocated/1048576,ok ? "reclaimed" : "allocation-failed-fallback");
+    return true;
+}
+
+static bool reclaim_idle(DependencyResidentPool *p, ResidentEntry *receiver, double now)
+{
+    ResidentEntry *best = NULL;
+    uint64_t largest = 0;
+    for (ResidentEntry *e = p->entries; e; e = e->next) {
+        if (!e->shared || e == receiver ||
+            strcmp(idle_reclaim_reason(p,e,now), "eligible-if-receiver-needs-memory")) continue;
+        uint64_t allocation = egtb_shared_cache_allocation(e->shared);
+        if (allocation > largest) { best = e; largest = allocation; }
+    }
+    return best ? reclaim_idle_entry(p,best,receiver,now) : false;
+}
+
+/* Repay only explicit loans, never an arbitrary active cache. All probes are
+ * quiescent. Migration preserves surviving entries when the overlap fits;
+ * otherwise discard-resize needs only its minimal failure fallback. */
+static bool repay_headroom(DependencyResidentPool *p, ResidentEntry *receiver, double now)
+{
+    if (p->policy != CACHE_IDLE_RECLAIM || p->donor) return false;
+    ResidentEntry *e = NULL;
+    for (ResidentEntry *it=p->entries; it; it=it->next)
+        if (it != receiver && it->shared && it->loan_base) { e=it; break; }
+    if (!e) return false;
+    /* Avoid rebuilding the protected base only to reclaim it immediately.
+     * The normal idle grace, assessment and resize guards still apply. */
+    if (!strcmp(idle_reclaim_reason(p,e,now), "eligible-if-receiver-needs-memory")) {
+        uint64_t protected_base=e->loan_base;
+        bool acted=reclaim_idle_entry(p,e,receiver,now);
+        if (acted && !e->loan_base) {
+            ++p->loan_repayments;
+            p->borrow_after=now+60;
+        }
+        egtb_progress_log("cache headroom idle repayment: database=%s receiver=%s "
+            "strategy=direct-idle-reclaim protected-MiB=%.2f payload-MiB=%.2f "
+            "result=%s\n",entry_name(e),entry_name(receiver),
+            (double)protected_base/1048576,(double)egtb_shared_cache_bytes(e->shared)/1048576,
+            e->loan_base ? "loan-retained" : "repaid");
+        return acted;
+    }
+    uint64_t old=egtb_shared_cache_bytes(e->shared);
+    uint64_t allocation=egtb_shared_cache_allocation(e->shared);
+    uint64_t target=e->loan_base;
+    uint64_t free_bytes=p->shared_budget-p->shared_allocated;
+    uint64_t minimum=egtb_shared_cache_planned_allocation(e->backing,
+        2*(size_t)egtb_cache_page_size(e->backing));
+    if (free_bytes < minimum) return false;
+    bool migrate=egtb_shared_cache_planned_allocation(e->backing,(size_t)target)<=free_bytes;
+    double started=monotonic_seconds();
+    bool ok=migrate ? egtb_shared_cache_resize(e->shared,(size_t)target) :
+                      egtb_shared_cache_discard_resize(e->shared,(size_t)target);
+    double seconds=monotonic_seconds()-started;
+    uint64_t actual=egtb_shared_cache_bytes(e->shared);
+    p->shared_used=p->shared_used-old+actual;
+    p->shared_allocated=p->shared_allocated-allocation+egtb_shared_cache_allocation(e->shared);
+    p->growth_seconds+=seconds;
+    if (actual<=target) { e->loan_base=0; ++p->loan_repayments; }
+    /* A failed replacement can leave the minimal fallback; remember only the
+     * protected base, not the loan, for subsequent recovery. */
+    if (actual<target && e->recovery_payload<target) e->recovery_payload=target;
+    e->sampled=e->pending_measurement=false;
+    e->pressure_windows=e->cooldown_windows=0;
+    p->borrow_after=now+60;
+    egtb_progress_log("cache headroom repayment: database=%s receiver=%s payload-MiB=%.2f->%.2f strategy=%s result=%s seconds=%.6f borrow-cooldown=60s\n",
+        entry_name(e),entry_name(receiver),(double)old/1048576,(double)actual/1048576,
+        migrate ? "migrate" : "discard-refill",ok ? "repaid" : "allocation-failed",seconds);
     return true;
 }
 
@@ -565,7 +907,7 @@ static bool maintain_private(DependencyResidentPool *p, double now)
             !pressure ? "below-load-floor" : e->private_windows<2 ? "collecting-pressure-windows" :
             now<e->admission_retry_after ? "allocation-cooldown" :
             allocation>p->shared_budget ? "initial-cache-exceeds-budget" :
-            allocation>p->shared_budget-p->shared_allocated-p->recovery_reserve ? "capacity-blocked" : "funded";
+            allocation>admission_available(p) ? "capacity-blocked" : "funded";
         if (cache_policy_log_due(&e->private_log,now,qualified ? 1 : 0,allocation))
             egtb_progress_log("cache private pressure: phase=%s database=%s lookups=%" PRIu64
                 " decompressions=%" PRIu64 " elapsed=%.3f load-share=%.3f%% timed-loads=%" PRIu64
@@ -581,9 +923,9 @@ static bool maintain_private(DependencyResidentPool *p, double now)
     }
     if (!best || p->donor) return false;
     uint64_t needed=egtb_shared_cache_planned_allocation(best->backing,(size_t)p->shared_bytes);
-    if (needed>p->shared_budget-p->shared_allocated-p->recovery_reserve) {
-        if (!reclaim_idle(p,best,now)) return false;
-        if (needed>p->shared_budget-p->shared_allocated-p->recovery_reserve) return true;
+    if (needed>admission_available(p)) {
+        if (!repay_headroom(p,best,now) && !reclaim_idle(p,best,now)) return false;
+        if (needed>admission_available(p)) return true;
     }
     admit_private(p,best,now);
     return true;
@@ -621,7 +963,13 @@ void dependency_shared_phase_at(DependencyResidentPool *p, double now)
         e->window_lookups = 0; e->activity_elapsed = 0;
         e->previous_lookups = s.lookups;
         e->previous_decompressions = s.decompressions;
-        e->sampled = e->pending_measurement = false;
+        e->pending_measurement = false;
+        /* A reclaimed cache has a known target capacity. Start measuring at
+         * the boundary instead of discarding its first interval as warm-up. */
+        e->sampled = p->policy == CACHE_IDLE_RECLAIM && e->recovery_payload >
+                     egtb_shared_cache_bytes(e->shared);
+        e->previous_time = now;
+        e->cost_samples = 0; /* Recovery must use fresh timed loads. */
         e->pressure_windows = e->cooldown_windows = 0;
         e->pressure_rate = e->last_window_seconds = 0;
         e->last_window_lookups = e->last_window_decompressions = 0;
@@ -648,20 +996,45 @@ void dependency_shared_phase(void *context, const char *phase)
 
 typedef struct {
     uint64_t payload, allocation, unfunded_payload;
+    bool borrowed;
     double floor, score, unfunded_score;
     const char *reason;
 } CacheDecision;
 
 /* Pure decision function: all alternatives see identical measurements and
  * allocation state. Only the selected policy's result reaches the executor. */
+/* Allocation budgets include metadata; round down to a realizable cache size.
+ * Comparing an actual allocation against the unrounded budget can otherwise
+ * recall a loan forever for a fraction of a page that cannot be allocated. */
+static uint64_t returning_bootstrap(DependencyResidentPool *p, ResidentEntry *e)
+{
+    uint64_t budget=p->shared_budget/80;
+    uint64_t initial=egtb_shared_cache_planned_allocation(e->backing,(size_t)p->shared_bytes);
+    uint64_t minimum=egtb_shared_cache_planned_allocation(e->backing,
+        4*(size_t)egtb_cache_page_size(e->backing));
+    if (budget<initial) budget=initial;
+    if (budget<minimum) budget=minimum;
+    uint64_t lo=0, hi=e->recovery_payload;
+    while (lo<hi) {
+        uint64_t mid=lo+(hi-lo)/2+(hi-lo)%2;
+        if (egtb_shared_cache_planned_allocation(e->backing,(size_t)mid)<=budget) lo=mid;
+        else hi=mid-1;
+    }
+    return egtb_shared_cache_planned_allocation(e->backing,(size_t)lo);
+}
+
 static CacheDecision policy_decide(DependencyResidentPool *p, ResidentEntry *e,
-                                   CachePolicy policy)
+                                   CachePolicy policy, double now)
 {
     CacheDecision d = {.floor = p->minimum_load_share, .reason = "below-load-threshold"};
     uint64_t current = egtb_shared_cache_allocation(e->shared);
     uint64_t old = egtb_shared_cache_bytes(e->shared);
-    uint64_t available = p->shared_budget > p->shared_allocated ?
-                         p->shared_budget - p->shared_allocated : 0;
+    uint64_t available = admission_available(p);
+    uint64_t physical_available = available;
+    /* Admission can use the whole pool; growth cannot consume its last 5%.
+     * This is allocation (metadata included), not a second memory allocation. */
+    uint64_t admission_headroom = policy == CACHE_IDLE_RECLAIM ? p->shared_budget / 20 : 0;
+    available = available > admission_headroom ? available - admission_headroom : 0;
     uint64_t quantum = 2 * (uint64_t)egtb_cache_page_size(e->backing);
     /* Ordinary growth may discard old contents at the quiescent checkpoint.
      * Reserve a tiny fallback so allocation failure never strands probes. The
@@ -686,6 +1059,35 @@ static CacheDecision policy_decide(DependencyResidentPool *p, ResidentEntry *e,
         shared_cache_cost_eligible(e->pressure_rate, e->decode_ns,
             e->cost_samples, p->workers, p->minimum_load_share);
     if (recovery) payload = e->recovery_payload;
+    bool recovery_headroom = false;
+    if (recovery) {
+        /* Reclaimed caches are already admitted, but need the same bootstrap
+         * opportunity as new admissions. Bound the allocation ceiling so one
+         * returning cache cannot take all the reserved headroom. */
+        uint64_t bootstrap = returning_bootstrap(p,e);
+        uint64_t physical_capacity = physical_available >= fallback ?
+            physical_available + current - fallback : physical_available;
+        if (bootstrap > physical_capacity) bootstrap = physical_capacity;
+        if (bootstrap > capacity_budget) {
+            capacity_budget = bootstrap;
+            recovery_headroom = true;
+        }
+    }
+    uint64_t protected_capacity = capacity_budget;
+    bool loan_available = policy == CACHE_IDLE_RECLAIM && p->rebalance &&
+        now >= p->borrow_after && !p->donor &&
+        egtb_shared_cache_planned_allocation(e->backing,(size_t)(old+quantum))>protected_capacity;
+    for (ResidentEntry *it=p->entries; loan_available && it; it=it->next)
+        if ((it != e && it->loan_base) ||
+            (!it->shared && it->private_windows>=2 && now>=it->admission_retry_after)) loan_available=false;
+    /* Loans require the normal cost floor, not the relaxed spare-budget floor.
+     * A single borrower bounds repayment work at a checkpoint. */
+    if (loan_available && shared_cache_cost_eligible(e->pressure_rate,e->decode_ns,
+            e->cost_samples,p->workers,p->minimum_load_share)) {
+        uint64_t physical_capacity=physical_available>=fallback ?
+            physical_available+current-fallback : physical_available;
+        if (physical_capacity>capacity_budget) capacity_budget=physical_capacity;
+    }
     /* A dense jump is allowed only if the complete new allocation consumes at
      * most half the currently free pool; old storage still coexists with it. */
     if (policy != CACHE_COST_GATED && funded) {
@@ -710,7 +1112,8 @@ static CacheDecision policy_decide(DependencyResidentPool *p, ResidentEntry *e,
     d.allocation = egtb_shared_cache_planned_allocation(e->backing, (size_t)lo);
     if (d.allocation <= current) { d.reason = "capacity-budget"; d.payload = 0; return d; }
     d.score = shared_cache_cost_score(e->pressure_rate, e->decode_ns, d.allocation - current);
-    d.reason = recovery ? "returning-idle-cache" :
+    d.borrowed = d.allocation > protected_capacity;
+    d.reason = d.borrowed ? "borrow-admission-headroom" : recovery_headroom ? "returning-cache-admission-headroom" : recovery ? "returning-idle-cache" :
         policy != CACHE_COST_GATED && funded ? "spare-budget" : "load-cost";
     /* Report a bounded actual payload, even for the SIZE_MAX dense request. */
     uint64_t full = egtb_shared_cache_planned_allocation(e->backing, SIZE_MAX);
@@ -809,6 +1212,11 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
         }
         e->activity_lookups = s.lookups;
     }
+    if (p->active_trial) {
+        measure_active_transfer(p,now);
+        pthread_mutex_unlock(&p->mutex);
+        return;
+    }
     if (p->donor && (p->rollback_requested || donor_under_pressure(p, now))) {
         finish_transfer(p, now, true, p->rollback_requested ? "deferred recovery" : "donor pressure");
         pthread_mutex_unlock(&p->mutex);
@@ -831,6 +1239,8 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
     uint64_t unfunded_payload = 0;
     double unfunded_score = 0;
     uint64_t best_payload = 0, best_allocation = 0;
+    bool best_borrowed = false;
+    ResidentEntry *returning_waiter = NULL;
     double best_score = 0, best_rate = 0, best_density = 0;
     double best_floor = p->minimum_load_share;
     ResidentEntry *policy_best[CACHE_POLICY_COUNT] = {0};
@@ -947,18 +1357,38 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             continue;
         }
         /* Ignore small/cold samples and implicit-draw misses, regardless of hit rate. */
-        const char *guard = e->pressure_windows < 2 ? "insufficient-pressure-windows" :
+        bool returning = p->policy == CACHE_IDLE_RECLAIM &&
+            e->recovery_payload > egtb_shared_cache_bytes(e->shared);
+        const char *guard = e->pressure_windows < (returning ? 1u : 2u) ? "insufficient-pressure-windows" :
             egtb_shared_cache_dense(e->shared) ? "dense" :
             now < e->resize_after && p->policy != CACHE_IDLE_RECLAIM ? "resize-protection" : NULL;
         if (guard) { policy_guard_log(p,e,guard,now); continue; }
         CacheDecision decisions[CACHE_POLICY_COUNT];
         for (unsigned i=0; i<CACHE_POLICY_COUNT; ++i) {
-            CacheDecision d = policy_decide(p,e,(CachePolicy)i);
+            CacheDecision d = policy_decide(p,e,(CachePolicy)i,now);
             decisions[i] = d;
             if (d.score > policy_choice[i].score) {
                 policy_best[i] = e; policy_choice[i] = d;
             }
             if (i != (unsigned)p->policy) continue;
+            /* A returning cache below its bootstrap ceiling has priority over
+             * a loan, even when some partial growth would already fit. */
+            uint64_t bootstrap=returning_bootstrap(p,e);
+            uint64_t fallback=egtb_shared_cache_planned_allocation(e->backing,
+                2*(size_t)egtb_cache_page_size(e->backing));
+            uint64_t free_now=admission_available(p);
+            uint64_t capacity=free_now>=fallback ?
+                free_now+egtb_shared_cache_allocation(e->shared)-fallback : free_now;
+            uint64_t after_repayment=capacity;
+            for (ResidentEntry *borrower=p->entries; borrower; borrower=borrower->next) {
+                if (borrower==e || !borrower->shared || !borrower->loan_base) continue;
+                after_repayment+=egtb_shared_cache_allocation(borrower->shared)-
+                    egtb_shared_cache_planned_allocation(borrower->backing,(size_t)borrower->loan_base);
+            }
+            if (returning && egtb_shared_cache_allocation(e->shared)<bootstrap &&
+                capacity<bootstrap && after_repayment>=bootstrap &&
+                shared_cache_cost_eligible(e->pressure_rate,e->decode_ns,e->cost_samples,
+                    p->workers,p->minimum_load_share)) returning_waiter=e;
             if (d.unfunded_score > unfunded_score) {
                 unfunded = e; unfunded_payload = d.unfunded_payload; unfunded_score = d.unfunded_score;
             }
@@ -966,6 +1396,7 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
                 best = e; best_score = d.score; best_payload = d.payload;
                 best_allocation = d.allocation; best_rate = before_rate; best_density = before_density;
                 best_floor = d.floor;
+                best_borrowed = d.borrowed;
             }
         }
         policy_log(p,e,decisions,now);
@@ -985,8 +1416,12 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
         pthread_mutex_unlock(&p->mutex);
         return; /* One reversible experiment at a time. */
     }
+    if (returning_waiter && repay_headroom(p,returning_waiter,now)) {
+        pthread_mutex_unlock(&p->mutex);
+        return;
+    }
     if (!best && p->policy == CACHE_IDLE_RECLAIM) {
-        if (unfunded) reclaim_idle(p, unfunded, now);
+        if (unfunded && !reclaim_idle(p, unfunded, now)) start_active_transfer(p,unfunded,now);
         pthread_mutex_unlock(&p->mutex);
         return; /* No reversible idle-only trials under this experimental policy. */
     }
@@ -1015,6 +1450,12 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
             if (growth_seconds < 0) growth_seconds = 0;
             p->growth_seconds += growth_seconds;
             uint64_t actual = egtb_shared_cache_bytes(best->shared);
+            if (!best_borrowed && best->loan_base && actual>old)
+                best->loan_base+=actual-old; /* Ordinary capacity is not part of the loan. */
+            if (best_borrowed && !best->loan_base) best->loan_base=old;
+            if (best_borrowed)
+                egtb_progress_log("cache headroom loan: database=%s protected-MiB=%.2f payload-MiB=%.2f repay-on=qualified-admission-or-return\n",
+                    entry_name(best),(double)best->loan_base/1048576,(double)actual/1048576);
             if (best->recovery_payload > old) {
                 egtb_progress_log("cache recovery: database=%s previous-MiB=%.2f current-MiB=%.2f->%.2f result=%s\n",
                     entry_name(best), (double)best->recovery_payload/1048576,
@@ -1043,6 +1484,7 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
                 100 * shared_cache_load_share(best->pressure_rate, best->decode_ns, p->workers),
                 100 * best_floor, p->workers);
         } else {
+            if (best->loan_base && actual_bytes<=best->loan_base) best->loan_base=0;
             best->stopped = true; /* Usable old or minimal fallback cache remains. */
             egtb_progress_log("shared dependency cache growth skipped: database=%s remaining-MiB=%.2f: %s\n",
                 entry_name(best), (double)actual_bytes / 1048576, egtb_last_error());
@@ -1118,8 +1560,13 @@ void dependency_shared_coordinator_statistics(DependencyResidentPool *p,
                                               DependencyCoordinatorStatistics *out)
 {
     pthread_mutex_lock(&p->mutex);
-    *out = (DependencyCoordinatorStatistics){p->shared_allocated, p->recovery_reserve,
-        p->shrinks, p->transfers, p->rollbacks, p->donor != NULL};
+    *out = (DependencyCoordinatorStatistics){.allocated=p->shared_allocated,
+        .recovery_reserve=p->recovery_reserve, .shrinks=p->shrinks,
+        .transfers=p->transfers, .rollbacks=p->rollbacks, .assessing=p->donor != NULL,
+        .loan_repayments=p->loan_repayments};
+    for (ResidentEntry *e=p->entries; e; e=e->next)
+        if (e->shared && e->loan_base)
+            out->borrowed_payload+=egtb_shared_cache_bytes(e->shared)-e->loan_base;
     pthread_mutex_unlock(&p->mutex);
 }
 
@@ -1174,6 +1621,14 @@ void dependency_resident_report(DependencyResidentPool *p)
     if (p->shared_budget)
         printf("shared-cache growth admission: minimum-load-share=%.3f%% minimum-timed-loads=16 growth-factor=%.3f one-growth-per-checkpoint\n",
                100 * p->minimum_load_share, p->growth_factor);
+    if (p->shared_budget && p->policy == CACHE_IDLE_RECLAIM)
+        printf("shared-cache admission headroom: %.2f MiB (5%%; reclaimable loan after pressure qualification; one borrower; repayment cooldown=60s); returning-cache pressure-windows=1\n",
+               (double)(p->shared_budget / 20) / 1048576);
+    for (ResidentEntry *e=p->entries; e; e=e->next)
+        if (e->shared && e->loan_base)
+            printf("shared-cache outstanding loan: database=%s protected-MiB=%.2f borrowed-payload-MiB=%.2f\n",
+                entry_name(e),(double)e->loan_base/1048576,
+                (double)(egtb_shared_cache_bytes(e->shared)-e->loan_base)/1048576);
     pthread_mutex_unlock(&p->mutex);
 }
 
@@ -1191,5 +1646,10 @@ void dependency_resident_destroy(DependencyResidentPool *p)
     }
     pthread_cond_destroy(&p->changed);
     pthread_mutex_destroy(&p->mutex);
+    while (p->active_history) {
+        ActiveHistory *next=p->active_history->next;
+        free(p->active_history);
+        p->active_history=next;
+    }
     free(p);
 }

@@ -504,6 +504,16 @@ slice. Captures and promotions continue to use normal material dependencies.
 Each slice uses compact compilation and mandatory full read-only verification,
 with automatic consistency repair only as a mismatch fallback.
 
+For traversal experiments, `EGTB_SLICE_ORDER` accepts `row` (the default),
+`column`, `tile2`, `tile3`, or `diagonal`. Coordinates run away from promotion;
+every order completes both forward-move slice dependencies first. Tiles are
+2-by-2 or 3-by-3, processed row-first both between and within tiles. Diagonal
+order processes increasing sums of the two coordinates. Checkpoint names and
+the merged file format are unchanged, so traversal can change on resume.
+This option does not retain private slice caches across slice boundaries.
+`benchmark_slice_order.sh` compares all five orders against an unsliced reference
+using real dependencies, full verification, histogram checks and repeated runs.
+
 Slice indices are independently dense. Their position counts sum exactly to
 the normal full-index count. Empty slices are omitted: six or more men cannot
 fit behind a frontier on their final single row. After every nonempty slice
@@ -812,6 +822,8 @@ export EGTB_DEPENDENCY_CACHE_POLICY=cost-gated-v1  # Default
 # Alternative experiment:
 # export EGTB_DEPENDENCY_CACHE_POLICY=spare-budget-v1
 # export EGTB_DEPENDENCY_CACHE_POLICY=idle-reclaim-v1
+# Experimental slice traversal; default remains row-first.
+# export EGTB_SLICE_ORDER=tile2  # row | column | tile2 | tile3 | diagonal
 ```
 
 `cost-gated-v1` retains the existing load-cost admission and fractional growth.
@@ -852,12 +864,90 @@ performing these admissions.
 Revision 3.603 remembers the capacity discarded by idle reclamation. If that
 dependency becomes busy again, fresh pressure measurements that clear the normal
 load-share floor allow `idle-reclaim-v1` to request its previous capacity directly,
-instead of repeating the growth ladder from 1 MiB. The normal warm-up, two pressure
-windows, timed-sample requirement, budget/metadata/fallback accounting, and
-post-growth assessment still apply. A budget-limited partial recovery retains the
+instead of repeating the growth ladder from 1 MiB. Revision 3.605 starts returning-cache
+measurement at the phase boundary and requires one substantial pressure window
+(100,000 lookups, 1,000 decompressions and 16 fresh timed samples), rather than
+warm-up followed by two windows. Ordinary growth still uses two windows.
+Budget/metadata/fallback accounting and post-growth assessment still apply.
+A budget-limited partial recovery retains the
 target for a later pressure-qualified attempt; full recovery clears it. The hint
 survives phase changes but reserves no memory and cannot evict an active cache.
 `cache recovery` log lines report the remembered capacity and actual result.
+
+Under `idle-reclaim-v1`, growth leaves 5% of the shared allocation budget free
+for new admissions (metadata included). Admissions may consume this headroom;
+it is not extra RAM or a guarantee that every dependency will fit. From 3.606,
+pressure-qualified reclaimed caches may also use it to bootstrap recovery. The
+allocation ceiling is the larger of the initial allocation, one quarter of the
+headroom, and the minimum two-slot-per-side allocation, bounded by the remembered
+target and actual free budget (including metadata and failure fallback). Logs
+identify this as `returning-cache-admission-headroom`. This prevents a returning
+1 MiB cache being blocked solely because it is already admitted; it does not
+promise full recovery or solve competition between active caches. Existing
+active caches are not arbitrarily shrunk to restore the margin.
+From 3.607, `idle-reclaim-v1` with rebalancing enabled can lend unused headroom
+to one cache once ordinary growth is capacity-blocked and fresh measured cost
+clears the normal admission floor. The cache's pre-loan payload is recorded.
+Qualified private admissions and returning caches below their bootstrap ceiling
+can recall that loan at a quiescent checkpoint, even while the borrower is active.
+Only loaned capacity is recalled, not the protected base. Migration preserves
+surviving entries when overlap fits; otherwise discard/refill avoids exceeding
+the budget but can make the entire borrower cold. Allocation failure retains a
+usable cache and records any missing base capacity for recovery. Borrowing pauses
+for 60 seconds after repayment and while a qualified private admission is pending.
+Logs report `cache headroom loan` and `cache headroom repayment`, including the
+repayment method and elapsed time. This is experimental: refill and resize costs
+may outweigh the benefit; lower miss counts alone do not establish a speedup.
+From 3.608, recovery and loan recall use the same page-realizable bootstrap
+allocation. A sub-page remainder in the budget cannot trigger repeated loan
+repayments after a returning cache has already reached that target.
+From 3.609, a borrower already eligible for idle reclamation is reduced directly
+to the idle floor when its loan is recalled, avoiding an intermediate allocation
+of its protected base. The protected capacity remains a recovery hint; loaned
+capacity is not added to that hint. Logs identify `cache headroom idle repayment`.
+Active borrowers and borrowers still inside the idle/resize/assessment guards
+retain the normal loan-only repayment path; no waiting or grace reduction is added.
+Idle grace remains 60 seconds: faster recovery does not
+permit reclaiming a dependency merely because it has not been used yet in a slice.
+
+Revision 3.610 adds bounded **active-cache transfer trials** to `idle-reclaim-v1`
+when rebalancing is enabled. Normal growth and idle reclamation remain preferred.
+When a pressure-qualified shared receiver cannot grow, the coordinator may take
+the smallest of 5% of an active donor's payload, 1% of the pool budget, or 50% of
+the receiver's payload (rounded down to whole page pairs). The donor must have
+fresh substantial observations and measured load pressure below a quarter of the
+receiver's; low pressure selects an experiment, not proof that shrinking is safe.
+The donor is never reduced below the configured initial cache size by this path.
+
+Only one trial runs at a time, at quiescent checkpoints, with memory reserved for
+both forward and reverse discard-resizes including fallback allocations and
+metadata. After one warm-up window, two windows of at least 100,000 lookups per
+cache and at least five seconds each compare sampled load cost per lookup,
+normalized to pre-trial traffic. Receiver savings must exceed added donor cost
+by 10% and amortize the all-worker resize stall within a projected 300 seconds.
+This is observational evidence, not a guaranteed runtime improvement. Acceptance
+keeps the new capacities; weak benefit, inconclusive timing, a 180-second deadline,
+counter resets or a phase boundary restores the old capacities. Allocation
+failures retain the recovery reservation and retry. Cached contents may need to
+refill after resizing or rollback. Donors are protected for 300 seconds afterward.
+Logs identify `cache active transfer` and `cache active measurement` and explain
+acceptance or rollback. Set `EGTB_DEPENDENCY_SHARED_CACHE_REBALANCE=0` to disable
+rebalancing, including these trials. Free system RAM does not enlarge the configured
+shared-cache budget automatically.
+
+Revision 3.611 preflights active transfers against estimated **round-trip** resize
+cost (forward plus rollback). A cold estimate of 4 GiB/s over old+new allocation
+footprints is replaced by a larger measured coordinated-resize cost when observed.
+Projected savings use the receiver's measured load cost times its fractional
+capacity increase, capped at 25%; this is a conservative admission heuristic, not
+a measured miss curve. A trial must plausibly repay that all-worker stall within
+300 seconds before allocating anything. `cache active admission` logs explain
+`resize-cost-payback` and `failed-pair-unchanged` rejections, throttled per receiver.
+Failed donor/receiver pairs are remembered across slice and phase changes. A retry
+requires at least 30 minutes **and** a 25% capacity change in either cache or a
+doubling of receiver load pressure; elapsed time or a new phase alone is not enough.
+The history lasts for the current generator process. Existing idle reclamation,
+normal growth, rollback memory reservations and verification behaviour are unchanged.
 
 Policy logs include `lookups-window`, `window-seconds`, `lookups/s`, and
 `idle-seconds`. Lookup windows are intervals between maintenance checkpoints;

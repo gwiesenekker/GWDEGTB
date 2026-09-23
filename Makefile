@@ -36,6 +36,11 @@ test_dependency_resident: test_dependency_resident.o dependency_resident.o egtb.
 
 all test: test_dependency_resident
 all test: test_shared_cache
+all test: test_active_transfer
+
+# The test includes the coordinator implementation for controlled policy fixtures.
+test_active_transfer: test_active_transfer.o egtb.o progress.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 test_shared_cache: test_shared_cache.o dependency_resident.o egtb.o progress.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -140,6 +145,13 @@ test_generator_padded: test_generator.o generator_padded.o frontier.o bitmap.o m
 test_material: test_material.o material.o
 	$(CC) $(CFLAGS) -o $@ $^
 
+test_slice_order: test_slice_order.o
+
+test: test_slice_order
+
+test-slice-order: test_slice_order
+	./test_slice_order
+
 test_bitmap: test_bitmap.o bitmap.o
 	$(CC) $(CFLAGS) -o $@ $^
 
@@ -170,6 +182,7 @@ test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb
 	./test_wdl_compile
 	./test_wdl_dictionary
 	./test_shared_cache
+	./test_active_transfer
 	./test_crc32c
 	./test_frontier
 	./test_compact_pipeline
@@ -180,6 +193,7 @@ test: test_index test_slice_index test_sliced test_combinatorial_index test_egtb
 	./test_index 0 0 0 0
 	./test_index 1 1 1 1
 	./test_slice_index
+	./test_slice_order
 	./test_sliced
 	./test_sliced 2048
 	./test_sliced 1024 resident
@@ -231,6 +245,8 @@ test_frontier: test_frontier.c frontier.c frontier.h crc32c.h
 test: test_progress test_8piece test_frontier
 
 clean:
+	$(RM) test_slice_order test_slice_order.o
+	$(RM) test_active_transfer test_active_transfer.o
 	$(RM) test_dependency_resident test_dependency_resident.o dependency_resident.o
 	$(RM) test_shared_cache test_shared_cache.o
 	$(RM) test_frontier

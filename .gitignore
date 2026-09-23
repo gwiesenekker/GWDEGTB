@@ -43,4 +43,6 @@ test_compact_pipeline
 /test_frontier
 /test_dependency_resident
 /test_shared_cache
+/test_active_transfer
+/test_slice_order
 /test_wdl_dictionary
