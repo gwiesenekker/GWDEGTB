@@ -155,6 +155,8 @@ bool egtb_create(Egtb **out, const char *path, uint64_t maximum_index,
 
 /* Open an existing EGTB. Read-only handles are shared by path and ref-counted. */
 bool egtb_open_readonly(Egtb **out, const char *path, size_t cache_pages);
+/* Read-only, uncached lookup. Do not call concurrently on the same backing. */
+bool egtb_get_uncached(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value);
 /* Borrowed diagnostic path, valid until the handle is closed. */
 const char *egtb_path(const Egtb *egtb);
 bool egtb_open_readwrite(Egtb **out, const char *path, size_t cache_pages);

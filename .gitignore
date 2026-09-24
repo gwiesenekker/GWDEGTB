@@ -50,3 +50,7 @@ test_compat_include
 test_compat_runtime
 test_platform_guards
 build-windows/
+/build-debug/
+/build-release/
+/dtm_pv
+/test_dtm_pv

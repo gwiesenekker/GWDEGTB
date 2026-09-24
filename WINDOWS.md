@@ -11,6 +11,7 @@ Compile these C files as C11, for 64-bit Windows:
 
 * `gwdegtb.c`, `wdl.c`, `egtb.c`, `progress.c`
 * `material.c`, `endgame_index.c`, `dtm_fen.c`
+* `dtm_pv.c`, `movegen.c` if using the PV API (included by CMake)
 * `../compat/compat.c` (once only if GWD already compiles this file)
 
 Add the endgame7, shared compat, and Zstd include directories. Include the
@@ -26,19 +27,35 @@ intrinsics are retained. The 128-bit multiply-high operation is isolated in
 
 ## Optional standalone CMake build
 
-From a Visual Studio developer terminal with Clang, Ninja and CMake available:
+Use the same directory convention as GWD8: `build-debug` for Debug and
+`build-release` for Release, both using `clang-cl`. Ninja is single-configuration:
+select the build type when configuring, not by renaming a build directory.
+Keep an existing `build-windows` directory until the new build has passed its tests.
 
-```powershell
-cmake -S . -B build-windows -G Ninja -DCMAKE_C_COMPILER=clang-cl `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DCOMPAT_DIR=C:/path/to/compat `
-  -DZSTD_INCLUDE_DIR=C:/path/to/zstd/include `
-  -DZSTD_LIBRARY=C:/path/to/zstd/lib/zstd.lib
-cmake --build build-windows
-ctest --test-dir build-windows --output-on-failure
+From a Visual Studio x64 developer terminal with Clang, Ninja and CMake available,
+the following single-line commands work in either cmd.exe or PowerShell. These
+examples use the current read-only source mappings (`E:/` for endgame7, `G:/` for
+compat) and the existing writable directory `C:/Tmp2/gwdegtb`:
+
+```bat
+cmake -S E:/ -B C:/Tmp2/gwdegtb/build-debug -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Debug -DCOMPAT_DIR=G:/ -DZSTD_INCLUDE_DIR=C:/Tmp2/gwdegtb/include -DZSTD_LIBRARY=C:/Tmp2/gwdegtb/lib/libzstd.lib
+cmake --build C:/Tmp2/gwdegtb/build-debug --parallel 8
+ctest --test-dir C:/Tmp2/gwdegtb/build-debug --output-on-failure
+
+cmake -S E:/ -B C:/Tmp2/gwdegtb/build-release -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release -DCOMPAT_DIR=G:/ -DZSTD_INCLUDE_DIR=C:/Tmp2/gwdegtb/include -DZSTD_LIBRARY=C:/Tmp2/gwdegtb/lib/libzstd.lib
+cmake --build C:/Tmp2/gwdegtb/build-release --parallel 8
+ctest --test-dir C:/Tmp2/gwdegtb/build-release --output-on-failure
 ```
 
-This builds only the library and portable tests. The `gwdegtb` test checks both
+If using `C:/Tmp2/endgame7` instead, substitute the writable build paths; do not
+move existing CMake build trees. Adjust the Zstd paths only if those files move.
+For subsequent rebuilds, only the build command is needed. Add `--clean-first`
+for a clean rebuild. Match the CRT across GWD8, GWDEGTB and Zstd: CMake normally
+uses `/MDd` for Debug and `/MD` for Release, so select the corresponding Zstd
+library or explicitly align the runtime configuration across all components.
+
+This builds the library, `dtm_pv`, the database scanner and portable tests, not
+the generator. The `gwdegtb` test checks both
 sides, compact/padded bitboards, mirroring, missing-WDL generation, parallel
 WDL loading/decompression, compressed probes, DTM values and unavailable files.
 Its DTM fixture is synthetic: this tests storage/API behavior, not game solving.
@@ -77,7 +94,7 @@ disk space for a file of that logical size (Linux normally stores it sparsely).
 After building, run this against a directory containing matching DTM/WDL pairs:
 
 ```bat
-C:\Tmp2\gwdegtb\build-windows\test_database_files.exe Z:/ 1wX-0wO-1bX-0bO 1wX-0wO-0bX-1bO 0wX-1wO-0bX-1bO
+C:\Tmp2\gwdegtb\build-release\test_database_files.exe Z:/ 1wX-0wO-1bX-0bO 1wX-0wO-0bX-1bO 0wX-1wO-0bX-1bO
 ```
 
 Use canonical basenames without extensions. Each named database must have both
@@ -99,7 +116,7 @@ Start with the small two-piece files above, then try larger files.
 For the largest five-piece database by position count:
 
 ```bat
-C:\Tmp2\gwdegtb\build-windows\test_database_files.exe -j 8 Z:/ 2wX-1wO-1bX-1bO > C:\Tmp2\gwdegtb\five-piece-scan.txt 2>&1
+C:\Tmp2\gwdegtb\build-release\test_database_files.exe -j 8 Z:/ 2wX-1wO-1bX-1bO > C:\Tmp2\gwdegtb\five-piece-scan.txt 2>&1
 ```
 
 This is a complete logical-data scan, not a game-theoretic consistency

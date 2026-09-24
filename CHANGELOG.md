@@ -1,9 +1,28 @@
 # Version history
 
 Published versions are Git tags. The `REVISION` file identifies the executable
-revision independently of individual commits; version 3.6 starts at 3.601.
+revision independently of individual commits; version 3.7 starts at 3.701.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
+
+## Version 3.7 — revision 3.701
+
+- Add the read-only `dtm_pv` command and `gwdegtb_dtm_pv` API: parse FEN,
+  follow exact DTM values, and list equally optimal alternative moves in wrapped
+  PDN comments. Validate each decisive position and DTM step, handle mirroring,
+  captures and promotions, and report missing or inconsistent databases.
+  Probes bypass page/result caches; database files are never modified.
+- Port the GWD library subset to Windows with clang-cl and the externally
+  maintained shared `compat.c`/`compat.h`. Add CMake builds, platform/runtime
+  tests, and Debug/Release build instructions. EGTB generation remains Linux-only.
+- Add a portable, parallel `test_database_files` scanner for checksum-checked
+  DTM/WDL agreement, histograms and API checks. This is not move-based verification.
+- Refine dependency-cache admission retries, idle reclamation and returning-cache
+  recovery. Add bounded, reversible active-cache transfers and regression coverage.
+- Add alternate slice traversal orders and a local traversal benchmark script;
+  preserve checkpoint dependencies and existing default traversal.
+- No DTM or WDL file-format change. The shared compat sources remain a separate
+  dependency and are not bundled in this repository.
 
 ## Version 3.6 — revision 3.601
 

@@ -9,7 +9,7 @@ find_library(ZSTD_LIBRARY NAMES zstd libzstd zstd_static libzstd_static REQUIRED
 
 # Library only: the generator and its shell scripts remain Linux tools.
 add_library(gwdegtb STATIC gwdegtb.c wdl.c egtb.c progress.c material.c
-    endgame_index.c dtm_fen.c "${COMPAT_DIR}/compat.c")
+    endgame_index.c dtm_fen.c dtm_pv.c movegen.c "${COMPAT_DIR}/compat.c")
 target_include_directories(gwdegtb PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}"
     PRIVATE "${COMPAT_DIR}" "${ZSTD_INCLUDE_DIR}")
 target_link_libraries(gwdegtb PUBLIC "${ZSTD_LIBRARY}")
@@ -24,6 +24,8 @@ else()
     target_link_libraries(gwdegtb PUBLIC Threads::Threads)
 endif()
 include(CTest)
+add_executable(dtm_pv dtm_pv_main.c)
+target_link_libraries(dtm_pv PRIVATE gwdegtb)
 add_executable(test_database_files test_database_files.c)
 target_include_directories(test_database_files PRIVATE "${ZSTD_INCLUDE_DIR}" "${COMPAT_DIR}")
 target_link_libraries(test_database_files PRIVATE gwdegtb)
@@ -31,7 +33,7 @@ if(WIN32)
     target_compile_definitions(test_database_files PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 if(BUILD_TESTING)
-    foreach(name compat_include compat_runtime platform_guards crc32c gwdegtb)
+    foreach(name compat_include compat_runtime platform_guards crc32c gwdegtb dtm_pv)
         add_executable(test_${name} test_${name}.c)
         # The integration test includes wdl.h, which also includes zstd.h.
         target_include_directories(test_${name} PRIVATE "${COMPAT_DIR}" "${ZSTD_INCLUDE_DIR}")

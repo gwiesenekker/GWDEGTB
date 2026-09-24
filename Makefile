@@ -115,8 +115,18 @@ dtm_examples: dtm_examples.o dtm_fen.o material.o endgame_index.o movegen.o egtb
 verify_dtm: verify_dtm.o generator_padded.o frontier.o bitmap.o material.o movegen.o endgame_index.o egtb.o progress.o revision.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-libgwdegtb.a: gwdegtb.o wdl.o egtb.o progress.o material.o endgame_index.o dtm_fen.o
+libgwdegtb.a: gwdegtb.o wdl.o egtb.o progress.o material.o endgame_index.o dtm_fen.o dtm_pv.o movegen.o
 	$(AR) rcs $@ $^
+
+all: dtm_pv
+dtm_pv: dtm_pv_main.o libgwdegtb.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test_dtm_pv: test_dtm_pv.o libgwdegtb.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test: test-pv
+.PHONY: test-pv
+test-pv: test_dtm_pv
+	./test_dtm_pv
 
 generate_egtb.o: revision.h
 
@@ -273,6 +283,7 @@ test_frontier: test_frontier.c frontier.c frontier.h crc32c.h
 test: test_progress test_8piece test_frontier
 
 clean:
+	$(RM) dtm_pv dtm_pv_main.o dtm_pv.o test_dtm_pv test_dtm_pv.o
 	$(RM) compat.o test_compat_include test_compat_runtime test_platform_guards
 	$(RM) test_slice_order test_slice_order.o
 	$(RM) test_dependency_resident test_dependency_resident.o dependency_resident.o

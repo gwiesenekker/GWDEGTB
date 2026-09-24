@@ -1763,3 +1763,39 @@ make benchmark-movegen
 | `libgwdegtb.a` | Static library target for integration with GWD |
 | `test_*.c`, `check_stats.c` | Regression and reference-count validation |
 | `benchmark_*.c` | Index, cache/storage, and move-generation benchmarks |
+## DTM principal variations
+
+`make dtm_pv` builds a read-only FEN-to-PV diagnostic tool (also available in
+the Windows CMake build):
+
+```sh
+./dtm_pv -d /path/to/databases "B:WK49:B24"
+```
+
+It follows exact DTM values to a terminal position, choosing the shortest win
+or longest resistance. Output is a move sequence, wrapped at 80 columns without
+FEN lines. Each move is followed by `{pre-move DTM, other equally optimal moves}`.
+Alternatives exclude the selected move and are separated by `or`. A unique best
+move shows only its DTM, for example:
+
+```text
+1... 24-29 {-8} 2. 49-43 {7, 49-38 or 49-32 or 49-27 or 49-21 or 49-16 or
+49-44 or 49-40 or 49-35} 29-33 {-6} 3. 43-32 {5, 43-27 or 43-21 or 43-16 or
+43-34 or 43-30 or 43-25} 33-39 {-4} 4. 32-49 {3} 39-43 {-2, 39-44} 5. 49x38 {1,
+49x32 or 49x27 or 49x21 or 49x16} 2-0
+```
+
+Long comments wrap between alternatives. Different capture routes producing the
+same board are listed once. Captures print
+start/end squares, not the full intermediate jump route. Results use `2-0`,
+`0-2`, or `1-1` (draw, with no PV). Annotations use standard PDN comment braces.
+The input accepts plain FEN, not the `{DTM}` annotation printed by example tools.
+
+The library function is `gwdegtb_dtm_pv(directory, fen, output, error, error_size)`
+in `dtm_pv.h`. It checks every legal successor at each decisive position and
+fails on missing databases, unreadable pages or inconsistent DTM values; a
+failed call can leave a partial PV in the output stream. This checks the PV and
+its immediate alternatives, not the entire database. Existing files are opened
+read-only and each lookup decodes its page afresh, without page/result caching;
+open handles are retained for the call and normal OS file buffering still applies.
+Use this diagnostic API single-threaded, without concurrent probes of these files.

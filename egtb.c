@@ -1331,6 +1331,22 @@ bool egtb_get(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value)
     return true;
 }
 
+bool egtb_get_uncached(Egtb *egtb, uint64_t index, EgtbSide side, int16_t *value)
+{
+    uint64_t page;
+    uint32_t slot;
+    if (!egtb || !egtb->readonly || !value || index > egtb->maximum_index ||
+        (side != EGTB_WHITE_TO_MOVE && side != EGTB_BLACK_TO_MOVE))
+        return fail("invalid uncached read-only lookup");
+    EgtbEntry *entries = malloc(egtb->memory_page_size);
+    if (!entries) return fail("cannot allocate uncached page buffer");
+    split_storage_index(egtb, index, side, &page, &slot);
+    bool ok = load_page(egtb, page, entries);
+    if (ok) *value = egtb_decode_dtm(stored_value(egtb, entries, slot, side));
+    free(entries);
+    return ok;
+}
+
 bool egtb_set(Egtb *egtb, uint64_t index, EgtbSide side, int16_t value)
 {
     uint64_t page;
