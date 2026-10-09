@@ -769,7 +769,7 @@ int main(int argc, char **argv)
     if (histogram == NULL) goto done;
     phase_started = wall_seconds();
     EgtbVerificationOptions verify_options = {
-        thread_count, verification_cache_pages, probe_contexts, NULL
+        thread_count, verification_cache_pages, probe_contexts, NULL, 0, 0
     };
     EgtbConsistencyStatistics repair = {0};
     if (verify_final) {

@@ -195,6 +195,33 @@ Dependency caches remain private per worker and database. The command never
 repairs, compacts or otherwise writes the DTM. A successful run ends with a
 prominent `VERIFIED ...` line and reports the number of values checked.
 
+For a long verification, supply an external checkpoint path. Each chunk is
+checked in parallel; only a fully successful chunk advances the durable,
+CRC32C-protected checkpoint. A later invocation with the same options resumes
+at the next page. The checkpoint records the target, page/chunk size and a
+64-bit fingerprint of identity metadata (name, device, inode, size,
+modification/change times) for all `.dtm` files in the directory. If any file
+is replaced or modified, the
+verifier refuses to resume; start with a new checkpoint. This detects normal
+file changes, but is not a cryptographic content hash. The checkpoint is
+advisory evidence of completed checks, not a substitute for preserving the
+DTMs unchanged. A `.lock` file prevents concurrent use of the same checkpoint.
+
+```sh
+EGTB_RESIDENT_LIMIT_GIB=0 ./verify_dtm -d /path/to/dtms -j 16 \
+    --checkpoint /path/to/checkpoints/4k-vs-4k.verify \
+    --chunk-pages 1048576 4 0 4 0
+```
+
+The checkpoint path should be outside the DTM directory if that directory is
+read-only. Relative checkpoint paths are resolved after `-d`. The default is
+1,048,576 logical pages per chunk (about one billion positions with 2 KiB
+planar pages); `--chunk-pages` changes the checkpoint cadence. For a scheduled
+run, `--max-chunks N` stops after N successfully checked chunks with exit code
+2 rather than claiming the entire database is verified. A complete
+verification exits zero; a mismatch or I/O/checkpoint error exits nonzero.
+Without `--checkpoint`, the command retains its original single-pass behavior.
+
 The manually maintained `REVISION` file supplies the revision printed at
 startup. It is independent of Git tags and commit identifiers:
 

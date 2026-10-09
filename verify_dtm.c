@@ -7,18 +7,174 @@
 #include "material.h"
 #include "progress.h"
 #include "revision.h"
+#include "crc32c.h"
 
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #define GIBIBYTE (UINT64_C(1024) * 1024 * 1024)
 #define DEFAULT_RESIDENT_LIMIT_BYTES (UINT64_C(32) * GIBIBYTE)
 #define DEFAULT_VERIFICATION_CACHE_BYTES (UINT64_C(32) * GIBIBYTE)
 #define DEPENDENCY_CACHE_BYTES (UINT64_C(64) * 1024 * 1024)
+#define DEFAULT_CHECKPOINT_PAGES UINT64_C(1048576)
+
+static bool parse_u64(const char *text, uint64_t *value)
+{
+    char *end;
+    unsigned long long parsed;
+    errno = 0;
+    parsed = strtoull(text, &end, 10);
+    if (errno || !*text || *end || !parsed) return false;
+    *value = (uint64_t)parsed;
+    return true;
+}
+
+static int compare_names(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static uint64_t fingerprint_dtm_directory(void)
+{
+    DIR *dir = opendir(".");
+    struct dirent *entry;
+    char **names = NULL;
+    size_t count = 0, capacity = 0;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    if (!dir) return 0;
+    while ((entry = readdir(dir)) != NULL) {
+        size_t length = strlen(entry->d_name);
+        if (length < 4 || strcmp(entry->d_name + length - 4, ".dtm")) continue;
+        if (count == capacity) {
+            size_t next = capacity ? capacity * 2 : 64;
+            char **grown = realloc(names, next * sizeof(*names));
+            if (!grown) { hash = 0; goto done; }
+            names = grown; capacity = next;
+        }
+        names[count] = strdup(entry->d_name);
+        if (!names[count]) { hash = 0; goto done; }
+        ++count;
+    }
+    if (closedir(dir) != 0) { dir = NULL; hash = 0; goto done; }
+    dir = NULL;
+    qsort(names, count, sizeof(*names), compare_names);
+    for (size_t i = 0; i < count; ++i) {
+        struct stat st;
+        char row[512];
+        int length;
+        if (stat(names[i], &st) != 0 || !S_ISREG(st.st_mode)) { hash = 0; break; }
+        length = snprintf(row, sizeof(row), "%s:%ju:%ju:%ju:%jd:%ld:%jd:%ld\n",
+                          names[i], (uintmax_t)st.st_dev, (uintmax_t)st.st_ino,
+                          (uintmax_t)st.st_size, (intmax_t)st.st_mtim.tv_sec,
+                          st.st_mtim.tv_nsec, (intmax_t)st.st_ctim.tv_sec,
+                          st.st_ctim.tv_nsec);
+        if (length < 0 || (size_t)length >= sizeof(row)) { hash = 0; break; }
+        for (int j = 0; j < length; ++j) {
+            hash ^= (unsigned char)row[j];
+            hash *= UINT64_C(1099511628211);
+        }
+    }
+done:
+    if (dir) closedir(dir);
+    for (size_t i = 0; i < count; ++i) free(names[i]);
+    free(names);
+    return hash;
+}
+
+static bool checkpoint_text(char *text, size_t capacity, const char *name,
+                            uint64_t positions, uint64_t page_entries,
+                            uint64_t chunk_pages, uint64_t signature,
+                            uint64_t next_index)
+{
+    int length = snprintf(text, capacity,
+        "GWDEGTB-VERIFY-1\n%s\n%" PRIu64 " %" PRIu64 " %" PRIu64
+        " %016" PRIx64 " %" PRIu64 "\n",
+        name, positions, page_entries, chunk_pages, signature, next_index);
+    if (length < 0 || (size_t)length >= capacity - 16) return false;
+    uint32_t crc = crc32c(text, (size_t)length);
+    length += snprintf(text + length, capacity - (size_t)length,
+                       "%08" PRIx32 "\n", crc);
+    return length > 0 && (size_t)length < capacity;
+}
+
+static bool checkpoint_read(const char *path, const char *name,
+                            uint64_t positions, uint64_t page_entries,
+                            uint64_t chunk_pages, uint64_t signature,
+                            uint64_t *next_index)
+{
+    char text[512], expected[512], stored_name[128], magic[32];
+    uint64_t stored_positions, stored_entries, stored_chunk, stored_signature, stored_next;
+    uint32_t stored_crc;
+    FILE *file = fopen(path, "rb");
+    size_t length;
+    if (!file) return false;
+    length = fread(text, 1, sizeof(text) - 1, file);
+    bool read_ok = !ferror(file) && feof(file);
+    if (fclose(file) != 0 || !read_ok) return false;
+    text[length] = 0;
+    if (sscanf(text, "%31s\n%127s\n%" SCNu64 " %" SCNu64 " %" SCNu64
+               " %" SCNx64 " %" SCNu64 "\n%" SCNx32,
+               magic, stored_name, &stored_positions, &stored_entries,
+               &stored_chunk, &stored_signature, &stored_next, &stored_crc) != 8 ||
+        strcmp(magic, "GWDEGTB-VERIFY-1") || strcmp(name, stored_name) ||
+        stored_positions != positions || stored_entries != page_entries ||
+        stored_chunk != chunk_pages || stored_signature != signature ||
+        stored_next > positions ||
+        (stored_next != positions && stored_next % page_entries)) return false;
+    if (!checkpoint_text(expected, sizeof(expected), name, positions,
+                         page_entries, chunk_pages, signature, stored_next) ||
+        strcmp(text, expected)) return false;
+    *next_index = stored_next;
+    return true;
+}
+
+static bool checkpoint_write(const char *path, const char *name,
+                             uint64_t positions, uint64_t page_entries,
+                             uint64_t chunk_pages, uint64_t signature,
+                             uint64_t next_index)
+{
+    char text[512], temporary[4096], parent[4096];
+    const char *slash;
+    int fd, parent_fd;
+    size_t length, offset = 0;
+    if (!checkpoint_text(text, sizeof(text), name, positions, page_entries,
+                         chunk_pages, signature, next_index) ||
+        snprintf(temporary, sizeof(temporary), "%s.tmp.%ld", path, (long)getpid()) >=
+            (int)sizeof(temporary)) return false;
+    fd = open(temporary, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) return false;
+    length = strlen(text);
+    while (offset < length) {
+        ssize_t written = write(fd, text + offset, length - offset);
+        if (written <= 0) break;
+        offset += (size_t)written;
+    }
+    bool ok = offset == length && fsync(fd) == 0;
+    if (close(fd) != 0) ok = false;
+    if (ok) ok = rename(temporary, path) == 0;
+    if (!ok) { unlink(temporary); return false; }
+    slash = strrchr(path, '/');
+    if (!slash) strcpy(parent, ".");
+    else if (slash == path) strcpy(parent, "/");
+    else {
+        size_t size = (size_t)(slash - path);
+        if (size >= sizeof(parent)) return false;
+        memcpy(parent, path, size); parent[size] = 0;
+    }
+    parent_fd = open(parent, O_RDONLY | O_DIRECTORY);
+    if (parent_fd < 0) return false;
+    ok = fsync(parent_fd) == 0;
+    if (close(parent_fd) != 0) ok = false;
+    return ok;
+}
 
 typedef struct {
     EgtbMaterialKind kind;
@@ -317,6 +473,10 @@ static bool configured_gibibytes(const char *name, uint64_t default_value,
 int main(int argc, char **argv)
 {
     const char *directory = ".";
+    const char *checkpoint = NULL;
+    uint64_t chunk_pages = DEFAULT_CHECKPOINT_PAGES;
+    uint64_t max_chunks = 0, completed_chunks = 0;
+    uint64_t signature = 0, next_index = 0, resumed_index = 0, positions = 0;
     int argument = 1;
     unsigned thread_count = 4, progress_seconds = 60;
     EgtbMaterial requested, material;
@@ -330,10 +490,14 @@ int main(int argc, char **argv)
     void **contexts = NULL;
     EgtbConsistencyStatistics verification = {0};
     EgtbCacheStatistics dependency_statistics = {0};
+    EgtbCacheStatistics current_statistics = {0};
     uint64_t resident_limit, verification_cache_bytes, resident_bytes;
     size_t verification_cache_pages;
     char filename[128];
+    char checkpoint_lock_path[4096];
+    int checkpoint_lock_fd = -1;
     bool ok = false;
+    bool paused = false;
 
     if (argc == 2 && strcmp(argv[1], "--revision") == 0) {
         printf("GWDEGTB revision %s\n", gwdegtb_revision);
@@ -367,6 +531,24 @@ int main(int argc, char **argv)
                 return EXIT_FAILURE;
             }
             argument += 2;
+        } else if (strcmp(argv[argument], "--checkpoint") == 0 &&
+                   argument + 1 < argc) {
+            checkpoint = argv[argument + 1];
+            argument += 2;
+        } else if (strcmp(argv[argument], "--chunk-pages") == 0 &&
+                   argument + 1 < argc) {
+            if (!parse_u64(argv[argument + 1], &chunk_pages)) {
+                fprintf(stderr, "chunk pages must be positive\n");
+                return EXIT_FAILURE;
+            }
+            argument += 2;
+        } else if (strcmp(argv[argument], "--max-chunks") == 0 &&
+                   argument + 1 < argc) {
+            if (!parse_u64(argv[argument + 1], &max_chunks)) {
+                fprintf(stderr, "max chunks must be positive\n");
+                return EXIT_FAILURE;
+            }
+            argument += 2;
         } else {
             break;
         }
@@ -381,11 +563,16 @@ int main(int argc, char **argv)
         !parse_unsigned(argv[argument + 3], EGTB_MAX_PIECES,
                         &requested.black_men)) {
         fprintf(stderr, "usage: %s [-d DIRECTORY] [-j THREADS] "
+                        "[--checkpoint FILE] [--chunk-pages N] [--max-chunks N] "
                         "NWHITE_KINGS NWHITE_MEN NBLACK_KINGS NBLACK_MEN\n",
                 argv[0]);
         return EXIT_FAILURE;
     }
     kind = egtb_material_resolve(&requested, &material);
+    if (max_chunks && !checkpoint) {
+        fprintf(stderr, "--max-chunks requires --checkpoint\n");
+        return EXIT_FAILURE;
+    }
     if (kind != EGTB_MATERIAL_CANONICAL && kind != EGTB_MATERIAL_MIRROR) {
         fprintf(stderr, "material must contain 2..%u pieces and at least "
                         "one piece for each side\n", EGTB_MAX_PIECES);
@@ -403,6 +590,18 @@ int main(int argc, char **argv)
     if (chdir(directory) != 0) {
         fprintf(stderr, "cannot enter %s: %s\n", directory, strerror(errno));
         return EXIT_FAILURE;
+    }
+    if (checkpoint) {
+        if (snprintf(checkpoint_lock_path, sizeof(checkpoint_lock_path),
+                     "%s.lock", checkpoint) >= (int)sizeof(checkpoint_lock_path) ||
+            (checkpoint_lock_fd = open(checkpoint_lock_path,
+                                       O_RDWR | O_CREAT, 0600)) < 0 ||
+            flock(checkpoint_lock_fd, LOCK_EX | LOCK_NB) != 0) {
+            fprintf(stderr, "cannot lock checkpoint %s: %s\n", checkpoint,
+                    strerror(errno));
+            if (checkpoint_lock_fd >= 0) close(checkpoint_lock_fd);
+            return EXIT_FAILURE;
+        }
     }
     if (!egtb_material_filename(filename, sizeof(filename),
                                 material.white_kings, material.white_men,
@@ -426,12 +625,42 @@ int main(int argc, char **argv)
                 filename);
         goto done;
     }
+    positions = eg_position_count(&indexer);
+    if (checkpoint) {
+        signature = fingerprint_dtm_directory();
+        if (!signature) {
+            fprintf(stderr, "cannot fingerprint DTM directory\n");
+            goto done;
+        }
+        if (access(checkpoint, F_OK) == 0) {
+            if (!checkpoint_read(checkpoint, filename, positions,
+                                 egtb_positions_per_page(database), chunk_pages,
+                                 signature, &next_index)) {
+                fprintf(stderr, "checkpoint is corrupt or its DTM inputs changed: %s\n",
+                        checkpoint);
+                goto done;
+            }
+            printf("resuming verification at index %" PRIu64 "/%" PRIu64 "\n",
+                   next_index, positions);
+        } else if (errno != ENOENT) {
+            fprintf(stderr, "cannot inspect checkpoint %s: %s\n", checkpoint,
+                    strerror(errno));
+            goto done;
+        }
+        resumed_index = next_index;
+    }
     if (!egtb_progress_start(progress_seconds)) {
         fprintf(stderr, "cannot start progress reporter\n");
         goto done;
     }
     egtb_progress_log("GWDEGTB revision %s verifying %s with %u threads\n",
                       gwdegtb_revision, filename, thread_count);
+    if (next_index == positions) {
+        printf("VERIFIED %s: checkpoint covers all %" PRIu64 " DTM values\n",
+               filename, positions * 2);
+        ok = true;
+        goto done;
+    }
     resident_bytes = (egtb_maximum_index(database) + 1) * sizeof(EgtbEntry);
     if (resident_limit != 0 && resident_bytes <= resident_limit &&
         !egtb_resident_load(&resident, database, thread_count)) {
@@ -462,11 +691,21 @@ int main(int argc, char **argv)
     }
     {
         EgtbVerificationOptions options = {
-            thread_count, verification_cache_pages, contexts, resident
+            thread_count, verification_cache_pages, contexts, resident, 0, 0
         };
-        if (!egtb_verify_consistent_threaded(
-                database, &indexer, catalog_probe, &catalogs[0], &options,
-                NULL, &verification)) {
+        uint64_t verified_values = 0;
+        do {
+            if (checkpoint) {
+                uint64_t page_entries = egtb_positions_per_page(database);
+                uint64_t remaining_pages = (positions - next_index + page_entries - 1) / page_entries;
+                uint64_t pages = chunk_pages < remaining_pages ? chunk_pages : remaining_pages;
+                options.first_index = next_index;
+                options.end_index = next_index + pages * page_entries;
+                if (options.end_index > positions) options.end_index = positions;
+            }
+            if (!egtb_verify_consistent_threaded(
+                    database, &indexer, catalog_probe, &catalogs[0], &options,
+                    NULL, &verification)) {
             const char *dependency_error = "";
             for (unsigned worker = 0; worker < thread_count; ++worker)
                 if (catalogs[worker].error[0] != '\0') {
@@ -477,14 +716,47 @@ int main(int argc, char **argv)
                     filename, egtb_generator_last_error(),
                     *dependency_error ? ": " : "", dependency_error);
             goto done;
-        }
+            }
+            verified_values += verification.positions_checked;
+            current_statistics.lookups += verification.cache.lookups;
+            current_statistics.hits += verification.cache.hits;
+            current_statistics.misses += verification.cache.misses;
+            current_statistics.decompressions += verification.cache.decompressions;
+            current_statistics.dirty_evictions += verification.cache.dirty_evictions;
+            current_statistics.compressed_writes += verification.cache.compressed_writes;
+            if (!checkpoint) break;
+            next_index = options.end_index;
+            if (fingerprint_dtm_directory() != signature) {
+                fprintf(stderr, "DTM inputs changed during verification; checkpoint not advanced\n");
+                goto done;
+            }
+            if (!checkpoint_write(checkpoint, filename, positions,
+                                  egtb_positions_per_page(database), chunk_pages,
+                                  signature, next_index)) {
+                fprintf(stderr, "cannot save checkpoint %s: %s\n", checkpoint,
+                        strerror(errno));
+                goto done;
+            }
+            printf("verified through index %" PRIu64 "/%" PRIu64 "\n",
+                   next_index, positions);
+            fflush(stdout);
+            ++completed_chunks;
+            if (max_chunks && completed_chunks == max_chunks && next_index < positions) {
+                paused = true;
+                goto done;
+            }
+        } while (next_index < positions);
+        verification.positions_checked = verified_values;
+        verification.cache = current_statistics;
     }
     catalog_cache_statistics(catalogs, thread_count,
                              &dependency_statistics);
     printf("VERIFIED %s: positions=%" PRIu64
-           " DTM-values-checked=%" PRIu64 " threads=%u mode=%s\n",
+           " DTM-values-checked=%" PRIu64 " newly-checked=%" PRIu64
+           " checkpointed=%" PRIu64 " threads=%u mode=%s\n",
            filename, eg_position_count(&indexer),
-           verification.positions_checked, thread_count,
+           verification.positions_checked + resumed_index * 2,
+           verification.positions_checked, resumed_index * 2, thread_count,
            resident != NULL ? "resident" : "disk-cache");
     print_cache_statistics("current-DTM cache", &verification.cache);
     print_shared_statistics(catalogs, thread_count);
@@ -510,7 +782,8 @@ done:
         ok = false;
     if (indexer_initialized)
         eg_indexer_destroy(&indexer);
+    if (checkpoint_lock_fd >= 0) close(checkpoint_lock_fd);
     egtb_progress_log("GWDEGTB revision %s verification %s\n",
-                      gwdegtb_revision, ok ? "completed" : "failed");
-    return ok ? EXIT_SUCCESS : EXIT_FAILURE;
+                      gwdegtb_revision, paused ? "paused" : ok ? "completed" : "failed");
+    return paused ? 2 : ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

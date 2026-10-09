@@ -95,6 +95,10 @@ typedef struct {
     void *const *external_contexts;
     /* Optional fully decompressed current database; bypasses current-DB views. */
     const EgtbResident *resident;
+    /* Optional page-aligned [first_index, end_index) verification range.
+     * Both zero selects the complete database. */
+    uint64_t first_index;
+    uint64_t end_index;
 } EgtbVerificationOptions;
 
 typedef bool (*EgtbExternalProbe)(

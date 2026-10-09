@@ -87,6 +87,12 @@ test_shared_cache: test_shared_cache.o dependency_resident.o egtb.o progress.o
 .PHONY: test-verification-modes
 test-verification-modes: generate_egtb verify_dtm
 	sh ./test_verification_modes.sh "$(CURDIR)/generate_egtb" "$(CURDIR)/verify_dtm"
+
+.PHONY: test-resumable-verification
+test-resumable-verification: generate_egtb verify_dtm
+	sh ./test_resumable_verification.sh "$(CURDIR)/generate_egtb" "$(CURDIR)/verify_dtm"
+
+test: test-resumable-verification
 .PHONY: test-tmux
 test-tmux:
 	./test_tmux.sh

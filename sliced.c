@@ -632,7 +632,7 @@ static bool generate_one_slice(const char *directory,
         }
     }
     EgtbVerificationOptions verify_options = {
-        options->thread_count, options->verification_cache_pages, probe_contexts, NULL
+        options->thread_count, options->verification_cache_pages, probe_contexts, NULL, 0, 0
     };
     EgtbConsistencyStatistics repair = {0};
     struct timespec verify_start, verify_end;

@@ -1,9 +1,19 @@
 # Version history
 
 Published versions are Git tags. The `REVISION` file identifies the executable
-revision independently of individual commits; version 3.8 starts at 3.801.
+revision independently of individual commits; version 3.9 starts at 3.901.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
+
+## Version 3.9 — revision 3.901
+
+- Add page-aligned, resumable `verify_dtm` checkpoints with atomic durable
+  writes, CRC32C integrity, input-identity checks and single-process locking.
+- Add bounded verification ranges internally; keep the default exhaustive
+  verifier behavior unchanged. Test resume, resident/disk-cache modes and
+  stale/corrupt checkpoint rejection.
+- No DTM or WDL file-format change. Eight-piece performance profiling is
+  deferred while other jobs are active.
 
 ## Version 3.8 — revision 3.801
 

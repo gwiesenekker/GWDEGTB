@@ -287,7 +287,7 @@ static bool test_complete_wk_bk_generation(void)
             goto destroy_indexer;
     }
     {
-        EgtbVerificationOptions repair_options = {4, 16, NULL, NULL};
+        EgtbVerificationOptions repair_options = {4, 16, NULL, NULL, 0, 0};
         if (win_three_index == UINT64_MAX || lost_two_index == UINT64_MAX ||
             !bitmap_create(&verified_positions,
                            eg_position_count(&indexer)) ||
@@ -317,7 +317,7 @@ static bool test_complete_wk_bk_generation(void)
             goto destroy_indexer;
     }
     {
-        EgtbVerificationOptions verify_options = {4, 16, NULL, NULL};
+        EgtbVerificationOptions verify_options = {4, 16, NULL, NULL, 0, 0};
         EgtbConsistencyStatistics verification;
         if (!egtb_flush(database) || !egtb_close(database)) {
             database = NULL;
@@ -447,7 +447,7 @@ static bool test_threaded_wk_bk_generation(unsigned threads, size_t buffer_bytes
         }
     }
     if (long_dtm) {
-        EgtbVerificationOptions verification = {threads, 16, NULL, NULL};
+        EgtbVerificationOptions verification = {threads, 16, NULL, NULL, 0, 0};
         if (!egtb_close(threaded)) {
             threaded = NULL;
             goto destroy_indexer;

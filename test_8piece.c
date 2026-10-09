@@ -214,7 +214,7 @@ static void test_slice_generation(void)
     CHECK(egtb_close(database));
     CHECK(egtb_compact(path, 1, 2));
     CHECK(egtb_open_readonly(&database, path, 2));
-    EgtbVerificationOptions verification = {2, 8, NULL, NULL};
+    EgtbVerificationOptions verification = {2, 8, NULL, NULL, 0, 0};
     CHECK(egtb_verify_consistent_threaded(database, &indexer, external_loss,
                                           NULL, &verification, NULL, NULL));
     for (uint64_t index = 0; index < 25; ++index)

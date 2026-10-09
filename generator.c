@@ -1919,6 +1919,7 @@ static bool verify_consistent_impl(
     ConsistencyVerifyWorker *workers = NULL;
     pthread_t *threads = NULL;
     uint64_t position_count, page_count, pages_per_worker, extra_pages;
+    uint64_t first_page, end_page, range_positions;
     uint64_t entries_per_page;
     unsigned thread_count, created_threads = 0, i;
     bool ok = false;
@@ -1936,13 +1937,32 @@ static bool verify_consistent_impl(
     if (position_count == 0 || page_count == 0 ||
         egtb_maximum_index(database) != position_count - 1)
         return fail("database and indexer sizes do not match");
+    first_page = 0;
+    end_page = page_count;
+    if (options->first_index || options->end_index) {
+        entries_per_page = egtb_positions_per_page(database);
+        if (options->first_index >= options->end_index ||
+            options->end_index > position_count ||
+            options->first_index % entries_per_page ||
+            (options->end_index != position_count &&
+             options->end_index % entries_per_page))
+            return fail("verification range must be nonempty and page-aligned");
+        first_page = options->first_index / entries_per_page;
+        end_page = (options->end_index + entries_per_page - 1) / entries_per_page;
+    }
+    range_positions = (options->first_index || options->end_index)
+                          ? options->end_index - options->first_index
+                          : position_count;
     if (verified_positions != NULL &&
         (verified_positions->words == NULL ||
          verified_positions->bit_count != position_count))
         return fail("verified-position bitmap has the wrong size");
+    if (verified_positions != NULL && (options->first_index || options->end_index))
+        return fail("verified-position bitmap cannot be combined with a verification range");
     if (options->resident != NULL &&
         !egtb_resident_matches(options->resident, database))
         return fail("resident EGTB does not match verification database");
+    page_count = end_page - first_page;
     thread_count = options->thread_count;
     if (page_count < thread_count)
         thread_count = (unsigned)page_count;
@@ -1956,7 +1976,7 @@ static bool verify_consistent_impl(
     pages_per_worker = page_count / thread_count;
     extra_pages = page_count % thread_count;
     for (i = 0; i < thread_count; ++i) {
-        uint64_t first_page = i * pages_per_worker +
+        uint64_t owned_first_page = first_page + i * pages_per_worker +
                               (i < extra_pages ? i : extra_pages);
         uint64_t owned_pages = pages_per_worker + (i < extra_pages);
         size_t cache_pages = options->cache_pages / thread_count +
@@ -1975,15 +1995,17 @@ static bool verify_consistent_impl(
                                           : external_context;
         workers[i].verified_positions = verified_positions;
         workers[i].resident = options->resident;
-        workers[i].first_index = first_page * entries_per_page;
-        workers[i].end_index = (first_page + owned_pages) * entries_per_page;
+        workers[i].first_index = owned_first_page * entries_per_page;
+        workers[i].end_index = (owned_first_page + owned_pages) * entries_per_page;
         if (workers[i].end_index > position_count)
             workers[i].end_index = position_count;
+        if (options->end_index != 0 && workers[i].end_index > options->end_index)
+            workers[i].end_index = options->end_index;
         if (options->resident == NULL) {
             /* Keep the linear old-value stream out of the random probe cache. */
             if (!egtb_view_create_range(&workers[i].scan_view, database, 1,
-                                        false, first_page,
-                                        first_page + owned_pages) ||
+                                        false, owned_first_page,
+                                        owned_first_page + owned_pages) ||
                 !egtb_view_create(&workers[i].successor_view, database,
                                   cache_pages, false)) {
                 fail("cannot create verification views %u: %s", i,
@@ -1993,7 +2015,7 @@ static bool verify_consistent_impl(
         }
     }
     egtb_progress_begin("final read-only verification",
-                        position_count - (verified_positions != NULL
+                        range_positions - (verified_positions != NULL
                             ? progress_bitmap_count(verified_positions) : 0),
                         "positions");
     uint64_t full_end[EGTB_MAX_THREADS];
@@ -3417,7 +3439,7 @@ static bool generate_threaded_impl(Egtb *database, const EgIndexer *indexer,
     {
         EgtbVerificationOptions repair_options = {
             thread_count, options->writable_cache_pages,
-            options->external_contexts, NULL
+            options->external_contexts, NULL, 0, 0
         };
         if (!egtb_make_consistent_threaded(
                 database, indexer, external_probe, initial_context,

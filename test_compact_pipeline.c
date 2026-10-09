@@ -62,7 +62,7 @@ static void pipeline(const char *directory, unsigned threads, bool resident_mode
     EgtbCreateOptions create = {4, 20, 1};
     /* One assembly page per worker forces repeated frontier replay. */
     EgtbThreadOptions genopt = {threads, 16, NULL, NULL, 2 * page_size * threads};
-    EgtbVerificationOptions verifyopt = {threads, 16, NULL, NULL};
+    EgtbVerificationOptions verifyopt = {threads, 16, NULL, NULL, 0, 0};
     EgtbGenerationStatistics generated;
     EgtbConsistencyStatistics verification, repair;
     EgtbDtmExamples examples;
