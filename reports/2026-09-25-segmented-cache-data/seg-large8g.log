@@ -1,0 +1,15 @@
+[2026-09-25 09:04:16 +0200] shared cache discard-resize timing: database=synthetic free-old=0.848128s allocate=0.000023s initialize=0.862288s initialization-threads=16 total=1.710451s
+[2026-09-25 09:04:17 +0200] shared cache discard-resize timing: database=synthetic free-old=0.176068s allocate=0.000043s initialize=0.350575s initialization-threads=16 total=0.526689s
+LARGE,discard,0,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=2.237309
+LARGE,migrate,0,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=3.478998
+LARGE,seg-linear,0,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=0.002981
+LARGE,seg-linear,1,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=0.003053
+LARGE,migrate,1,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=3.480870
+[2026-09-25 09:04:37 +0200] shared cache discard-resize timing: database=synthetic free-old=0.816818s allocate=0.000026s initialize=0.865894s initialization-threads=16 total=1.682741s
+[2026-09-25 09:04:37 +0200] shared cache discard-resize timing: database=synthetic free-old=0.163926s allocate=0.000025s initialize=0.350166s initialization-threads=16 total=0.514120s
+LARGE,discard,1,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=2.196972
+[2026-09-25 09:04:41 +0200] shared cache discard-resize timing: database=synthetic free-old=0.811270s allocate=0.000027s initialize=0.822217s initialization-threads=16 total=1.633517s
+[2026-09-25 09:04:41 +0200] shared cache discard-resize timing: database=synthetic free-old=0.160521s allocate=0.000028s initialize=0.354686s initialization-threads=16 total=0.515238s
+LARGE,discard,2,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=2.148838
+LARGE,migrate,2,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=3.529785
+LARGE,seg-linear,2,donor-MiB=8192,receiver-MiB=2048,transfer-MiB=1024,segment-MiB=16,seconds=0.002792

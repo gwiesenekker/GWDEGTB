@@ -3,6 +3,9 @@
 /benchmark_index
 /benchmark_combinatorial_index
 /benchmark_egtb
+/benchmark_segmented_cache
+/benchmark_lazy_cache
+/benchmark_hybrid_cache
 /benchmark_movegen
 /check_stats
 /test_index
@@ -54,3 +57,4 @@ build-windows/
 /build-release/
 /dtm_pv
 /test_dtm_pv
+/test_shared_init

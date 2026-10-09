@@ -84,6 +84,22 @@ typedef struct {
     uint64_t live_pages;
 } EgtbStorageStatistics;
 
+/* Header-only inspection: does not load the page directory or validate pages.
+ * compression_level is the encoder setting recorded in the file header,
+ * not a property recoverable from every compressed Zstd frame. */
+typedef struct {
+    unsigned format_version;
+    int compression_level;
+    uint32_t page_size;
+    uint64_t maximum_index;
+    uint64_t page_count;
+    unsigned reserve_percent;
+    bool exact_layout;
+    bool planar;
+} EgtbFileInfo;
+
+bool egtb_file_info(const char *path, EgtbFileInfo *info);
+
 typedef struct {
     uint64_t lookups;
     uint64_t hits;
@@ -108,6 +124,18 @@ typedef struct {
     uint64_t timed_decodes, decode_nanoseconds;
 } EgtbSharedStatistics;
 bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes);
+/* Parallel initialization; small allocations automatically use fewer threads.
+ * Subsequent resizes remember this count for initialization and migration. */
+bool egtb_shared_cache_create_threads(EgtbSharedCache **out, Egtb *backing,
+                                      size_t bytes, unsigned threads);
+/* Quiescent only; controls initialization and migration, not probing. */
+void egtb_shared_cache_set_threads(EgtbSharedCache *cache, unsigned threads);
+typedef struct {
+    double allocation_seconds, initialization_seconds;
+    unsigned initialization_threads;
+} EgtbSharedInitTiming;
+void egtb_shared_cache_init_timing(const EgtbSharedCache *cache,
+                                  EgtbSharedInitTiming *timing);
 void egtb_shared_cache_destroy(EgtbSharedCache *cache);
 uint64_t egtb_shared_cache_bytes(const EgtbSharedCache *cache);
 /* The following maintenance operations require ALL probes to be quiescent.

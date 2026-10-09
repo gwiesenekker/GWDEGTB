@@ -1434,6 +1434,14 @@ just because the thread count changes. Values must be in 1..256; workers are
 capped by the page count. These are process-local threads: only the MPI master
 should generate/load, as before.
 
+To convert an existing DTM explicitly, run `make dtm_to_wdl` and then, for
+example, `./dtm_to_wdl -j 16 2wX-1wO-1bX-1bO.dtm`. The utility writes the
+corresponding `.wdl` file, uses Zstd level 12 by default, and prints WTM/BTM
+statistics and storage size. Use `-l LEVEL` to change compression, `-o PATH`
+for another output location, or `--force` to replace an existing WDL. Without
+`--force`, an existing WDL is left untouched. Conversion uses the same parallel
+streaming implementation as automatic missing-file generation.
+
 Each compilation worker owns a two-page DTM sequential view, a Zstd context,
 and a bounded batch of up to 1,024 compressed WDL pages (approximately 1 MiB).
 It reads both sides together, packs the unchanged four-bit representation, and
@@ -1765,6 +1773,13 @@ make benchmark-movegen
 | `benchmark_*.c` | Index, cache/storage, and move-generation benchmarks |
 ## DTM principal variations
 
+`make dtm_info` builds a read-only header inspector (also included in the
+Windows CMake build). Run `./dtm_info /path/to/database.dtm` to see its file
+format version, recorded Zstd compression level, value width, page layout and
+size, position count, and reserve percentage. It reads only the fixed header,
+so even a large eight-piece file opens quickly; it does not verify page data.
+The generator revision is not recorded in DTM files.
+
 `make dtm_pv` builds a read-only FEN-to-PV diagnostic tool (also available in
 the Windows CMake build):
 
@@ -1774,15 +1789,18 @@ the Windows CMake build):
 
 It follows exact DTM values to a terminal position, choosing the shortest win
 or longest resistance. Output is a move sequence, wrapped at 80 columns without
-FEN lines. Each move is followed by `{pre-move DTM, other equally optimal moves}`.
-Alternatives exclude the selected move and are separated by `or`. A unique best
-move shows only its DTM, for example:
+FEN lines. An opening comment lists the initial position and each subsequent
+piece-count conversion as `move-number/DTM/white-pieces x black-pieces` (without
+spaces around `x`). The pre-move DTM appears in braces before each move. Other equally
+optimal moves appear in a separate comment after the selected move, separated by
+`or`. A unique best move has no alternatives comment, for example:
 
 ```text
-1... 24-29 {-8} 2. 49-43 {7, 49-38 or 49-32 or 49-27 or 49-21 or 49-16 or
-49-44 or 49-40 or 49-35} 29-33 {-6} 3. 43-32 {5, 43-27 or 43-21 or 43-16 or
-43-34 or 43-30 or 43-25} 33-39 {-4} 4. 32-49 {3} 39-43 {-2, 39-44} 5. 49x38 {1,
-49x32 or 49x27 or 49x21 or 49x16} 2-0
+{1/-8/1x1}
+1... {-8} 24-29 2. {7} 49-43 {49-38 or 49-32 or 49-27 or 49-21 or 49-16 or
+49-44 or 49-40 or 49-35} {-6} 29-33 3. {5} 43-32 {43-27 or 43-21 or 43-16 or
+43-34 or 43-30 or 43-25} {-4} 33-39 4. {3} 32-49 {-2} 39-43 {39-44} 5. {1} 49x38
+{49x32 or 49x27 or 49x21 or 49x16} 2-0
 ```
 
 Long comments wrap between alternatives. Different capture routes producing the
@@ -1794,8 +1812,41 @@ The input accepts plain FEN, not the `{DTM}` annotation printed by example tools
 The library function is `gwdegtb_dtm_pv(directory, fen, output, error, error_size)`
 in `dtm_pv.h`. It checks every legal successor at each decisive position and
 fails on missing databases, unreadable pages or inconsistent DTM values; a
-failed call can leave a partial PV in the output stream. This checks the PV and
+failed call produces no PV in the output stream. This checks the PV and
 its immediate alternatives, not the entire database. Existing files are opened
 read-only and each lookup decodes its page afresh, without page/result caching;
 open handles are retained for the call and normal OS file buffering still applies.
 Use this diagnostic API single-threaded, without concurrent probes of these files.
+
+## Parallel shared-cache initialization
+
+At quiescent dependency-maintenance checkpoints, cache replacement initializes
+atomic slot metadata and page words in parallel using the generation worker
+count. Work is capped at 256 threads and at one worker per 4 MiB of payload;
+small caches therefore remain single-threaded. No probing resumes until all
+initializers have joined. Failed thread creation falls back to initializing that
+range on the calling thread. Normal concurrent first-time dependency admission
+remains single-threaded to avoid nested worker teams.
+
+Discard-resize logs split the pause into `free-old`, `allocate`, and `initialize`,
+with the actual initialization thread count and total elapsed time. Freeing old
+storage remains serial. Retained-page migration now uses parallel disjoint source
+ranges too. Atomic destination claims handle collisions during fractional resizing;
+which colliding page survives may vary, but database values cannot change.
+The allocation-before-free budget rules and discard-resize failure fallback are unchanged.
+
+With progress logging enabled, migration logs include allocation, initialization,
+migration, freeing and total seconds, actual worker counts, copied pages and
+collision drops. Resident dependency loads report start/completion, size and elapsed
+time (one loader thread per database; different loads can overlap). DTM page-directory
+load/validation, writes and storage-statistics processing report their own elapsed
+times and directory sizes. These measurements add no timing calls to cache hits;
+overlapping or nested operations must not be summed as application wall time.
+
+`make test_shared_init` builds a portable regression test. Run
+`./test_shared_init 4096` to benchmark 4 GiB initialization and populated-cache
+retained migration (4-to-6-to-3 GiB) with 1/8/16/32/64 threads, three rounds with reversed middle
+order. It creates and removes its own temporary backing file. See
+`reports/2026-09-25-parallel-cache-initialization.md` for local results.
+Migration results and the new logging fields are described in
+`reports/2026-09-25-parallel-cache-migration.md`.

@@ -116,6 +116,10 @@ typedef struct {
     DraughtsMove move;
 } Alternative;
 typedef struct {
+    unsigned move_number, white_pieces, black_pieces;
+    int16_t dtm;
+} Conversion;
+typedef struct {
     Context *context;
     DraughtsPosition position;
     EgtbSide side;
@@ -186,6 +190,10 @@ bool gwdegtb_dtm_pv(const char *directory, const char *fen, FILE *output,
     if (error && error_size) *error = 0;
     if (!directory || !fen || !output || !parse(fen, &p, &side))
         return failure(&c, "invalid FEN (use W:W27,K32:B12,K8; at most eight pieces)");
+    FILE *pv_output = tmpfile();
+    if (!pv_output) return failure(&c, "cannot create temporary PV stream");
+    Conversion conversions[EGTB_MAX_PIECES];
+    size_t conversion_count = 0;
     int expected = 32768;
     unsigned move_number = 1;
     size_t column = 0;
@@ -196,8 +204,18 @@ bool gwdegtb_dtm_pv(const char *directory, const char *fen, FILE *output,
             failure(&c, "DTM progression mismatch at ply %u: stored=%d expected=%d", ply, value, expected);
             goto done;
         }
+        EgtbMaterial material = egtb_position_material(&p);
+        unsigned white_pieces = material.white_kings + material.white_men;
+        unsigned black_pieces = material.black_kings + material.black_men;
+        if (white_pieces && black_pieces &&
+            (!conversion_count ||
+             conversions[conversion_count - 1].white_pieces != white_pieces ||
+             conversions[conversion_count - 1].black_pieces != black_pieces)) {
+            conversions[conversion_count++] = (Conversion){move_number, white_pieces,
+                                                        black_pieces, value};
+        }
         if (value == EGTB_DRAW) {
-            print_token(output, &column, "1-1"); ok = true; goto done;
+            print_token(pv_output, &column, "1-1"); ok = true; goto done;
         }
         Choices choices = {.context=&c, .position=p, .side=side,
                            .win=32768, .all_won=true, .ok=true};
@@ -216,28 +234,27 @@ bool gwdegtb_dtm_pv(const char *directory, const char *fen, FILE *output,
         }
         if (!count) {
             free(choices.ties);
-            print_token(output, &column, side == EGTB_WHITE_TO_MOVE ? "0-2" : "2-0");
+            print_token(pv_output, &column, side == EGTB_WHITE_TO_MOVE ? "0-2" : "2-0");
             ok = true; goto done;
         }
         DraughtsMove *m = &choices.best;
         char token[128];
         if (side == EGTB_WHITE_TO_MOVE || ply == 0)
-            snprintf(token, sizeof token, "%u%s %u%c%u {%d%s", move_number,
+            snprintf(token, sizeof token, "%u%s {%d} %u%c%u", move_number,
                      side == EGTB_WHITE_TO_MOVE ? "." : "...",
-                     m->from + 1, m->captured ? 'x' : '-', m->to + 1, value,
-                     choices.tie_count > 1 ? "," : "}");
+                     value, m->from + 1, m->captured ? 'x' : '-', m->to + 1);
         else
-            snprintf(token, sizeof token, "%u%c%u {%d%s",
-                     m->from + 1, m->captured ? 'x' : '-', m->to + 1, value,
-                     choices.tie_count > 1 ? "," : "}");
-        print_token(output, &column, token);
+            snprintf(token, sizeof token, "{%d} %u%c%u", value,
+                     m->from + 1, m->captured ? 'x' : '-', m->to + 1);
+        print_token(pv_output, &column, token);
         /* The first distinct successor is the selected move. */
         for (size_t i = 1; i < choices.tie_count; ++i) {
             const DraughtsMove *alternative = &choices.ties[i].move;
-            snprintf(token, sizeof token, "%u%c%u%s", alternative->from + 1,
+            snprintf(token, sizeof token, "%s%u%c%u%s",
+                     i == 1 ? "{" : "", alternative->from + 1,
                      alternative->captured ? 'x' : '-', alternative->to + 1,
                      i + 1 == choices.tie_count ? "}" : " or");
-            print_token(output, &column, token);
+            print_token(pv_output, &column, token);
         }
         free(choices.ties);
         if (!draughts_do_move(&p, side, m, NULL)) { failure(&c, "cannot apply move"); goto done; }
@@ -247,12 +264,34 @@ bool gwdegtb_dtm_pv(const char *directory, const char *fen, FILE *output,
     }
     failure(&c, "PV exceeds maximum DTM length");
 done:
-    if (column) fputc('\n', output);
+    if (column) fputc('\n', pv_output);
     while (c.files) {
         Database *d = c.files; c.files = d->next;
         if (d->db) egtb_close(d->db);
         eg_indexer_destroy(&d->indexer); free(d);
     }
-    if (ok && ferror(output)) return failure(&c, "output write failed");
+    if (ok && !ferror(pv_output) && !fseek(pv_output, 0, SEEK_SET)) {
+        size_t comment_column = 0;
+        for (size_t i = 0; i < conversion_count; ++i) {
+            char token[64];
+            snprintf(token, sizeof token, "%s%u/%d/%ux%u%s",
+                     i == 0 ? "{" : "", conversions[i].move_number,
+                     conversions[i].dtm, conversions[i].white_pieces,
+                     conversions[i].black_pieces,
+                     i + 1 == conversion_count ? "}" : "");
+            print_token(output, &comment_column, token);
+        }
+        if (comment_column) fputc('\n', output);
+        char buffer[4096];
+        size_t n;
+        while ((n = fread(buffer, 1, sizeof buffer, pv_output)) != 0)
+            if (fwrite(buffer, 1, n, output) != n) { ok = false; break; }
+        if (ferror(pv_output) || ferror(output)) ok = false;
+    } else if (ok) {
+        ok = false;
+    }
+    fclose(pv_output);
+    if (!ok && error && error_size && !*error)
+        failure(&c, "PV output failed");
     return ok;
 }

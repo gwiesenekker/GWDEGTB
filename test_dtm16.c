@@ -96,6 +96,7 @@ done:
 static bool legacy(const char *path, unsigned version)
 {
     unsigned char bytes[1024];
+    EgtbFileInfo info;
     Egtb *db = NULL;
     EgtbView *view = NULL;
     EgtbResident *resident = NULL;
@@ -104,6 +105,11 @@ static bool legacy(const char *path, unsigned version)
     for (size_t i = 0; i < 512; ++i)
         bytes[version == 2 ? i * 2 : i] = (unsigned char)(i % 256);
     if (!fixture(path, version, bytes, sizeof(bytes), crc(bytes, sizeof(bytes))))
+        return false;
+    if (!egtb_file_info(path, &info) || info.format_version != version ||
+        info.compression_level != 1 || info.page_size != 1024 ||
+        info.maximum_index != 511 || info.page_count != (version == 2 ? 1u : 2u) ||
+        !info.exact_layout || info.planar != (version == 3))
         return false;
     for (unsigned pass = 0; pass < 3; ++pass) {
         EgtbSequentialReader reader;
@@ -251,6 +257,12 @@ static bool wide(const char *path, const char *wdl_path)
         db = NULL;
         if (!egtb_compact_copy(path, 2) || !egtb_compact(path, 3, 2)) goto done;
     }
+    EgtbFileInfo info;
+    if (!egtb_file_info(path, &info) || info.format_version != 4 ||
+        info.compression_level != 3 || info.maximum_index != 32767 ||
+        info.page_size != 1024 || info.page_count != 128 ||
+        !info.planar || !info.exact_layout)
+        goto done;
     if (!wdl_compile(path, wdl_path, 1, 2, NULL, NULL) ||
         !wdl_open(&wdl, wdl_path, 2, 1, 2)) goto done;
     for (uint64_t i = 0; i < 32768; ++i)

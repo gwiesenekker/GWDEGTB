@@ -844,7 +844,7 @@ static bool admit_private(DependencyResidentPool *p, ResidentEntry *e, double no
 {
     EgtbSharedCache *cache = NULL;
     double started = monotonic_seconds();
-    bool ok = egtb_shared_cache_create(&cache, e->backing, (size_t)p->shared_bytes);
+    bool ok = egtb_shared_cache_create_threads(&cache, e->backing, (size_t)p->shared_bytes, p->workers);
     for (PrivateRegistration *r=e->private_views; ok && r; r=r->next)
         ok = egtb_shared_probe_create(&r->prepared, cache);
     if (!ok) {
@@ -1200,6 +1200,7 @@ void dependency_shared_maintain_at(DependencyResidentPool *p, double now)
     /* Track dense and cold entries as well. Counter resets restart idle grace. */
     for (ResidentEntry *e = p->entries; e; e = e->next) {
         if (!e->shared) continue;
+        egtb_shared_cache_set_threads(e->shared, p->workers);
         EgtbCacheStatistics s;
         egtb_shared_cache_statistics(e->shared, &s);
         bool valid_window = e->activity_seen && s.lookups >= e->activity_lookups && now > e->activity_time;
@@ -1531,7 +1532,12 @@ bool dependency_resident_acquire(DependencyResidentPool *p, Egtb *backing,
     e->loading = true;
     pthread_mutex_unlock(&p->mutex);
     EgtbResident *resident = NULL;
+    double load_started = monotonic_seconds();
+    if (egtb_progress_enabled())
+        egtb_progress_log("resident dependency load: database=%s MiB=%.2f threads=1 started\n",
+                          entry_name(e), (double)bytes / 1048576);
     bool ok = egtb_resident_load_quiet(&resident, backing);
+    double load_seconds = monotonic_seconds() - load_started;
     char message[256] = "";
     if (!ok) snprintf(message, sizeof(message), "%s", egtb_last_error());
     pthread_mutex_lock(&p->mutex);
@@ -1545,6 +1551,10 @@ bool dependency_resident_acquire(DependencyResidentPool *p, Egtb *backing,
     pthread_cond_broadcast(&p->changed);
     *out = resident;
     pthread_mutex_unlock(&p->mutex);
+    if (egtb_progress_enabled())
+        egtb_progress_log("resident dependency load: database=%s MiB=%.2f threads=1 elapsed=%.6fs result=%s\n",
+                          entry_name(e), (double)bytes / 1048576, load_seconds,
+                          ok ? "completed" : "failed");
     return ok;
 }
 

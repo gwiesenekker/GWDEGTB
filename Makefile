@@ -9,6 +9,16 @@ COMPAT_DIR ?= ../compat
 CPPFLAGS += -I$(COMPAT_DIR)
 .DEFAULT_GOAL := all
 
+# Isolated experimental cache benchmark; includes egtb.c, never link egtb.o.
+benchmark_segmented_cache: benchmark_segmented_cache.c egtb.c egtb.h cache_modulo.h compat.o progress.o
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) -o $@ benchmark_segmented_cache.c compat.o progress.o $(LDLIBS)
+
+benchmark_lazy_cache: benchmark_lazy_cache.c benchmark_segmented_cache.c egtb.c egtb.h cache_modulo.h compat.o progress.o
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) -o $@ benchmark_lazy_cache.c compat.o progress.o $(LDLIBS)
+
+benchmark_hybrid_cache: benchmark_hybrid_cache.c benchmark_segmented_cache.c egtb.c egtb.h cache_modulo.h compat.o progress.o
+	$(CC) $(CPPFLAGS) $(BENCH_CFLAGS) -o $@ benchmark_hybrid_cache.c compat.o progress.o $(LDLIBS)
+
 # Shared platform layer (also linked by tools using the library internals).
 compat.o: $(COMPAT_DIR)/compat.c $(COMPAT_DIR)/compat.h
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $(COMPAT_DIR)/compat.c
@@ -119,6 +129,14 @@ libgwdegtb.a: gwdegtb.o wdl.o egtb.o progress.o material.o endgame_index.o dtm_f
 	$(AR) rcs $@ $^
 
 all: dtm_pv
+all: dtm_to_wdl
+all: dtm_info
+dtm_info: dtm_info.o libgwdegtb.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
+dtm_to_wdl: dtm_to_wdl.o libgwdegtb.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
+test_database_files: test_database_files.o libgwdegtb.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
 dtm_pv: dtm_pv_main.o libgwdegtb.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
 test_dtm_pv: test_dtm_pv.o libgwdegtb.a
@@ -127,6 +145,13 @@ test: test-pv
 .PHONY: test-pv
 test-pv: test_dtm_pv
 	./test_dtm_pv
+
+test_shared_init: test_shared_init.o libgwdegtb.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $^ $(LDLIBS)
+.PHONY: test-shared-init
+test: test-shared-init
+test-shared-init: test_shared_init
+	./test_shared_init
 
 generate_egtb.o: revision.h
 
@@ -283,6 +308,10 @@ test_frontier: test_frontier.c frontier.c frontier.h crc32c.h
 test: test_progress test_8piece test_frontier
 
 clean:
+	$(RM) dtm_info dtm_info.o
+	$(RM) dtm_to_wdl dtm_to_wdl.o
+	$(RM) test_database_files test_database_files.o
+	$(RM) test_shared_init test_shared_init.o
 	$(RM) dtm_pv dtm_pv_main.o dtm_pv.o test_dtm_pv test_dtm_pv.o
 	$(RM) compat.o test_compat_include test_compat_runtime test_platform_guards
 	$(RM) test_slice_order test_slice_order.o

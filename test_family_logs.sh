@@ -12,7 +12,7 @@ else
 fi
 STUB
 chmod +x "$work/generate_egtb"
-for family in 1x1 2x1 2x2 3x1 3x2 4x1 3x3 4x2 5x1 4x3 5x2 6x1 4x4; do
+for family in 1x1 2x1 2x2 3x1 3x2 4x1 3x3 4x2 5x1 4x3 5x2 6x1 4x4 5x3; do
     cp "$root/$family.sh" "$work/$family.sh"
     sh -n "$work/$family.sh"
     EGTB_LOG_DIR="$work/logs/$family" sh "$work/$family.sh" > /dev/null

@@ -59,10 +59,10 @@ int main(void)
     CHECK(egtb_get_uncached(db, index, EGTB_WHITE_TO_MOVE, &value) && value == 1);
     CHECK(!egtb_get_uncached(db, eg_position_count(&indexer), EGTB_WHITE_TO_MOVE, &value));
     CHECK(egtb_close(db)); db = NULL;
-    CHECK(run(dir, "W:WK49:B43", true, "1. 49x38 {1, 49x32 or 49x27 or 49x21 or 49x16} 2-0\n"));
-    CHECK(run(dir, "W:WK47:B41", true, "1. 47x36 {1} 2-0\n"));
-    CHECK(run(dir, "B:W8:BK2", true, "1... 2x13 {1, 2x19 or 2x24 or 2x30 or 2x35} 0-2\n"));
-    CHECK(run(dir, "W:WK50:B45", true, "1-1\n"));
+    CHECK(run(dir, "W:WK49:B43", true, "{1/1/1x1}\n1. {1} 49x38 {49x32 or 49x27 or 49x21 or 49x16} 2-0\n"));
+    CHECK(run(dir, "W:WK47:B41", true, "1. {1} 47x36 2-0\n"));
+    CHECK(run(dir, "B:W8:BK2", true, "{1/1/1x1}\n1... {1} 2x13 {2x19 or 2x24 or 2x30 or 2x35} 0-2\n"));
+    CHECK(run(dir, "W:WK50:B45", true, "{1/-1/1x1}\n1-1\n"));
     CHECK(run(dir, "W:W:B1", true, "0-2\n"));
     CHECK(run(dir, "W:WK49:B49", false, "invalid FEN"));
     CHECK(run(dir, "W:W1:B40", false, "invalid FEN"));

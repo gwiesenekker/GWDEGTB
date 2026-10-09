@@ -414,6 +414,35 @@ static bool read_header(Egtb *egtb)
     return true;
 }
 
+bool egtb_file_info(const char *path, EgtbFileInfo *info)
+{
+    Egtb header = {0};
+    CompatStat status;
+    bool ok;
+    if (path == NULL || info == NULL)
+        return fail("invalid EGTB file-info argument");
+    memset(info, 0, sizeof(*info));
+    header.file = fopen(path, "rb");
+    if (header.file == NULL)
+        return fail("cannot open %s: %s", path, strerror(errno));
+    ok = read_header(&header);
+    if (ok && (compat_fstat(compat_fileno(header.file), &status) != 0 ||
+               status.st_size < 0 || (uint64_t)status.st_size < header.data_offset))
+        ok = fail("DTM file is shorter than its header and page directory");
+    if (fclose(header.file) != 0)
+        ok = fail("cannot close %s: %s", path, strerror(errno));
+    if (!ok) return false;
+    info->format_version = header.format_version;
+    info->compression_level = header.compression_level;
+    info->page_size = header.page_size;
+    info->maximum_index = header.maximum_index;
+    info->page_count = header.page_count;
+    info->reserve_percent = header.reserve_percent;
+    info->exact_layout = header.exact_layout;
+    info->planar = header.planar;
+    return true;
+}
+
 static uint32_t mix32(uint32_t value)
 {
     value ^= value >> 16;
@@ -978,7 +1007,19 @@ static bool cached_page(Egtb *egtb, uint64_t page, size_t *result)
     return true;
 }
 
-static bool write_directory(Egtb *egtb)
+static double shared_clock(void);
+
+static void directory_timing(Egtb *db, const char *operation, double started, bool ok)
+{
+    if (egtb_progress_enabled())
+        egtb_progress_log("DTM page-directory: database=%s operation=%s pages=%" PRIu64
+            " directory-MiB=%.2f threads=1 elapsed=%.6fs result=%s\n",
+            db->path, operation, db->page_count,
+            (double)db->page_count * EGTB_DIRECTORY_ENTRY_SIZE / 1048576,
+            shared_clock()-started, ok ? "completed" : "failed");
+}
+
+static bool write_directory_impl(Egtb *egtb)
 {
     unsigned char buffer[EGTB_DIRECTORY_ENTRY_SIZE * 4096];
     uint64_t page = 0;
@@ -1002,6 +1043,15 @@ static bool write_directory(Egtb *egtb)
         page += count;
     }
     return true;
+}
+
+static bool write_directory(Egtb *egtb)
+{
+    if (egtb->readonly) return true;
+    double started = shared_clock();
+    bool ok = write_directory_impl(egtb);
+    directory_timing(egtb,"write",started,ok);
+    return ok;
 }
 
 static void destroy_egtb(Egtb *egtb)
@@ -1049,7 +1099,7 @@ static bool allocate_runtime(Egtb *egtb, size_t cache_pages)
     return cache_init(egtb, cache_pages);
 }
 
-static bool load_directory(Egtb *egtb)
+static bool load_directory_impl(Egtb *egtb)
 {
     unsigned char buffer[EGTB_DIRECTORY_ENTRY_SIZE * 4096];
     uint64_t page = 0;
@@ -1082,6 +1132,14 @@ static bool load_directory(Egtb *egtb)
         page += count;
     }
     return true;
+}
+
+static bool load_directory(Egtb *egtb)
+{
+    double started = shared_clock();
+    bool ok = load_directory_impl(egtb);
+    directory_timing(egtb,"load-and-validate",started,ok);
+    return ok;
 }
 
 static bool open_common(Egtb **out, const char *path, bool readonly,
@@ -1745,6 +1803,8 @@ struct EgtbSharedCache {
     bool dense;
     my_mutex_t probes_mutex;
     EgtbSharedProbe *probes;
+    unsigned initialization_threads;
+    EgtbSharedInitTiming init_timing;
 };
 
 struct EgtbSharedProbe {
@@ -1776,7 +1836,79 @@ void egtb_view_load_timing(const EgtbView *v, uint64_t *samples, uint64_t *ns)
     *ns = v ? v->load_ns : 0;
 }
 
+static double shared_clock(void)
+{
+    struct timespec ts;
+    return compat_monotonic(&ts) == 0 ? (double)ts.tv_sec + ts.tv_nsec * 1e-9 : 0;
+}
+
+typedef struct {
+    EgtbSharedCache *cache;
+    size_t first, end;
+} SharedInitWorker;
+
+static void *shared_initialize_range(void *opaque)
+{
+    SharedInitWorker *w = opaque;
+    EgtbSharedCache *c = w->cache;
+    for (size_t i = w->first; i < w->end; ++i) {
+        atomic_init(&c->slots[i].sequence, 0);
+        atomic_init(&c->slots[i].tag, UINT64_MAX);
+    }
+    for (size_t i = w->first * c->words_per_page;
+         i < w->end * c->words_per_page; ++i)
+        atomic_init(&c->words[i], 0);
+    return NULL;
+}
+
+void egtb_shared_cache_set_threads(EgtbSharedCache *c, unsigned threads)
+{
+    if (c) c->initialization_threads = threads ? (threads > 256 ? 256 : threads) : 1;
+}
+
+void egtb_shared_cache_init_timing(const EgtbSharedCache *c, EgtbSharedInitTiming *timing)
+{
+    if (timing) *timing = c ? c->init_timing : (EgtbSharedInitTiming){0};
+}
+
+static void shared_initialize(EgtbSharedCache *c)
+{
+    /* Avoid thread-start costs for small caches; at least 4 MiB per worker. */
+    size_t useful = egtb_shared_cache_bytes(c) / (4 * 1024 * 1024);
+    unsigned count = c->initialization_threads;
+    if (count > useful) count = (unsigned)useful;
+    if (!count) count = 1;
+    my_thread_t threads[256];
+    SharedInitWorker workers[256];
+    bool started[256] = {false};
+    size_t quotient = c->capacity / count, remainder = c->capacity % count;
+    unsigned actual = 1;
+    for (unsigned i = 0; i < count; ++i) {
+        size_t first = i * quotient + (i < remainder ? i : remainder);
+        workers[i] = (SharedInitWorker){c, first, first + quotient + (i < remainder)};
+        if (i + 1 < count && !compat_thread_create(&threads[i], shared_initialize_range, &workers[i])) {
+            started[i] = true; ++actual;
+        } else {
+            /* Thread creation failure is harmless: initialize that range here. */
+            shared_initialize_range(&workers[i]);
+        }
+    }
+    for (unsigned i = 0; i < count; ++i) {
+        if (started[i] && compat_thread_join(threads[i])) {
+            /* Cannot release live worker storage safely after a failed join. */
+            abort();
+        }
+    }
+    c->init_timing.initialization_threads = actual;
+}
+
 bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes)
+{
+    return egtb_shared_cache_create_threads(out, backing, bytes, 1);
+}
+
+bool egtb_shared_cache_create_threads(EgtbSharedCache **out, Egtb *backing,
+                                      size_t bytes, unsigned threads)
 {
     if (!out) return fail("invalid shared cache output");
     *out = NULL;
@@ -1793,6 +1925,8 @@ bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes
     size_t capacity = per_side * sides;
     if (capacity > SIZE_MAX / sizeof(SharedSlot))
         return fail("shared cache metadata size overflow");
+    if (capacity > SIZE_MAX / backing->memory_page_size)
+        return fail("shared cache payload size overflow");
     EgtbSharedCache *c = calloc(1, sizeof(*c));
     if (!c) return fail("cannot allocate shared cache");
     if (compat_mutex_init(&c->probes_mutex)) {
@@ -1801,18 +1935,18 @@ bool egtb_shared_cache_create(EgtbSharedCache **out, Egtb *backing, size_t bytes
     c->backing = backing; c->per_side = per_side; c->capacity = capacity;
     c->modulo = cache_modulo_init(per_side);
     c->dense = dense; c->words_per_page = backing->memory_page_size / 8;
+    egtb_shared_cache_set_threads(c, threads);
+    double started = shared_clock();
     c->slots = compat_aligned_alloc(64, capacity * sizeof(SharedSlot));
     c->words = malloc(capacity * backing->memory_page_size);
     if (!c->slots || !c->words) {
         egtb_shared_cache_destroy(c);
         return fail("cannot allocate optimistic cache storage");
     }
-    for (size_t i = 0; i < capacity; ++i) {
-        atomic_init(&c->slots[i].sequence, 0);
-        atomic_init(&c->slots[i].tag, UINT64_MAX);
-    }
-    for (size_t i = 0; i < capacity * c->words_per_page; ++i)
-        atomic_init(&c->words[i], 0);
+    c->init_timing.allocation_seconds = shared_clock() - started;
+    started = shared_clock();
+    shared_initialize(c);
+    c->init_timing.initialization_seconds = shared_clock() - started;
     *out = c;
     return true;
 }
@@ -1878,6 +2012,7 @@ static void shared_swap_storage(EgtbSharedCache *c, EgtbSharedCache *next)
     c->slots = next->slots; c->words = next->words;
     c->per_side = next->per_side; c->capacity = next->capacity;
     c->dense = next->dense; c->modulo = next->modulo;
+    c->init_timing = next->init_timing;
     next->slots = slots; next->words = words;
 }
 
@@ -1898,45 +2033,100 @@ bool egtb_shared_cache_discard_resize(EgtbSharedCache *c, size_t bytes)
     /* Allocate the safety net before discarding anything. If the large allocation
      * fails, existing probes can still serve every lookup through this cache. */
     if (!egtb_shared_cache_create(&fallback, c->backing, minimum)) return false;
+    uint64_t old_bytes = egtb_shared_cache_bytes(c);
+    double started = shared_clock();
     shared_swap_storage(c, fallback);
     egtb_shared_cache_destroy(fallback);
-    if (!egtb_shared_cache_create(&next, c->backing, bytes)) return false;
+    double free_seconds = shared_clock() - started;
+    if (!egtb_shared_cache_create_threads(&next, c->backing, bytes, c->initialization_threads)) return false;
     shared_swap_storage(c, next);
     egtb_shared_cache_destroy(next);
+    if (old_bytes >= 16 * 1024 * 1024 || egtb_shared_cache_bytes(c) >= 16 * 1024 * 1024)
+        egtb_progress_log("shared cache discard-resize timing: database=%s free-old=%.6fs allocate=%.6fs initialize=%.6fs initialization-threads=%u total=%.6fs\n",
+            egtb_path(c->backing), free_seconds, c->init_timing.allocation_seconds,
+            c->init_timing.initialization_seconds, c->init_timing.initialization_threads,
+            shared_clock() - started);
     return true;
 }
 
-bool egtb_shared_cache_resize(EgtbSharedCache *c, size_t bytes)
+typedef struct {
+    EgtbSharedCache *source, *destination;
+    size_t first, end;
+    uint64_t copied, collisions;
+} SharedMigrationWorker;
+
+static void *shared_migrate_range(void *opaque)
 {
-    if (!c) return fail("invalid shared cache resize");
-    if (shared_per_side(c->backing, bytes) == c->per_side) return true;
-    EgtbSharedCache *next;
-    if (!egtb_shared_cache_create(&next, c->backing, bytes)) return false;
-    for (size_t old = 0; old < c->capacity; ++old) {
+    SharedMigrationWorker *w = opaque;
+    EgtbSharedCache *c = w->source, *next = w->destination;
+    for (size_t old = w->first; old < w->end; ++old) {
         uint64_t tag = atomic_load_explicit(&c->slots[old].tag, memory_order_relaxed);
         if (tag == UINT64_MAX) continue;
         size_t side = c->backing->planar && tag >= c->backing->side_page_count;
         uint64_t page = tag - side * c->backing->side_page_count;
         size_t slot = (next->dense ? (size_t)page : (size_t)cache_modulo(page, next->modulo))
                       + side * next->per_side;
-        /* Fractional growth or shrinking may merge old slots. Keep the first entry;
-         * sequence numbers are replacement counters, not global recency. */
-        if (atomic_load_explicit(&next->slots[slot].tag, memory_order_relaxed) != UINT64_MAX)
+        /* Fractional resizing can merge slots. Claim before copying: losing
+         * workers must never touch the winner's data. Probes remain quiescent
+         * until every migration worker joins, so relaxed ordering suffices. */
+        uint64_t expected = 0;
+        if (!atomic_compare_exchange_strong_explicit(&next->slots[slot].sequence,
+                &expected, 1, memory_order_relaxed, memory_order_relaxed)) {
+            ++w->collisions;
             continue;
-        for (size_t w = 0; w < c->words_per_page; ++w)
-            atomic_store_explicit(&next->words[slot * c->words_per_page + w],
-                atomic_load_explicit(&c->words[old * c->words_per_page + w],
+        }
+        for (size_t word = 0; word < c->words_per_page; ++word)
+            atomic_store_explicit(&next->words[slot * c->words_per_page + word],
+                atomic_load_explicit(&c->words[old * c->words_per_page + word],
                                      memory_order_relaxed), memory_order_relaxed);
         atomic_store_explicit(&next->slots[slot].tag, tag, memory_order_relaxed);
         atomic_store_explicit(&next->slots[slot].sequence, 2, memory_order_relaxed);
+        ++w->copied;
     }
-    SharedSlot *old_slots = c->slots;
-    _Atomic uint64_t *old_words = c->words;
-    c->slots = next->slots; c->words = next->words;
-    c->per_side = next->per_side; c->capacity = next->capacity; c->dense = next->dense;
-    c->modulo = next->modulo;
-    next->slots = old_slots; next->words = old_words;
+    return NULL;
+}
+
+bool egtb_shared_cache_resize(EgtbSharedCache *c, size_t bytes)
+{
+    if (!c) return fail("invalid shared cache resize");
+    if (shared_per_side(c->backing, bytes) == c->per_side) return true;
+    double started = shared_clock();
+    EgtbSharedCache *next;
+    if (!egtb_shared_cache_create_threads(&next, c->backing, bytes, c->initialization_threads)) return false;
+    double migration_started = shared_clock();
+    size_t useful = egtb_shared_cache_bytes(c) / (4 * 1024 * 1024);
+    unsigned count = c->initialization_threads;
+    if (count > useful) count = (unsigned)useful;
+    if (!count) count = 1;
+    SharedMigrationWorker workers[256];
+    my_thread_t threads[256];
+    bool running[256] = {false};
+    unsigned actual = 1;
+    size_t quotient = c->capacity / count, remainder = c->capacity % count;
+    for (unsigned i=0; i<count; ++i) {
+        size_t first = i * quotient + (i < remainder ? i : remainder);
+        workers[i] = (SharedMigrationWorker){c,next,first,first+quotient+(i<remainder),0,0};
+        if (i+1<count && !compat_thread_create(&threads[i],shared_migrate_range,&workers[i])) {
+            running[i]=true; ++actual;
+        } else shared_migrate_range(&workers[i]);
+    }
+    uint64_t copied=0, collisions=0;
+    for (unsigned i=0; i<count; ++i) {
+        if (running[i] && compat_thread_join(threads[i])) abort();
+        copied+=workers[i].copied; collisions+=workers[i].collisions;
+    }
+    double migration_seconds = shared_clock()-migration_started;
+    double free_started = shared_clock();
+    uint64_t old_bytes = egtb_shared_cache_bytes(c);
+    shared_swap_storage(c,next);
     egtb_shared_cache_destroy(next);
+    double free_seconds = shared_clock()-free_started;
+    if (egtb_progress_enabled() &&
+        (old_bytes >= 16*1024*1024 || egtb_shared_cache_bytes(c) >= 16*1024*1024))
+        egtb_progress_log("shared cache migration timing: database=%s allocate=%.6fs initialize=%.6fs initialization-threads=%u migrate=%.6fs migration-threads=%u copied-pages=%" PRIu64 " collision-drops=%" PRIu64 " free-old=%.6fs total=%.6fs\n",
+            egtb_path(c->backing),c->init_timing.allocation_seconds,
+            c->init_timing.initialization_seconds,c->init_timing.initialization_threads,
+            migration_seconds,actual,copied,collisions,free_seconds,shared_clock()-started);
     return true;
 }
 
@@ -2827,7 +3017,7 @@ bool egtb_resize_cache(Egtb *egtb, size_t cache_pages)
     return cache_init(egtb, cache_pages);
 }
 
-bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics)
+static bool storage_statistics_impl(Egtb *egtb, EgtbStorageStatistics *statistics)
 {
     uint64_t page = 0;
     int64_t end;
@@ -2887,6 +3077,14 @@ bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics)
         return fail("cannot determine EGTB file size");
     statistics->file_bytes = (uint64_t)end;
     return true;
+}
+
+bool egtb_storage_statistics(Egtb *egtb, EgtbStorageStatistics *statistics)
+{
+    double started = shared_clock();
+    bool ok = storage_statistics_impl(egtb,statistics);
+    if (egtb) directory_timing(egtb,"storage-statistics",started,ok);
+    return ok;
 }
 
 static bool registry_contains(const char *path)

@@ -1,9 +1,49 @@
 # Version history
 
 Published versions are Git tags. The `REVISION` file identifies the executable
-revision independently of individual commits; version 3.7 starts at 3.701.
+revision independently of individual commits; version 3.8 starts at 3.801.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
+
+## Version 3.8 — revision 3.801
+
+- Add generation scripts for the 5x3 and 6x2 material families.
+- No DTM or WDL file-format change.
+
+### Revision 3.706
+
+- Add `dtm_info` for fast, read-only inspection of the recorded DTM format
+  version, Zstd compression level and other fixed-header properties.
+
+### Revision 3.705
+
+- Add `dtm_to_wdl`, a multi-threaded command-line converter with explicit
+  thread count and compression level, output statistics, and safe existing-file
+  handling.
+
+### Revision 3.704
+
+- Place each pre-move DTM comment before its PV move and list equally optimal
+  alternatives in a separate comment after the move.
+
+### Revision 3.703
+
+- Parallelize retained-page cache migration, safely claiming destination slots
+  during fractional growth/shrink; preserve probe handles and quiescent publication.
+- Measure migration stages, resident dependency loading and DTM page-directory
+  loading/validation, writes and storage-statistics processing in progress logs.
+- Extend regression tests with populated-page migration, collisions and dense
+  transitions; record a local 1/8/16/32/64-thread migration benchmark.
+
+### Revision 3.702
+
+- Parallelize shared-cache replacement initialization at quiescent checkpoints
+  using the configured generation worker count, with a small-cache serial path
+  and caller-thread fallback for failed thread creation. Retained-page migration
+  and freeing old storage remain serial; lookup and budget rules are unchanged.
+- Split discard-resize timing into old-storage freeing, allocation and
+  initialization. Add portable regression coverage, a thread-failure test mode,
+  and a reproducible local initialization/resize benchmark.
 
 ## Version 3.7 — revision 3.701
 

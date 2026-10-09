@@ -1,0 +1,58 @@
+HYBRID,discard,0,donor-warmup,0.020105,decodes=32563,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,discard,0,receiver-warmup,0.072176,decodes=88251,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+[2026-09-25 10:48:42 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-1wO-1bX-1bO.dtm free-old=0.006562s allocate=0.000009s initialize=0.004732s initialization-threads=12 total=0.011304s
+[2026-09-25 10:48:42 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/1wX-2wO-1bX-1bO.dtm free-old=0.003164s allocate=0.000011s initialize=0.006466s initialization-threads=12 total=0.009642s
+TRANSFER,discard,0,0,0.021043
+HYBRID,discard,0,donor-after,0.036196,decodes=60327,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,discard,0,receiver-after,0.032707,decodes=60350,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+[2026-09-25 10:48:42 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/1wX-2wO-1bX-1bO.dtm free-old=0.004388s allocate=0.000019s initialize=0.003455s initialization-threads=8 total=0.007864s
+[2026-09-25 10:48:42 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-1wO-1bX-1bO.dtm free-old=0.004553s allocate=0.000013s initialize=0.008602s initialization-threads=16 total=0.013169s
+TRANSFER,discard,0,1,0.021087
+HYBRID,discard,0,donor-after,0.015530,decodes=32565,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,discard,0,receiver-after,0.043170,decodes=88126,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+[2026-09-25 10:48:42 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-1wO-1bX-1bO.dtm free-old=0.007063s allocate=0.000012s initialize=0.004492s initialization-threads=12 total=0.011569s
+[2026-09-25 10:48:42 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/1wX-2wO-1bX-1bO.dtm free-old=0.003224s allocate=0.000008s initialize=0.004796s initialization-threads=12 total=0.008029s
+TRANSFER,discard,0,2,0.019647
+HYBRID,discard,0,donor-after,0.030337,decodes=60485,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,discard,0,receiver-after,0.029603,decodes=60273,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+HYBRID,discard,0,donor-retired,0.026641,decodes=40073,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,discard,0,receiver-retired,0.020054,decodes=39862,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+HYBRID,migrate,0,donor-warmup,0.022943,decodes=32566,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,migrate,0,receiver-warmup,0.068168,decodes=88059,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+TRANSFER,migrate,0,0,0.029266
+HYBRID,migrate,0,donor-after,0.032788,decodes=40064,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,migrate,0,receiver-after,0.026247,decodes=49002,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+TRANSFER,migrate,0,1,0.030175
+HYBRID,migrate,0,donor-after,0.005648,decodes=8121,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,migrate,0,receiver-after,0.072150,decodes=80154,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+TRANSFER,migrate,0,2,0.028797
+HYBRID,migrate,0,donor-after,0.038485,decodes=40126,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,migrate,0,receiver-after,0.040691,decodes=49194,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+HYBRID,migrate,0,donor-retired,0.021658,decodes=40061,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,migrate,0,receiver-retired,0.026254,decodes=40018,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+HYBRID,split-segments,0,donor-warmup,0.020352,decodes=32582,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,split-segments,0,receiver-warmup,0.051867,decodes=88279,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+TRANSFER,split-segments,0,0,0.000578
+HYBRID,split-segments,0,donor-after,0.023618,decodes=39941,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,split-segments,0,receiver-after,0.025662,decodes=52272,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+TRANSFER,split-segments,0,1,0.000553
+HYBRID,split-segments,0,donor-after,0.008367,decodes=12143,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,split-segments,0,receiver-after,0.048208,decodes=79947,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+TRANSFER,split-segments,0,2,0.000776
+HYBRID,split-segments,0,donor-after,0.022899,decodes=39849,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,split-segments,0,receiver-after,0.031851,decodes=52111,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+HYBRID,split-segments,0,donor-retired,0.021777,decodes=39830,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,split-segments,0,receiver-retired,0.025717,decodes=39917,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+HYBRID,hybrid,0,donor-warmup,0.019159,decodes=32571,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,hybrid,0,receiver-warmup,0.046485,decodes=88060,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030
+TRANSFER,hybrid,0,0,0.000526
+HYBRID,hybrid,0,donor-after,0.021102,decodes=40152,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,hybrid,0,receiver-after,0.027271,decodes=50099,recovered=4072,promoted=4071,snapshot-retries=0,checksum=7892485030
+TRANSFER,hybrid,0,1,0.000479
+HYBRID,hybrid,0,donor-after,0.006356,decodes=10100,recovered=2070,promoted=2069,snapshot-retries=1,checksum=8046914715
+HYBRID,hybrid,0,receiver-after,0.044793,decodes=80283,recovered=1543,promoted=1543,snapshot-retries=0,checksum=7892485030
+TRANSFER,hybrid,0,2,0.000741
+HYBRID,hybrid,0,donor-after,0.020418,decodes=40047,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,hybrid,0,receiver-after,0.027395,decodes=50074,recovered=4088,promoted=4088,snapshot-retries=0,checksum=7892485030
+HYBRID,hybrid,0,donor-retired,0.020472,decodes=40112,recovered=0,promoted=0,snapshot-retries=0,checksum=8046914715
+HYBRID,hybrid,0,receiver-retired,0.022379,decodes=39925,recovered=0,promoted=0,snapshot-retries=0,checksum=7892485030

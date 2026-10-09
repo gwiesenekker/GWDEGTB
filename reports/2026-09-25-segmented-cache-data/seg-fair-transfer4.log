@@ -1,0 +1,84 @@
+RESULT,discard,0,donor-warmup,2,0.162364,24.636,94.6898,212405,6,151155529659
+RESULT,discard,0,receiver-warmup,2,0.221103,18.091,91.8157,327372,21,132160302925
+[2026-09-25 09:11:36 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-1bX-1bO.dtm free-old=0.035369s allocate=0.000018s initialize=0.039254s initialization-threads=16 total=0.074644s
+[2026-09-25 09:11:36 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-0bX-2bO.dtm free-old=0.017446s allocate=0.000041s initialize=0.044785s initialization-threads=16 total=0.062275s
+TRANSFER,discard,0,forward,0.137095
+RESULT,discard,0,donor-after,2,0.200684,19.932,92.5302,298789,27,151155529659
+RESULT,discard,0,receiver-after,2,0.197369,20.267,92.5391,298438,19,132160302925
+[2026-09-25 09:11:37 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-0bX-2bO.dtm free-old=0.027911s allocate=0.000009s initialize=0.039185s initialization-threads=16 total=0.067108s
+[2026-09-25 09:11:37 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-1bX-1bO.dtm free-old=0.026250s allocate=0.000027s initialize=0.063131s initialization-threads=16 total=0.089412s
+TRANSFER,discard,0,rollback,0.156605
+RESULT,discard,0,donor-rollback,2,0.175764,22.758,94.6900,212398,3,151155529659
+RESULT,discard,0,receiver-rollback,2,0.214665,18.634,91.8145,327419,23,132160302925
+RESULT,migrate,0,donor-warmup,2,0.203238,19.681,94.6900,212397,1,151155529659
+RESULT,migrate,0,receiver-warmup,2,0.210890,18.967,91.8161,327358,21,132160302925
+TRANSFER,migrate,0,forward,0.235928
+RESULT,migrate,0,donor-after,2,0.186466,21.452,96.0769,156922,33,151155529659
+RESULT,migrate,0,receiver-after,2,0.165477,24.173,94.6974,212106,27,132160302925
+TRANSFER,migrate,0,rollback,0.226767
+RESULT,migrate,0,donor-rollback,2,0.083155,48.103,98.8515,45940,1,151155529659
+RESULT,migrate,0,receiver-rollback,2,0.228027,17.542,93.6741,253037,21,132160302925
+RESULT,seg-linear,0,donor-warmup,2,0.161886,24.709,94.6900,212399,5,151155529659
+RESULT,seg-linear,0,receiver-warmup,2,0.222296,17.994,91.8150,327399,25,132160302925
+TRANSFER,seg-linear,0,forward,0.000696
+RESULT,seg-linear,0,donor-after,2,0.099754,40.099,97.4923,100306,1,151155529659
+RESULT,seg-linear,0,receiver-after,2,0.125701,31.822,96.0801,156795,2,132160302925
+TRANSFER,seg-linear,0,rollback,0.000665
+RESULT,seg-linear,0,donor-rollback,2,0.078279,51.099,98.2065,71739,1,151155529659
+RESULT,seg-linear,0,receiver-rollback,2,0.171443,23.331,94.0525,237898,27,132160302925
+RESULT,seg-linear,1,donor-warmup,2,0.164306,24.345,94.6898,212408,4,151155529659
+RESULT,seg-linear,1,receiver-warmup,2,0.227405,17.590,91.8167,327332,26,132160302925
+TRANSFER,seg-linear,1,forward,0.000915
+RESULT,seg-linear,1,donor-after,2,0.099031,40.391,97.4933,100267,2,151155529659
+RESULT,seg-linear,1,receiver-after,2,0.139894,28.593,96.0824,156703,1,132160302925
+TRANSFER,seg-linear,1,rollback,0.000789
+RESULT,seg-linear,1,donor-rollback,2,0.105884,37.777,98.2066,71737,2,151155529659
+RESULT,seg-linear,1,receiver-rollback,2,0.176152,22.708,94.0563,237750,25,132160302925
+RESULT,migrate,1,donor-warmup,2,0.200767,19.924,94.6899,212401,6,151155529659
+RESULT,migrate,1,receiver-warmup,2,0.269969,14.816,91.8144,327426,16,132160302925
+TRANSFER,migrate,1,forward,0.209376
+RESULT,migrate,1,donor-after,2,0.128241,31.191,96.0446,158218,30,151155529659
+RESULT,migrate,1,receiver-after,2,0.161128,24.825,94.7206,211175,21,132160302925
+TRANSFER,migrate,1,rollback,0.230815
+RESULT,migrate,1,donor-rollback,2,0.065089,61.455,98.8514,45945,2,151155529659
+RESULT,migrate,1,receiver-rollback,2,0.175978,22.730,93.6923,252308,25,132160302925
+RESULT,discard,1,donor-warmup,2,0.191492,20.889,94.6902,212391,8,151155529659
+RESULT,discard,1,receiver-warmup,2,0.210489,19.003,91.8154,327383,17,132160302925
+[2026-09-25 09:11:43 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-1bX-1bO.dtm free-old=0.040225s allocate=0.000031s initialize=0.044798s initialization-threads=16 total=0.085061s
+[2026-09-25 09:11:43 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-0bX-2bO.dtm free-old=0.000002s allocate=0.000030s initialize=0.045590s initialization-threads=16 total=0.045625s
+TRANSFER,discard,1,forward,0.130790
+RESULT,discard,1,donor-after,2,0.247253,16.178,92.5327,298689,27,151155529659
+RESULT,discard,1,receiver-after,2,0.199378,20.062,92.5400,298401,25,132160302925
+[2026-09-25 09:11:44 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-0bX-2bO.dtm free-old=0.033868s allocate=0.000001s initialize=0.020360s initialization-threads=16 total=0.054233s
+[2026-09-25 09:11:44 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-1bX-1bO.dtm free-old=0.034152s allocate=0.000013s initialize=0.056509s initialization-threads=16 total=0.090677s
+TRANSFER,discard,1,rollback,0.144997
+RESULT,discard,1,donor-rollback,2,0.164433,24.326,94.6898,212405,9,151155529659
+RESULT,discard,1,receiver-rollback,2,0.211853,18.881,91.8161,327355,22,132160302925
+RESULT,discard,2,donor-warmup,2,0.161832,24.717,94.6900,212399,4,151155529659
+RESULT,discard,2,receiver-warmup,2,0.225133,17.767,91.8169,327326,22,132160302925
+[2026-09-25 09:11:45 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-1bX-1bO.dtm free-old=0.045725s allocate=0.000022s initialize=0.040233s initialization-threads=16 total=0.085986s
+[2026-09-25 09:11:45 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-0bX-2bO.dtm free-old=0.000002s allocate=0.000022s initialize=0.046166s initialization-threads=16 total=0.046197s
+TRANSFER,discard,2,forward,0.132307
+RESULT,discard,2,donor-after,2,0.204335,19.576,92.5337,298650,14,151155529659
+RESULT,discard,2,receiver-after,2,0.209935,19.053,92.5378,298488,27,132160302925
+[2026-09-25 09:11:45 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-0bX-2bO.dtm free-old=0.033706s allocate=0.000002s initialize=0.021749s initialization-threads=16 total=0.055462s
+[2026-09-25 09:11:45 +0200] shared cache discard-resize timing: database=/tmp8/gwies/endgame7/2wX-2wO-1bX-1bO.dtm free-old=0.033633s allocate=0.000013s initialize=0.060268s initialization-threads=16 total=0.093918s
+TRANSFER,discard,2,rollback,0.149480
+RESULT,discard,2,donor-rollback,2,0.158822,25.185,94.6902,212390,3,151155529659
+RESULT,discard,2,receiver-rollback,2,0.208046,19.227,91.8144,327424,23,132160302925
+RESULT,migrate,2,donor-warmup,2,0.159910,25.014,94.6899,212403,7,151155529659
+RESULT,migrate,2,receiver-warmup,2,0.212257,18.845,91.8158,327368,21,132160302925
+TRANSFER,migrate,2,forward,0.208341
+RESULT,migrate,2,donor-after,2,0.180524,22.158,96.0611,157555,29,151155529659
+RESULT,migrate,2,receiver-after,2,0.209661,19.078,94.7042,211831,21,132160302925
+TRANSFER,migrate,2,rollback,0.232565
+RESULT,migrate,2,donor-rollback,2,0.066526,60.127,98.8515,45939,2,151155529659
+RESULT,migrate,2,receiver-rollback,2,0.248650,16.087,93.6744,253025,31,132160302925
+RESULT,seg-linear,2,donor-warmup,2,0.164958,24.249,94.6893,212427,9,151155529659
+RESULT,seg-linear,2,receiver-warmup,2,0.237198,16.864,91.8171,327316,26,132160302925
+TRANSFER,seg-linear,2,forward,0.000598
+RESULT,seg-linear,2,donor-after,2,0.105238,38.009,97.4882,100470,2,151155529659
+RESULT,seg-linear,2,receiver-after,2,0.129018,31.003,96.0831,156678,2,132160302925
+TRANSFER,seg-linear,2,rollback,0.000662
+RESULT,seg-linear,2,donor-rollback,2,0.090034,44.427,98.2089,71645,0,151155529659
+RESULT,seg-linear,2,receiver-rollback,2,0.179607,22.271,94.0529,237885,15,132160302925
