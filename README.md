@@ -42,7 +42,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current published version: **3.6**; executable revision **3.601**.
+Current published version: **3.9**; executable revision **3.901**.
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 ### Keep remote generation running with tmux
