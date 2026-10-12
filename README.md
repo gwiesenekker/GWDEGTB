@@ -42,7 +42,7 @@ index, international-rules move generation, multithreaded retrograde analysis,
 compressed DTM and WDL storage, consistency repair, final verification, and
 regression and performance tests.
 
-Current published version: **3.9**; executable revision **3.901**.
+Current published version: **3.10**; executable revision **3.1001**.
 See [Version history](CHANGELOG.md) for changes in each tagged version.
 
 ### Keep remote generation running with tmux
@@ -221,6 +221,33 @@ run, `--max-chunks N` stops after N successfully checked chunks with exit code
 2 rather than claiming the entire database is verified. A complete
 verification exits zero; a mismatch or I/O/checkpoint error exits nonzero.
 Without `--checkpoint`, the command retains its original single-pass behavior.
+
+For a collection of completed eight-piece DTMs, the Linux-only `verify_all.py`
+runs that same
+move-based verifier in the order specified by `4x4.sh`, `5x3.sh`, and `6x2.sh`.
+The DTM directory must contain the target files **and their lower-material
+dependencies**, and must remain unchanged during the campaign. Put the state
+directory elsewhere. It holds one checkpoint and timestamped log per material,
+plus an atomically replaced `summary.tsv` with `VERIFIED`, `PARTIAL`, `FAILED`,
+`INTERRUPTED`, or `NOT_CHECKED` status. Only a zero-exit, complete `verify_dtm` run earns
+`VERIFIED`; the report is not a replacement for the verifier's logs and
+checkpoints. A collection change stops the driver with `INPUTS_CHANGED`.
+
+```sh
+EGTB_RESIDENT_LIMIT_GIB=0 EGTB_VERIFICATION_CACHE_GIB=16 \
+    python3 verify_all.py --directory /path/to/all/dtms \
+    --state-directory /path/to/verification-state --threads 16
+```
+
+The driver stops at the first failure. Re-running the same command validates
+completed checkpoints and continues at the first incomplete database. For a
+bounded session, add `--max-chunks 1` (exit status 2 means partial, not failed).
+`--chunk-pages` controls checkpoint frequency. `--families 4x4` selects one
+family; the default selects all three eight-piece families in generation order.
+`--dry-run` prints the selected order, and `--limit N` selects the first N
+entries for a small test. A stable symlink directory can combine DTMs stored
+on separate devices without copying their contents; the source files remain
+read-only. Full verification may take hours per large database.
 
 The manually maintained `REVISION` file supplies the revision printed at
 startup. It is independent of Git tags and commit identifiers:

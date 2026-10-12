@@ -1,9 +1,20 @@
 # Version history
 
 Published versions are Git tags. The `REVISION` file identifies the executable
-revision independently of individual commits; version 3.9 starts at 3.901.
+revision independently of individual commits; version 3.10 starts at 3.1001.
 Earlier summaries below were reconstructed from the tagged source and commit
 history. Release versions and DTM/WDL file-format versions are separate.
+
+## Version 3.10 — revision 3.1001
+
+- Add `verify_all.py` to verify the 4x4, 5x3 and 6x2 DTM families in their
+  generation-script order. Reuse `verify_dtm` checkpoints and stop on the first
+  failed or partially checked database.
+- Keep timestamped verifier logs and an atomic status report. Distinguish
+  `VERIFIED`, `PARTIAL`, `FAILED`, interrupted and unstarted databases; reject changed DTM
+  collections and concurrent drivers using the same state directory.
+- Test interrupted/resumed campaigns, failure handling, generation order and
+  changed-input rejection. No DTM/WDL format or generator-policy change.
 
 ## Version 3.9 — revision 3.901
 

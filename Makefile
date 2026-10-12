@@ -93,6 +93,11 @@ test-resumable-verification: generate_egtb verify_dtm
 	sh ./test_resumable_verification.sh "$(CURDIR)/generate_egtb" "$(CURDIR)/verify_dtm"
 
 test: test-resumable-verification
+.PHONY: test-verify-all
+test-verify-all:
+	python3 -m unittest -v test_verify_all
+
+test: test-verify-all
 .PHONY: test-tmux
 test-tmux:
 	./test_tmux.sh

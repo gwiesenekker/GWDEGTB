@@ -58,3 +58,4 @@ build-windows/
 /dtm_pv
 /test_dtm_pv
 /test_shared_init
+__pycache__/
